@@ -81,5 +81,5 @@ def releases_url() -> str:
     """Base URL for release artifacts. Override via ATO_MCP_RELEASES_URL for staging."""
     return os.environ.get(
         "ATO_MCP_RELEASES_URL",
-        "https://github.com/sensis/ato-mcp/releases/latest/download",
+        "https://github.com/gunba/ato-mcp/releases/latest/download",
     )
