@@ -126,6 +126,24 @@ roll back:
 ato-mcp doctor --rollback
 ```
 
+### Automatic updates (systemd user timer)
+
+The repo ships ready-made systemd units. Install the end-user daily
+refresh once and forget it:
+
+```bash
+mkdir -p ~/.config/systemd/user
+curl -fsSLO --output-dir ~/.config/systemd/user \
+  https://raw.githubusercontent.com/gunba/ato-mcp/main/systemd/ato-mcp-update.service \
+  https://raw.githubusercontent.com/gunba/ato-mcp/main/systemd/ato-mcp-update.timer
+systemctl --user daemon-reload
+systemctl --user enable --now ato-mcp-update.timer
+loginctl enable-linger "$USER"
+```
+
+See [systemd/README.md](systemd/README.md) for maintainer-side timers
+that also drive the release pipeline.
+
 ### Verify install
 
 ```bash
