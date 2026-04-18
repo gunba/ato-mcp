@@ -86,7 +86,7 @@ def refresh_source(
     pending_folder: str = "whats_new",
     parser_run_date: str | None = None,
     max_workers: int = 1,
-    request_interval: float = 1.0,
+    request_interval: float = 0.5,
     verbose_progress: bool = False,
     force: bool = True,
     root_query: str = "Mode=type&Action=initialise",

@@ -120,9 +120,9 @@ def refresh_source(
     links_file: Optional[Path] = typer.Option(None, help="deduped_links.jsonl for incremental mode."),
     max_workers: int = typer.Option(1, help="Parallel request workers. Keep low to be polite."),
     request_interval: float = typer.Option(
-        1.0,
+        0.5,
         help="Minimum seconds between HTTP request starts, globally across workers. "
-             "Default 1.0 s = ~1 req/sec. Don't go below 0.5 s without reason.",
+             "Default 0.5 s = ~2 req/sec. Drop to 1.0 for a slower/safer rate.",
     ),
     verbose: bool = typer.Option(False, help="Emit downloader status snapshots."),
     root_query: str = typer.Option(
@@ -160,9 +160,9 @@ def catch_up(
     output_dir: Path = typer.Option(..., help="Existing ato_pages/ directory (must contain index.jsonl)."),
     max_workers: int = typer.Option(1, help="Parallel request workers. Keep low to be polite."),
     request_interval: float = typer.Option(
-        1.0,
+        0.5,
         help="Minimum seconds between HTTP request starts, globally across workers. "
-             "Default 1.0 s = ~1 req/sec. Don't go below 0.5 s without reason.",
+             "Default 0.5 s = ~2 req/sec. Drop to 1.0 for a slower/safer rate.",
     ),
     verbose: bool = typer.Option(False, help="Print downloader status snapshots."),
     root_query: str = typer.Option(
