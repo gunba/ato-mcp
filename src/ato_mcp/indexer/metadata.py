@@ -111,6 +111,66 @@ def parse_docid(canonical_id: str) -> tuple[str | None, str | None]:
     return prefix, name
 
 
+def category_for_docid(canonical_id: str) -> str:
+    """Return the ``ato_pages/payloads/<category>/`` bucket for this docid.
+
+    Driven by ``data/doc_type_map.yaml``'s ``category`` hint. Falls back to
+    ``Other_ATO_documents`` for unknown prefixes so new docs still land in a
+    valid bucket rather than ``whats_new``.
+    """
+    prefix, _ = parse_docid(canonical_id)
+    if prefix:
+        entry = _load_doc_type_map().get(prefix)
+        if entry and entry.get("category"):
+            return entry["category"]
+    return "Other_ATO_documents"
+
+
+_YEAR_RE = re.compile(r"(?:19|20)\d{2}")
+
+
+def year_for_docid(canonical_id: str) -> str | None:
+    """Best-effort year extraction from the docid body. E.g. ``CR202612`` → ``2026``."""
+    parsed = urlparse(canonical_id)
+    docid_values = parse_qs(parsed.query).get("docid")
+    if not docid_values:
+        return None
+    docid = unquote(docid_values[0])
+    segments = [s for s in docid.split("/") if s]
+    for seg in segments[:2]:
+        m = _YEAR_RE.search(seg)
+        if m:
+            return m.group(0)
+    return None
+
+
+def representative_path_from_docid(
+    canonical_id: str,
+    *,
+    title: str | None = None,
+    heading: str | None = None,
+) -> list[str]:
+    """Derive a ``representative_path`` for the downloader using the docid alone.
+
+    Shape: ``[category, doc_type_name, year, title]``. Segments that can't be
+    resolved are omitted. This is used for What's New entries where we don't
+    have the tree-crawl-derived path — the first segment (category) is what
+    the indexer uses, so even partial classification is correct downstream.
+    """
+    category = category_for_docid(canonical_id)
+    prefix, doc_type_name = parse_docid(canonical_id)
+    year = year_for_docid(canonical_id)
+    segments = [category]
+    if doc_type_name:
+        segments.append(doc_type_name)
+    elif heading:
+        segments.append(heading)
+    if year:
+        segments.append(year)
+    segments.append(title or canonical_id)
+    return segments
+
+
 def extract_pub_date(markdown: str) -> str | None:
     """Best-effort publication-date scrape. Returns ISO yyyy-mm-dd or None."""
     match = _DATE_RE.search(markdown[:2000])

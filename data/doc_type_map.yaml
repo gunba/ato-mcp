@@ -144,3 +144,36 @@ DTR:
 DXT:
   name: "Draft Taxpayer Alert"
   category: "Taxpayer_alerts"
+OPS:
+  name: "Legislative Instrument"
+  category: "Legislation_and_supporting_material"
+COD:
+  name: "Law Companion Ruling (Draft)"
+  category: "Public_rulings"
+COG:
+  name: "Compliance Guideline"
+  category: "Practical_compliance_guidelines"
+TXD:
+  name: "Taxation Determination"
+  category: "Public_rulings"
+TXR:
+  name: "Taxation Ruling"
+  category: "Public_rulings"
+GST:
+  name: "GST Ruling"
+  category: "Public_rulings"
+GSD:
+  name: "GST Determination"
+  category: "Public_rulings"
+PRR:
+  name: "Product Ruling"
+  category: "Public_rulings"
+DCC:
+  name: "Draft Law Companion Compendium"
+  category: "Public_rulings"
+DTC:
+  name: "Draft Taxation Compendium"
+  category: "Public_rulings"
+TPA:
+  name: "Taxpayer Alert"
+  category: "Taxpayer_alerts"

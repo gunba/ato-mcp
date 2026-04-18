@@ -1,0 +1,11 @@
+[Unit]
+Description=ato-mcp: maintainer daily sync (What's New + release)
+
+[Timer]
+OnCalendar=*-*-* 02:37:00
+RandomizedDelaySec=20min
+Persistent=true
+Unit=ato-mcp-maintainer-daily.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,13 @@
+[Unit]
+Description=ato-mcp: pull the latest ATO index from GitHub Releases
+Documentation=https://github.com/gunba/ato-mcp
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/ato-mcp update
+# If your install put the binary elsewhere (pipx, uv tool, etc.) adjust above.
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
