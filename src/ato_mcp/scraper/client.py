@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
+import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, Optional, Union
 from urllib.parse import urlencode
@@ -25,23 +27,33 @@ class _HttpResponse:
 
 
 class AtoBrowseClient:
-	"""Thin wrapper around the ATO browse-content API."""
+	"""Thin wrapper around the ATO browse-content API.
+
+	``request_interval`` (seconds) globally paces all outgoing calls. Set > 0
+	to avoid hammering the ATO API — the tree crawler issues thousands of
+	these per run.
+	"""
 
 	def __init__(
 		self,
 		base_url: str = "https://www.ato.gov.au/API/v1/law/lawservices/browse-content/",
 		timeout: float = 30.0,
 		transport: Optional[Callable[[str], _HttpResponse]] = None,
+		request_interval: float = 0.0,
 	) -> None:
 		self.base_url = base_url.rstrip("?")
 		self.timeout = timeout
 		self._transport = transport
 		self._session = requests.Session() if transport is None else None
+		self._request_interval = float(request_interval)
+		self._rate_lock = threading.Lock()
+		self._last_request_started_at = 0.0
 
 	def fetch_nodes(self, query: Union[str, Dict[str, str]]) -> Iterable[Dict[str, Any]]:
 		"""Fetch a node list. ``query`` may be dict params or a raw query string."""
 
 		url = self._build_url(query)
+		self._acquire_request_slot()
 		response = self._make_request(url)
 
 		try:
@@ -53,6 +65,17 @@ class AtoBrowseClient:
 			raise AtoBrowseClientError("ATO response payload is not a list")
 
 		return payload
+
+	def _acquire_request_slot(self) -> None:
+		if self._request_interval <= 0.0:
+			return
+		with self._rate_lock:
+			now = time.monotonic()
+			earliest = self._last_request_started_at + self._request_interval
+			if earliest > now:
+				time.sleep(earliest - now)
+				now = earliest
+			self._last_request_started_at = now
 
 	def _make_request(self, url: str) -> _HttpResponse:
 		LOGGER.debug("Fetching %s", url)

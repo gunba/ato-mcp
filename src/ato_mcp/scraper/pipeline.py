@@ -145,7 +145,7 @@ def refresh_source(
     snapshot_base = Path(snapshot_dir) if snapshot_dir else output_dir.parent / "ato_snapshots"
     snapshot_base.mkdir(parents=True, exist_ok=True)
 
-    client = AtoBrowseClient()
+    client = AtoBrowseClient(request_interval=request_interval)
     crawler = AtoTreeCrawler(client)
     nodes = crawler.crawl(root_query=root_query, max_nodes=max_nodes)
     writer = SnapshotWriter(base_dir=snapshot_base)
@@ -218,7 +218,7 @@ def _run_catch_up(
             "under the correct ato_pages/payloads/<category>/... folder"
         )
 
-    client = AtoBrowseClient()
+    client = AtoBrowseClient(request_interval=request_interval)
     crawler = AtoTreeCrawler(client)
     LOGGER.info("crawling browse-content tree (root=%s, max_nodes=%s)", root_query, max_nodes)
     nodes = crawler.crawl(root_query=root_query, max_nodes=max_nodes)
