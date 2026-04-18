@@ -18,11 +18,6 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
 ]
-
-[project.urls]
-Homepage = "https://github.com/gunba/ato-mcp"
-Repository = "https://github.com/gunba/ato-mcp"
-Issues = "https://github.com/gunba/ato-mcp/issues"
 dependencies = [
     "mcp>=1.2",
     "fastmcp>=2.0",
@@ -43,6 +38,11 @@ dependencies = [
     "beautifulsoup4>=4.12",
     "tqdm>=4.66",
 ]
+
+[project.urls]
+Homepage = "https://github.com/gunba/ato-mcp"
+Repository = "https://github.com/gunba/ato-mcp"
+Issues = "https://github.com/gunba/ato-mcp/issues"
 
 [project.optional-dependencies]
 dev = [
