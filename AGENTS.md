@@ -5,6 +5,22 @@ Continue, etc.) tasked with installing or operating `ato-mcp` on the
 user's machine. Read this first; fall back to [README.md](README.md) for
 design detail.
 
+## Prerequisite: GitHub auth (private repo)
+
+`ato-mcp` lives in a private GitHub repo. Both `pipx install git+https://…`
+and `ato-mcp init` need authenticated access:
+
+```bash
+gh auth login                # if not already logged in
+gh auth setup-git            # installs gh as a git credential helper
+```
+
+After `setup-git`, `git clone https://github.com/gunba/ato-mcp.git` works
+transparently for the user, and so does `pipx install git+...`. The
+`init` + `update` subcommands already shell out to `gh release download`
+for release assets, so they require `gh auth login` but do **not** need
+`setup-git`.
+
 ## Install path
 
 Pick the first option that works:

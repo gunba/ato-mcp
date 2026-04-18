@@ -41,11 +41,15 @@ Every hit includes a `canonical_url` pointing to the authoritative ATO page.
 
 ## Install
 
-**Requirements:** Python 3.11+ (3.14 tested), `pipx`, ~1 GB disk (model + index), one-time 700 MB download.
+**Requirements:** Python 3.11+ (3.14 tested), `pipx`, `gh` CLI (for
+authenticated access to the private release artifacts), ~1 GB disk
+(model + index), one-time 700 MB download.
 
 ```bash
+gh auth login                                    # if you haven't already
+gh auth setup-git                                # lets pipx clone private repos
 pipx install git+https://github.com/gunba/ato-mcp.git
-ato-mcp init                       # downloads model + index (~700 MB)
+ato-mcp init                                     # downloads model + index (~700 MB)
 ```
 
 On Windows, substitute `%LOCALAPPDATA%\ato-mcp\` for the data directory.
