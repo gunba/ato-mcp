@@ -169,6 +169,7 @@ def _apply_locked(
             _insert_record(conn, record, ref)
 
         store_db.set_meta(conn, "index_version", new_manifest.index_version)
+        store_db.set_meta(conn, "embedding_model_id", new_manifest.model.id)
         store_db.set_meta(conn, "last_update_at", datetime.now(timezone.utc).isoformat())
         conn.execute("COMMIT")
     except Exception:
@@ -193,22 +194,55 @@ def _apply_locked(
 
 
 def _ensure_model(client: httpx.Client, manifest: Manifest, staging: Path) -> None:
+    """Fetch the embedding model bundle if missing or mismatched.
+
+    The model is distributed as a single ``.tar.zst`` bundle containing the
+    ONNX graph (with any external-data sibling file) plus ``tokenizer.json``.
+    We verify the bundle's sha256, extract into the live directory atomically.
+    """
     model_info = manifest.model
     model_live = paths.model_path()
-    if model_live.exists() and model_info.sha256:
-        try:
-            verify_sha256(model_live, model_info.sha256)
-            return
-        except ValueError:
-            LOGGER.warning("live model failed hash check; redownloading")
-    tmp = staging / "model.onnx.zst.part"
+    live_dir = model_live.parent
+    installed_marker = live_dir / ".model.sha256"
+    if (
+        model_live.exists()
+        and paths.tokenizer_path().exists()
+        and installed_marker.exists()
+        and installed_marker.read_text().strip() == model_info.sha256
+    ):
+        return
+
+    tmp = staging / "model-bundle.tar.zst.part"
     fetch_url(client, model_info.url, tmp)
-    decompressed = staging / "model.onnx.new"
-    with open(tmp, "rb") as src, open(decompressed, "wb") as dst:
+    if model_info.sha256:
+        verify_sha256(tmp, model_info.sha256)
+
+    # Extract into a staging subdir, then atomically move into place.
+    extract_dir = staging / "model-bundle-extracted"
+    if extract_dir.exists():
+        shutil.rmtree(extract_dir)
+    extract_dir.mkdir(parents=True)
+    import tarfile
+    with open(tmp, "rb") as fh:
         dctx = zstd.ZstdDecompressor()
-        dctx.copy_stream(src, dst)
-    decompressed.replace(model_live)
+        with dctx.stream_reader(fh) as reader, tarfile.open(fileobj=reader, mode="r|") as tar:
+            tar.extractall(extract_dir, filter="data")
+
+    for src in extract_dir.rglob("*"):
+        if src.is_file():
+            dst = live_dir / src.name
+            shutil.move(str(src), str(dst))
+    # Ensure a model.onnx pointer even if the bundle only shipped a different
+    # name (onnx-community ships ``model_quantized.onnx``).
+    if not (live_dir / "model.onnx").exists():
+        for candidate in ("model_quantized.onnx", "model_fp16.onnx", "model.onnx"):
+            path = live_dir / candidate
+            if path.exists():
+                (live_dir / "model.onnx").symlink_to(candidate)
+                break
+    installed_marker.write_text(model_info.sha256 or "")
     tmp.unlink(missing_ok=True)
+    shutil.rmtree(extract_dir, ignore_errors=True)
 
 
 def _prefetch_pack_bytes_into_cache(

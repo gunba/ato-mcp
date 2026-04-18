@@ -48,8 +48,11 @@ ATO_MCP_INSECURE=1 ato-mcp init
 **Claude Code:**
 
 ```bash
-claude mcp add ato -- ato-mcp serve
+claude mcp add --scope user ato -- ato-mcp serve
+claude mcp list                 # confirm 'ato' is registered
 ```
+
+Inside Claude Code, run `/mcp` to see the tools.
 
 **Claude Desktop** — edit the client config and restart:
 

@@ -10,10 +10,15 @@ otherwise we fall back to the python ``minisign`` package if available.
 """
 from __future__ import annotations
 
+import hashlib
+import io
 import shutil
 import subprocess
+import tarfile
 from dataclasses import dataclass
 from pathlib import Path
+
+import zstandard as zstd
 
 from ..store.manifest import load_manifest, save_manifest
 from ..util.log import get_logger
@@ -36,6 +41,49 @@ class ReleaseArgs:
     prerelease: bool = False
     sign_key: Path | None = None
     overwrite: bool = False      # replace existing assets on the release
+    model_dir: Path | None = None  # maintainer's ONNX + tokenizer dir
+    model_bundle_name: str = "embeddinggemma-bundle.tar.zst"
+
+
+def bundle_model(
+    model_dir: Path,
+    out_path: Path,
+    *,
+    include: tuple[str, ...] = (
+        "model_quantized.onnx",
+        "model_quantized.onnx_data",
+        "tokenizer.json",
+    ),
+    level: int = 3,
+) -> tuple[str, int]:
+    """Pack the embedding model + tokenizer into a single ``.tar.zst`` bundle.
+
+    Returns ``(sha256, size_bytes)`` of the produced bundle, which callers
+    plug into the manifest's ``ModelInfo`` so clients can verify the
+    download.
+    """
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    hasher = hashlib.sha256()
+    # Build the uncompressed tar in memory, then stream through zstd while
+    # hashing the result. Bundle is ~310 MB uncompressed — fits easily.
+    tar_buffer = io.BytesIO()
+    with tarfile.open(fileobj=tar_buffer, mode="w") as tar:
+        for name in include:
+            src = model_dir / name
+            if not src.exists():
+                raise FileNotFoundError(f"model bundle missing {src}")
+            # Flatten — store with just the base name.
+            tar.add(str(src), arcname=name)
+    tar_buffer.seek(0)
+    cctx = zstd.ZstdCompressor(level=level)
+    with open(out_path, "wb") as fh:
+        with cctx.stream_writer(fh) as writer:
+            while chunk := tar_buffer.read(1 << 20):
+                writer.write(chunk)
+    with open(out_path, "rb") as fh:
+        while chunk := fh.read(1 << 20):
+            hasher.update(chunk)
+    return hasher.hexdigest(), out_path.stat().st_size
 
 
 def _release_asset_url(repo: str, tag: str, filename: str) -> str:
@@ -43,23 +91,27 @@ def _release_asset_url(repo: str, tag: str, filename: str) -> str:
 
 
 def rewrite_manifest_urls(manifest_path: Path, repo: str, tag: str) -> None:
-    """Rewrite model + pack URLs in the manifest to absolute GH-Release URLs.
+    """Rewrite pack URLs in the manifest to absolute GH-Release URLs.
 
-    The build step writes relative paths (``packs/pack-<sha8>.bin.zst``) which
-    are convenient locally. ``gh release upload`` flattens assets into a single
-    namespace, so URLs we emit must be the absolute download URL for the
-    flattened asset name.
+    The model URL is set directly by :func:`publish` once the bundle is
+    produced, so we don't touch it here.
+
+    ``gh release upload`` flattens assets into a single namespace, so URLs
+    we emit must be the absolute download URL for the flattened asset
+    name.
     """
     manifest = load_manifest(manifest_path)
-    # Model
-    model_url = manifest.model.url
-    manifest.model.url = _release_asset_url(repo, tag, Path(model_url).name)
-    # Packs
-    for pack in manifest.packs:
-        manifest.packs[manifest.packs.index(pack)].url = _release_asset_url(
-            repo, tag, Path(pack.url).name
-        )
+    for idx, pack in enumerate(manifest.packs):
+        manifest.packs[idx].url = _release_asset_url(repo, tag, Path(pack.url).name)
     save_manifest(manifest, manifest_path)
+
+
+def _file_sha256(path: Path, chunk: int = 1 << 20) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        while data := fh.read(chunk):
+            h.update(data)
+    return h.hexdigest()
 
 
 def _gh_default_repo() -> str:
@@ -115,9 +167,30 @@ def publish(args: ReleaseArgs) -> None:
         raise ReleaseError("no pack files found to upload")
 
     repo = args.repo or _gh_default_repo()
+
+    # Bundle the embedding model + tokenizer if a model_dir was supplied and
+    # we haven't already produced the bundle.
+    model_bundle_path: Path | None = None
+    if args.model_dir is not None:
+        model_bundle_path = args.out_dir / args.model_bundle_name
+        if not model_bundle_path.exists():
+            LOGGER.info("bundling embedding model from %s", args.model_dir)
+            sha256, size = bundle_model(args.model_dir, model_bundle_path)
+        else:
+            sha256 = _file_sha256(model_bundle_path)
+            size = model_bundle_path.stat().st_size
+        # Patch the manifest with the real bundle metadata.
+        current = load_manifest(manifest)
+        current.model.sha256 = sha256
+        current.model.size = size
+        current.model.url = _release_asset_url(repo, args.tag, args.model_bundle_name)
+        save_manifest(current, manifest)
+
     rewrite_manifest_urls(manifest, repo, args.tag)
 
     artifacts: list[Path] = [manifest, *pack_files]
+    if model_bundle_path is not None:
+        artifacts.append(model_bundle_path)
     if args.sign_key:
         sig = sign_manifest(manifest, args.sign_key)
         artifacts.insert(1, sig)

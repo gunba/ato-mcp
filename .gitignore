@@ -14,6 +14,7 @@ scratch/
 # ML model weights and build outputs — too large for git.
 models/
 release/
+release_full/
 ato_pages/
 *.onnx
 *.onnx_data

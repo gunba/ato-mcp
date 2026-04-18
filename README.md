@@ -53,7 +53,17 @@ On Windows, substitute `%LOCALAPPDATA%\ato-mcp\` for the data directory.
 ### Wire up Claude Code
 
 ```bash
-claude mcp add ato -- ato-mcp serve
+claude mcp add --scope user ato -- ato-mcp serve
+```
+
+Use `--scope project` if you want it in `.claude/settings.json` for a
+specific repo instead of user-wide.
+
+Confirm it's registered:
+
+```bash
+claude mcp list
+claude mcp get ato
 ```
 
 Then inside Claude Code:
@@ -65,7 +75,7 @@ Then inside Claude Code:
 You should see `ato` listed. Test with a search:
 
 ```
-Ask ato-mcp: search "capital gains tax small business concessions"
+Ask ato: search "capital gains tax small business concessions"
 ```
 
 ### Wire up Claude Desktop

@@ -192,6 +192,9 @@ def release(
     prerelease: bool = typer.Option(False, help="Mark as prerelease."),
     sign_key: Optional[Path] = typer.Option(None, help="minisign secret-key file for signing the manifest."),
     overwrite: bool = typer.Option(False, help="Replace existing assets on the release (gh release upload --clobber)."),
+    model_dir: Optional[Path] = typer.Option(
+        None, help="Directory holding the embedding ONNX + tokenizer; creates a bundled tar.zst."
+    ),
 ) -> None:
     """Maintainer: upload the build artifacts to a GitHub release.
 
@@ -209,6 +212,7 @@ def release(
         prerelease=prerelease,
         sign_key=sign_key,
         overwrite=overwrite,
+        model_dir=model_dir,
     ))
     typer.echo(f"release {tag} published with manifest + packs")
 
