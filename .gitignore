@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+.venv/
+venv/
+.env
+.DS_Store
+/tmp/
+scratch/
+# ML model weights and build outputs — too large for git.
+models/
+release/
+ato_pages/
+*.onnx
+*.onnx_data
+*.bin.zst
