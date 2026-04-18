@@ -115,12 +115,21 @@ def stats() -> None:
 
 @app.command("refresh-source")
 def refresh_source(
-    mode: str = typer.Option("incremental", help="incremental | full"),
+    mode: str = typer.Option("incremental", help="incremental | full | catch_up"),
     output_dir: Path = typer.Option(Path("./ato_pages"), help="Destination for payloads/."),
     links_file: Optional[Path] = typer.Option(None, help="deduped_links.jsonl for incremental mode."),
-    max_workers: int = typer.Option(2),
-    request_interval: float = typer.Option(0.1, help="Seconds between HTTP requests."),
+    max_workers: int = typer.Option(1, help="Parallel request workers. Keep low to be polite."),
+    request_interval: float = typer.Option(
+        1.0,
+        help="Minimum seconds between HTTP request starts, globally across workers. "
+             "Default 1.0 s = ~1 req/sec. Don't go below 0.5 s without reason.",
+    ),
     verbose: bool = typer.Option(False, help="Emit downloader status snapshots."),
+    root_query: str = typer.Option(
+        "Mode=type&Action=initialise",
+        help="Tree root. Override to scope catch_up to a subtree.",
+    ),
+    max_nodes: Optional[int] = typer.Option(None, help="Cap for debugging."),
 ) -> None:
     """Maintainer: scrape the ATO site into ``ato_pages/``."""
     from .scraper import refresh_source as run_refresh
@@ -132,8 +141,81 @@ def refresh_source(
         max_workers=max_workers,
         request_interval=request_interval,
         verbose_progress=verbose,
+        root_query=root_query,
+        max_nodes=max_nodes,
     )
     typer.echo(f"refresh-source complete: mode={result.mode} output={result.output_dir}")
+    if result.catch_up_summary is not None:
+        s = result.catch_up_summary
+        typer.echo(
+            f"catch-up: {s.missing} missing of {s.total_current_links} current "
+            f"(existing={s.existing_canonical_ids}); downloaded={s.downloaded}"
+        )
+        for cat, n in s.by_category.items():
+            typer.echo(f"  {n:6d}  {cat}")
+
+
+@app.command("catch-up")
+def catch_up(
+    output_dir: Path = typer.Option(..., help="Existing ato_pages/ directory (must contain index.jsonl)."),
+    max_workers: int = typer.Option(1, help="Parallel request workers. Keep low to be polite."),
+    request_interval: float = typer.Option(
+        1.0,
+        help="Minimum seconds between HTTP request starts, globally across workers. "
+             "Default 1.0 s = ~1 req/sec. Don't go below 0.5 s without reason.",
+    ),
+    verbose: bool = typer.Option(False, help="Print downloader status snapshots."),
+    root_query: str = typer.Option(
+        "Mode=type&Action=initialise",
+        help="Tree root. Scope to a subtree for faster runs "
+             "(e.g. 'Mode=type&Action=inject&TOC=01%3A%23002%23Public%20rulings').",
+    ),
+    path_prefix: Optional[str] = typer.Option(
+        None,
+        help="REQUIRED when --root-query is scoped. Slash-separated ancestor "
+             "folders from the absolute root down to the scope, e.g. "
+             "'Public_rulings/Rulings/Class'. Omit for a full-tree crawl.",
+    ),
+    max_nodes: Optional[int] = typer.Option(None, help="Cap nodes crawled (debugging)."),
+) -> None:
+    """Crawl the ATO tree, diff against the existing index, and download only the
+    missing documents. Each new doc is placed into its proper category folder
+    automatically via the reducer's representative_path.
+
+    Defaults are polite (1 worker, 1.0 s between requests = ~1 req/sec).
+    A full-tree catch-up takes hours at these rates — scope with
+    ``--root-query`` + ``--path-prefix`` when you only need recent docs.
+
+    Full catch-up:
+        ato-mcp catch-up --output-dir ./ato_pages
+
+    Scoped catch-up — must supply path_prefix so paths line up:
+        ato-mcp catch-up --output-dir ./ato_pages \\
+          --root-query 'Mode=type&Action=inject&TOC=03%3APublic%20rulings%3ARulings%3A%23011%23Class' \\
+          --path-prefix 'Public_rulings/Rulings/Class'
+    """
+    from .scraper import refresh_source as run_refresh
+
+    prefix = [p for p in (path_prefix or "").split("/") if p] or None
+    result = run_refresh(
+        mode="catch_up",
+        output_dir=output_dir,
+        max_workers=max_workers,
+        request_interval=request_interval,
+        verbose_progress=verbose,
+        root_query=root_query,
+        max_nodes=max_nodes,
+        path_prefix=prefix,
+    )
+    s = result.catch_up_summary
+    assert s is not None
+    typer.echo(
+        f"catch-up: {s.missing} missing of {s.total_current_links} current "
+        f"(existing={s.existing_canonical_ids}); downloaded={s.downloaded}"
+    )
+    for cat, n in s.by_category.items():
+        typer.echo(f"  {n:6d}  {cat}")
+    typer.echo(f"diff_file: {s.diff_file}")
 
 
 @app.command("build-index")

@@ -5,13 +5,20 @@ Collapses taxiv's ``download_pages`` + ``reduce_snapshot`` + ``run_pipeline`` +
 point. Produces (or updates) the ``output_dir/index.jsonl`` +
 ``output_dir/payloads/`` layout that the indexer consumes.
 
-Two modes:
+Three modes:
 
 - ``incremental`` — pulls the ATO ``What's new`` feed, refreshes matching
   payloads, and drops any new/pending documents under
-  ``payloads/<pending_folder>/``.
+  ``payloads/<pending_folder>/``. Covers the rolling 2-3 week window the
+  feed exposes.
 - ``full`` — runs the whole crawl + reduce + download pipeline. Takes hours;
   intended for monthly full rebuilds.
+- ``catch_up`` — runs a fresh tree crawl, diffs the resulting canonical IDs
+  against the existing ``output_dir/index.jsonl``, and downloads **only the
+  missing** docs. Each new doc inherits its category from the reducer's
+  ``representative_path``, so they land in the correct
+  ``payloads/<Category>/...`` subfolder automatically. Use this after long
+  gaps where the What's New feed has rolled past the last scrape.
 """
 from __future__ import annotations
 
@@ -28,11 +35,11 @@ from .downloader import LinkDownloader
 from .reducer import SnapshotReducer
 from .snapshot import SnapshotWriter
 from .tree_crawler import AtoTreeCrawler
-from .whats_new import DedupedLinkIndex, WhatsNewFetcher, build_pending_record
+from .whats_new import DedupedLinkIndex, WhatsNewFetcher, build_pending_record, normalize_doc_href
 
 LOGGER = logging.getLogger(__name__)
 
-Mode = Literal["incremental", "full"]
+Mode = Literal["incremental", "full", "catch_up"]
 
 
 @dataclass
@@ -41,6 +48,31 @@ class RefreshResult:
     output_dir: Path
     whats_new_summary: dict[str, Any] | None = None
     snapshot_dir: Path | None = None
+    catch_up_summary: "CatchUpSummary | None" = None
+
+
+@dataclass
+class CatchUpSummary:
+    """Outcome of a catch-up run."""
+
+    total_current_links: int
+    existing_canonical_ids: int
+    missing: int
+    downloaded: int
+    snapshot_dir: Path
+    diff_file: Path
+    by_category: dict[str, int]
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "total_current_links": self.total_current_links,
+            "existing_canonical_ids": self.existing_canonical_ids,
+            "missing": self.missing,
+            "downloaded": self.downloaded,
+            "snapshot_dir": str(self.snapshot_dir),
+            "diff_file": str(self.diff_file),
+            "by_category": self.by_category,
+        }
 
 
 def refresh_source(
@@ -53,12 +85,13 @@ def refresh_source(
     whats_new_url: str = "https://www.ato.gov.au/law/view/whatsnew.htm?fid=whatsnew",
     pending_folder: str = "whats_new",
     parser_run_date: str | None = None,
-    max_workers: int = 2,
-    request_interval: float = 0.1,
+    max_workers: int = 1,
+    request_interval: float = 1.0,
     verbose_progress: bool = False,
     force: bool = True,
     root_query: str = "Mode=type&Action=initialise",
     max_nodes: int | None = None,
+    path_prefix: list[str] | None = None,
 ) -> RefreshResult:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -85,6 +118,28 @@ def refresh_source(
             force=force,
         )
         return RefreshResult(mode="incremental", output_dir=output_dir, whats_new_summary=summary)
+
+    if mode == "catch_up":
+        snapshot_base = Path(snapshot_dir) if snapshot_dir else output_dir.parent / "ato_snapshots"
+        snapshot_base.mkdir(parents=True, exist_ok=True)
+        summary = _run_catch_up(
+            output_dir=output_dir,
+            snapshot_base=snapshot_base,
+            base_url=base_url,
+            parser_run_date=parser_run_date,
+            max_workers=max_workers,
+            request_interval=request_interval,
+            verbose_progress=verbose_progress,
+            root_query=root_query,
+            max_nodes=max_nodes,
+            path_prefix=path_prefix,
+        )
+        return RefreshResult(
+            mode="catch_up",
+            output_dir=output_dir,
+            snapshot_dir=summary.snapshot_dir,
+            catch_up_summary=summary,
+        )
 
     # full mode
     snapshot_base = Path(snapshot_dir) if snapshot_dir else output_dir.parent / "ato_snapshots"
@@ -129,6 +184,136 @@ def refresh_source(
         whats_new_summary=summary,
         snapshot_dir=snap_dir,
     )
+
+
+def _run_catch_up(
+    *,
+    output_dir: Path,
+    snapshot_base: Path,
+    base_url: str,
+    parser_run_date: str,
+    max_workers: int,
+    request_interval: float,
+    verbose_progress: bool,
+    root_query: str,
+    max_nodes: int | None,
+    path_prefix: list[str] | None = None,
+) -> CatchUpSummary:
+    """Crawl the tree, diff against the existing index, download just the new docs.
+
+    ``representative_path`` from the reducer is relative to the crawl root. For
+    a full-tree crawl that starts with the correct top-level category
+    ("Public rulings", "Cases", etc.). For a scoped crawl the caller must pass
+    ``path_prefix`` — the ancestor folders from the absolute root down to the
+    scope — so the downloader writes files to the same locations a full crawl
+    would.
+
+    Without ``path_prefix``, we refuse to run a scoped crawl and raise.
+    """
+    existing = _load_existing_canonical_ids(output_dir / "index.jsonl")
+    if root_query != "Mode=type&Action=initialise" and not path_prefix:
+        raise ValueError(
+            "scoped catch_up requires path_prefix "
+            "(e.g. ['Public_rulings','Rulings','Class']) so new payloads land "
+            "under the correct ato_pages/payloads/<category>/... folder"
+        )
+
+    client = AtoBrowseClient()
+    crawler = AtoTreeCrawler(client)
+    LOGGER.info("crawling browse-content tree (root=%s, max_nodes=%s)", root_query, max_nodes)
+    nodes = crawler.crawl(root_query=root_query, max_nodes=max_nodes)
+    writer = SnapshotWriter(base_dir=snapshot_base)
+    snap_dir, meta = writer.write(nodes, root_query=root_query, output_dir=snapshot_base)
+    LOGGER.info("crawl: %s nodes (%s links) -> %s", meta.node_count, meta.link_count, snap_dir)
+
+    reducer = SnapshotReducer(snap_dir / "nodes.jsonl")
+    outputs = reducer.run(output_dir=snap_dir)
+    links_path = outputs["deduped_links"]
+
+    # Build the filtered "missing" links file, prepending path_prefix if needed.
+    missing_path = snap_dir / "missing_links.jsonl"
+    total_current = 0
+    missing_count = 0
+    by_category: dict[str, int] = {}
+    with open(links_path, "r", encoding="utf-8") as src, open(missing_path, "w", encoding="utf-8") as dst:
+        for line in src:
+            total_current += 1
+            rec = json.loads(line)
+            cid = normalize_doc_href(rec.get("canonical_id", ""))
+            if not cid or cid in existing:
+                continue
+            if path_prefix:
+                rep = list(path_prefix) + list(rec.get("representative_path") or [])
+                rec["representative_path"] = rep
+            else:
+                rep = rec.get("representative_path") or []
+            missing_count += 1
+            category = rep[0] if rep else "(uncategorized)"
+            by_category[category] = by_category.get(category, 0) + 1
+            dst.write(json.dumps(rec) + "\n")
+    LOGGER.info(
+        "diff: %d current, %d existing, %d missing (%d categories)",
+        total_current, len(existing), missing_count, len(by_category),
+    )
+
+    downloaded = 0
+    if missing_count:
+        downloader = LinkDownloader(
+            deduped_links_path=missing_path,
+            output_dir=output_dir,
+            base_url=base_url,
+            parser_run_date=parser_run_date,
+            request_delay=request_interval,
+            verbose_progress=verbose_progress,
+        )
+        # Force=False: respect existing payloads if somehow present (cheap retries).
+        downloader.download_all(force=False, max_workers=max_workers)
+        downloaded = _count_success_since(output_dir / "index.jsonl", parser_run_date)
+
+    return CatchUpSummary(
+        total_current_links=total_current,
+        existing_canonical_ids=len(existing),
+        missing=missing_count,
+        downloaded=downloaded,
+        snapshot_dir=snap_dir,
+        diff_file=missing_path,
+        by_category=dict(sorted(by_category.items(), key=lambda kv: -kv[1])),
+    )
+
+
+def _load_existing_canonical_ids(index_path: Path) -> set[str]:
+    out: set[str] = set()
+    if not index_path.exists():
+        return out
+    with open(index_path, "r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            cid = normalize_doc_href(rec.get("canonical_id", ""))
+            if cid:
+                out.add(cid)
+    return out
+
+
+def _count_success_since(index_path: Path, parser_run_date: str) -> int:
+    """Count how many index.jsonl rows have status=success and downloaded_at >= parser_run_date."""
+    if not index_path.exists():
+        return 0
+    n = 0
+    with open(index_path, "r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            if rec.get("status") != "success":
+                continue
+            ts = rec.get("downloaded_at", "")
+            if ts and ts >= parser_run_date:
+                n += 1
+    return n
 
 
 def _run_whats_new(

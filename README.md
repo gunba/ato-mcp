@@ -251,18 +251,39 @@ model/embeddinggemma-<sha8>.onnx.zst     # rarely changes
 Only needed if you are publishing new index releases. End users never run
 these.
 
+Scraping defaults are polite: **1 worker, 1 s between requests (~1 req/s)**.
+Increase only if you have reason.
+
+### Cadence
+
+The ATO doesn't expose a `lastmod` timestamp anywhere, and
+`sitemap.xml` doesn't cover `/law/view/`. Scheduling is layered:
+
+| Frequency | Command | What it catches |
+|---|---|---|
+| Daily | `ato-mcp refresh-source --mode incremental` | Rolling "What's New" feed (2-3 week window). Amendments + recent adds. |
+| Weekly | `ato-mcp catch-up --output-dir ./ato_pages` | Metadata-only tree diff. Adds/removes anywhere in the corpus. ~1-3 h at 1 req/s. |
+| Monthly | `ato-mcp refresh-source --mode full` | Defensive full re-crawl + re-download. Guards against drift. |
+
+The tree crawl is **metadata-only** — it hits the browse-content JSON API
+(~one call per folder), never document HTML — so a weekly run is cheap
+compared to re-downloading every payload.
+
+### Release steps
+
 ```bash
-# 1. Scrape. Incremental mode pulls the ATO "What's New" feed + refreshes
-#    matching payloads. Full mode re-crawls everything (hours).
-ato-mcp refresh-source --mode incremental --output-dir ./ato_pages
+# 1. Scrape fresh data.
+ato-mcp catch-up --output-dir ./ato_pages               # fast path
+#   or
+ato-mcp refresh-source --mode full --output-dir ./ato_pages   # full rebuild
 
 # 2. Build the index. GPU recommended for full rebuilds.
-LD_LIBRARY_PATH=$(find .venv/lib64/python3.14/site-packages/nvidia/ -maxdepth 2 -name "lib" -type d | tr '\n' ':') \
+LD_LIBRARY_PATH=$(find .venv/lib*/python3.*/site-packages/nvidia/ -maxdepth 2 -name "lib" -type d | tr '\n' ':') \
 ato-mcp build-index \
   --pages-dir ./ato_pages \
   --out-dir   ./release \
   --db-path   ./release/ato.db \
-  --model-path ./models/embeddinggemma/onnx/model_quantized.onnx \
+  --model-path     ./models/embeddinggemma/onnx/model_quantized.onnx \
   --tokenizer-path ./models/embeddinggemma/tokenizer.json \
   --previous-manifest ./release-prev/manifest.json \
   --gpu
@@ -272,6 +293,7 @@ ato-mcp release \
   --out-dir ./release \
   --tag index-2026.04.18 \
   --repo gunba/ato-mcp \
+  --model-dir ./models/embeddinggemma \
   --sign-key ~/.minisign/ato-mcp.key   # optional
 ```
 
