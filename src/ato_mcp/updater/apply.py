@@ -233,12 +233,18 @@ def _ensure_model(client: httpx.Client, manifest: Manifest, staging: Path) -> No
             dst = live_dir / src.name
             shutil.move(str(src), str(dst))
     # Ensure a model.onnx pointer even if the bundle only shipped a different
-    # name (onnx-community ships ``model_quantized.onnx``).
+    # name (onnx-community ships ``model_quantized.onnx``). Prefer a symlink
+    # on Unix; fall back to a copy on Windows where unprivileged users can't
+    # create symlinks. The ``.onnx_data`` sibling resolves correctly either
+    # way because it lives next to the target in ``live/``.
     if not (live_dir / "model.onnx").exists():
         for candidate in ("model_quantized.onnx", "model_fp16.onnx", "model.onnx"):
             path = live_dir / candidate
             if path.exists():
-                (live_dir / "model.onnx").symlink_to(candidate)
+                try:
+                    (live_dir / "model.onnx").symlink_to(candidate)
+                except OSError:
+                    shutil.copy2(path, live_dir / "model.onnx")
                 break
     installed_marker.write_text(model_info.sha256 or "")
     tmp.unlink(missing_ok=True)

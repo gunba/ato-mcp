@@ -302,3 +302,7 @@ def release(
 def _bundled_pubkey_path() -> Path | None:
     candidate = Path(__file__).parent / "keys" / "maintainer.pub"
     return candidate if candidate.exists() else None
+
+
+if __name__ == "__main__":
+    app()
