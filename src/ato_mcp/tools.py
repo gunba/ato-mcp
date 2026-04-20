@@ -39,45 +39,76 @@ SNIPPET_CHARS = 280
 
 @dataclass
 class Backend:
-    """Holds shared DB connection + embedding model. Thread-safe."""
-    db: sqlite3.Connection
+    """Shared embedding model plus per-thread read-only SQLite connections.
+
+    FastMCP dispatches synchronous tool handlers on a thread pool, and
+    ``sqlite3`` connections are thread-affine by default (``check_same_thread``).
+    A single shared connection would raise ``ProgrammingError`` when the pool
+    rotates threads. We instead give each worker thread its own connection via
+    ``threading.local``; SQLite handles concurrent readers cleanly. The
+    embedding model (ONNX Runtime session + Rust tokenizer) is thread-safe and
+    stays shared.
+    """
     model: EmbeddingModel | None
-    _lock: threading.Lock
+    _tls: threading.local
 
     @classmethod
     def open(cls) -> "Backend":
-        conn = store_db.connect(paths.db_path(), mode="ro")
         model: EmbeddingModel | None = None
         try:
             model = EmbeddingModel()
         except FileNotFoundError:
             LOGGER.warning("embedding model unavailable; vector search disabled")
-        return cls(db=conn, model=model, _lock=threading.Lock())
+        return cls(model=model, _tls=threading.local())
+
+    @property
+    def db(self) -> sqlite3.Connection:
+        tls = self._tls
+        conn: sqlite3.Connection | None = getattr(tls, "conn", None)
+        try:
+            current_mtime = paths.db_path().stat().st_mtime
+        except FileNotFoundError:
+            current_mtime = 0.0
+        # If a concurrent `ato-mcp update` replaced the DB since we last saw it,
+        # drop this thread's connection so we reopen against the new file.
+        if conn is not None and getattr(tls, "mtime", 0.0) + 0.001 < current_mtime:
+            conn.close()
+            conn = None
+        if conn is None:
+            conn = store_db.connect(paths.db_path(), mode="ro")
+            tls.conn = conn
+            tls.mtime = current_mtime
+        return conn
 
     def close(self) -> None:
-        with self._lock:
-            self.db.close()
+        """Close this thread's connection if any. Other threads' connections
+        stay open until their thread exits — the stdlib thread-local teardown
+        runs the sqlite3 destructor for us."""
+        conn = getattr(self._tls, "conn", None)
+        if conn is not None:
+            conn.close()
+            self._tls.conn = None
 
     def ensure_fresh(self) -> None:
-        """Reopen the connection if the DB has been updated since it was opened."""
-        current_mtime = paths.db_path().stat().st_mtime if paths.db_path().exists() else 0
-        stored = getattr(self, "_last_seen_mtime", 0.0)
-        if current_mtime > stored + 0.001:
-            with self._lock:
-                self.db.close()
-                self.db = store_db.connect(paths.db_path(), mode="ro")
-                self._last_seen_mtime = current_mtime
+        """Kept for API compatibility; the ``db`` property handles mtime checks."""
 
 
 _BACKEND: Backend | None = None
+_BACKEND_LOCK = threading.Lock()
 
 
 def get_backend() -> Backend:
+    """Return the process-wide backend, creating it once under a lock.
+
+    Double-checked locking keeps the fast path lock-free once ``_BACKEND`` is
+    set, and prevents the thread-pool TOCTOU race that would otherwise have
+    every concurrent first-call load its own copy of the 300 MB ONNX model.
+    """
     global _BACKEND
     if _BACKEND is None:
-        _BACKEND = Backend.open()
-    else:
-        _BACKEND.ensure_fresh()
+        with _BACKEND_LOCK:
+            if _BACKEND is None:
+                _BACKEND = Backend.open()
     return _BACKEND
 
 
