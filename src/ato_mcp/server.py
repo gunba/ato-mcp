@@ -130,4 +130,15 @@ def stats(format: Literal["markdown", "json"] = "json") -> str:
 
 def run() -> None:
     """Entry point invoked by ``ato-mcp serve``."""
+    # Warm the backend (DB + ONNX model + tokenizer) and run a throwaway
+    # inference before yielding stdio. The first encode() call pays a
+    # ~3-4 s ONNX JIT cost that we'd rather absorb during startup than on
+    # the user's first search. Errors are non-fatal — if the DB or model
+    # is missing we let the first call surface the real failure.
+    try:
+        backend = T.get_backend()
+        if backend.model is not None:
+            backend.model.encode(["warmup"], is_query=True)
+    except Exception:  # noqa: BLE001 — opportunistic warmup, not correctness
+        pass
     mcp.run()
