@@ -1,6 +1,8 @@
-from .build import BuildArgs
-from .chunk import Chunk, chunk_markdown
-from .extract import ExtractedDoc, extract
-from .metadata import DocMetadata
+"""Maintainer-side build pipeline: metadata parsing, content extraction,
+chunking, packing, index build, release.
 
-__all__ = ["BuildArgs", "Chunk", "DocMetadata", "ExtractedDoc", "chunk_markdown", "extract"]
+Submodules are imported directly (e.g. ``from ato_mcp.indexer.metadata import
+citation_regex``) rather than from this package root. Keeping ``__init__``
+empty avoids dragging ``build``/``pack`` and their numpy dependency into
+import graphs that only need the lightweight parsing helpers.
+"""

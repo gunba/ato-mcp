@@ -18,6 +18,7 @@ import zstandard as zstd
 
 from . import formatters
 from .embed.model import EmbeddingModel, vec_to_bytes
+from .indexer.metadata import citation_regex
 from .store import db as store_db
 from .store.queries import (
     COUNT_CHUNKS,
@@ -428,15 +429,9 @@ def search_titles(
     return formatters.format_hits_markdown(hits)
 
 
-_CITATION_RE = re.compile(
-    r"\b((?:TR|GSTR|LCR|SGR|FTR|PR|CR|TD|MT|IT|FBT|SCD|SMSFRB|PSLA|PS LA|PCG|TA|ATOID|LCG|LG|LI)\s?[0-9]{1,4}/[0-9A-Za-z]+)\b",
-    re.IGNORECASE,
-)
-
-
 def resolve(citation: str, *, format: Literal["markdown", "json"] = "markdown") -> str:
     backend = get_backend()
-    match = _CITATION_RE.search(citation.strip())
+    match = citation_regex().search(citation.strip())
     if match:
         code = match.group(1).upper().replace("  ", " ")
     else:

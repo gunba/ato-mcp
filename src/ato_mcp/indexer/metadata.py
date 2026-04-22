@@ -142,6 +142,35 @@ def category_for_docid(canonical_id: str) -> str:
     return "Other_ATO_documents"
 
 
+_CITATION_RE_CACHE: re.Pattern[str] | None = None
+
+
+def citation_regex() -> re.Pattern[str]:
+    """Return a compiled regex matching ATO citations like ``TR 2024/3``.
+
+    Derived from ``data/doc_type_map.yaml`` so that adding a new document
+    type to the map automatically broadens what :func:`ato_mcp.tools.resolve`
+    can normalize. Prefixes sort by length descending so multi-word keys
+    like ``PS LA`` match before their shorter variants (``PS``, ``LA``).
+    Falls back to a generic ``[A-Z]{2,10}`` prefix pattern if the map
+    couldn't be loaded, so resolve() still degrades gracefully.
+    """
+    global _CITATION_RE_CACHE
+    if _CITATION_RE_CACHE is not None:
+        return _CITATION_RE_CACHE
+    prefixes = list(_load_doc_type_map().keys())
+    if not prefixes:
+        _CITATION_RE_CACHE = re.compile(
+            r"\b([A-Z]{2,10}\s?[0-9]{1,4}/[0-9A-Za-z]+)\b", re.IGNORECASE
+        )
+        return _CITATION_RE_CACHE
+    alt = "|".join(re.escape(p) for p in sorted(prefixes, key=len, reverse=True))
+    _CITATION_RE_CACHE = re.compile(
+        rf"\b((?:{alt})\s?[0-9]{{1,4}}/[0-9A-Za-z]+)\b", re.IGNORECASE
+    )
+    return _CITATION_RE_CACHE
+
+
 _YEAR_RE = re.compile(r"(?:19|20)\d{2}")
 
 
