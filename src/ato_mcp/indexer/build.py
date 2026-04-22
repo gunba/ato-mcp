@@ -136,7 +136,7 @@ def build(args: BuildArgs) -> Manifest:
 
             prefix, doc_type_name = meta_mod.parse_docid(canonical_id)
             doc_type = doc_type_name or prefix
-            docid_code = meta_mod.extract_docid_code(title, markdown)
+            docid_code = meta_mod.extract_docid_code(canonical_id)
             pub_date = meta_mod.extract_pub_date(markdown) if markdown else None
             effective_date = None
             doc_status = meta_mod.extract_status(markdown) or "active" if markdown else None

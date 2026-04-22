@@ -37,19 +37,21 @@ _NAV_LIKE_CLASSES = (
 class ExtractedDoc:
     markdown: str
     title: str | None
+    html_title: str | None = None  # raw <title> (browser tab text) — used for docid_code
     headings: list[str] = field(default_factory=list)
     anchors: list[tuple[str, str]] = field(default_factory=list)  # (heading_text, anchor_id)
 
 
 def extract(html: str) -> ExtractedDoc:
     if not html or not html.strip():
-        return ExtractedDoc(markdown="", title=None)
+        return ExtractedDoc(markdown="", title=None, html_title=None)
 
     tree = HTMLParser(html)
+    html_title = _first_text(tree, "title")
 
     container = _pick_container(tree)
     if container is None:
-        return ExtractedDoc(markdown="", title=None)
+        return ExtractedDoc(markdown="", title=None, html_title=html_title)
 
     _strip_noise(container)
     anchors = _collect_anchors(container)
@@ -57,7 +59,7 @@ def extract(html: str) -> ExtractedDoc:
     # Capture "title headings" — consecutive leading headings before any body
     # content. On ATO rulings that gives h1=doc_type, h2=code, h3=subject.
     lead_headings = _leading_headings(container)
-    title = _compose_title(lead_headings) or _first_text(tree, "title")
+    title = _compose_title(lead_headings) or html_title
 
     _inject_anchor_suffixes(container)
 
@@ -73,7 +75,10 @@ def extract(html: str) -> ExtractedDoc:
         strip=["script", "style", "iframe"],
     )
     markdown = _tidy_markdown(markdown)
-    return ExtractedDoc(markdown=markdown, title=title, headings=headings, anchors=anchors)
+    return ExtractedDoc(
+        markdown=markdown, title=title, html_title=html_title,
+        headings=headings, anchors=anchors,
+    )
 
 
 def _leading_headings(container: Node) -> list[str]:

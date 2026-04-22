@@ -250,15 +250,40 @@ def content_hash(markdown: str, metadata: dict[str, Any]) -> str:
     return "sha256:" + h.hexdigest()
 
 
-_CODE_PATTERNS = (
-    re.compile(r"\b((?:TR|GSTR|LCR|SGR|FTR|PR|CR|TD|MT|IT|FBT|SCD|SMSFRB|PSLA|PS LA|PCG|TA|ATOID|LCG|LG|LI)\s?[0-9]{1,4}/[0-9A-Za-z]+)\b"),
-)
+def extract_docid_code(canonical_id: str | None) -> str | None:
+    """Return the URL-derived docid_code, verbatim minus the category prefix.
 
+    Every ATO document's canonical URL carries a ``docid`` query parameter of
+    the form ``<CATEGORY>/<rest...>`` where ``<CATEGORY>`` is the segment we
+    already track separately as ``doc_type`` (NEM, DPC, JUD, AID, TXR, ...).
+    The rest is the document's stable identifier, including any trailing page
+    number. Examples::
 
-def extract_docid_code(title: str | None, markdown: str) -> str | None:
-    for src in (title or "", markdown[:500]):
-        for pat in _CODE_PATTERNS:
-            m = pat.search(src)
-            if m:
-                return m.group(1).upper().replace("  ", " ")
-    return None
+        NEM/EM202412/NAT/ATO/00003   ->  EM202412/NAT/ATO/00003
+        DPC/PCG2026D1/NAT/ATO/00001  ->  PCG2026D1/NAT/ATO/00001
+        AID/AID200634/00001          ->  AID200634/00001
+        JUD/2020ATC10-558/00001      ->  2020ATC10-558/00001
+        JUD/*2012*AATA129/00002      ->  *2012*AATA129/00002
+
+    This replaces the previous regex-over-title-and-body implementation.
+    That approach had 3% coverage (the hardcoded 21-prefix regex didn't
+    match most docid formats) and cross-contaminated results — an ATO ID
+    page that cited ``TR 2024/3`` in its opening paragraph inherited that
+    code as its own.
+
+    A human-readable citation (``TR 2024/3``, ``ATO ID 2006/34``) is a
+    separate concern handled by title extraction. The URL-derived form
+    here is what the agent passes back verbatim when retrieving a
+    document, and is always unambiguous.
+    """
+    if not canonical_id:
+        return None
+    parsed = urlparse(canonical_id)
+    docid_values = parse_qs(parsed.query).get("docid")
+    if not docid_values:
+        return None
+    docid = unquote(docid_values[0])
+    if "/" not in docid:
+        return None
+    _prefix, _sep, rest = docid.partition("/")
+    return rest or None
