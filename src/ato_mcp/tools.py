@@ -18,7 +18,6 @@ import zstandard as zstd
 
 from . import formatters
 from .embed.model import EmbeddingModel, vec_to_bytes
-from .indexer.metadata import citation_regex
 from .store import db as store_db
 from .store.queries import (
     COUNT_CHUNKS,
@@ -430,12 +429,17 @@ def search_titles(
 
 
 def resolve(citation: str, *, format: Literal["markdown", "json"] = "markdown") -> str:
+    """Exact lookup by the URL-derived ``docid_code``.
+
+    The agent normally receives ``docid_code`` verbatim in ``search`` /
+    ``search_titles`` results (e.g. ``PCG2026D1/NAT/ATO/00001``) and passes
+    that back here for a direct fetch. Natural-language citations like
+    ``TR 2024/3`` or ``ATO ID 2006/34`` should go through ``search`` or
+    ``search_titles`` instead — those hit the FTS index which includes the
+    document's human-readable title.
+    """
     backend = get_backend()
-    match = citation_regex().search(citation.strip())
-    if match:
-        code = match.group(1).upper().replace("  ", " ")
-    else:
-        code = citation.strip()
+    code = citation.strip()
     rows = backend.db.execute(
         "SELECT * FROM documents WHERE docid_code = ? LIMIT 10",
         (code,),
