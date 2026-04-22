@@ -204,11 +204,19 @@ def _fts_search(
 
 
 def _fts_query(query: str) -> str:
-    """Turn a free-text query into an FTS5-safe MATCH expression."""
-    tokens = _WORD_RE.findall(query)
+    """Turn a free-text query into an FTS5-safe MATCH expression.
+
+    Tokens are space-joined, which FTS5 interprets as implicit AND — every
+    returned chunk must contain every query term. Previous OR-join behaviour
+    made common words like "tax" match ~500K chunks and then BM25-rank all
+    of them, producing >30 s tails on natural-language queries. Single-char
+    tokens (e.g. ``R``/``D`` from ``R&D``) are dropped so they don't turn
+    queries into zero-result searches for punctuation artefacts.
+    """
+    tokens = [t for t in _WORD_RE.findall(query) if len(t) >= 2]
     if not tokens:
         return '""'
-    return " OR ".join(f'"{t}"' for t in tokens)
+    return " ".join(f'"{t}"' for t in tokens)
 
 
 @lru_cache(maxsize=128)
