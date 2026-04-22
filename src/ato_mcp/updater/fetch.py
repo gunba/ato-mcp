@@ -135,7 +135,6 @@ def fetch_ranges(
     m = _gh_release_match(url)
     if m and shutil.which("gh"):
         # Download the full asset into the updater staging cache once.
-        from . import fetch as self_mod  # noqa: F401 — keep module import
         from ..util import paths as _paths
         cache = _paths.staging_dir() / f"pack-cache-{m['asset']}"
         if not cache.exists() or cache.stat().st_size == 0:

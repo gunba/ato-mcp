@@ -185,6 +185,19 @@ def _apply_locked(
     final = paths.installed_manifest_path()
     save_manifest(new_manifest, final)
 
+    # Success — drop the staged pack caches + temp manifest. We kept them
+    # earlier so a crashed apply could resume on next invocation; once the
+    # installed manifest has been written atomically there's no reason to
+    # keep ~800 MB of compressed pack blobs around. The in-memory cache
+    # mirrored the same bytes and is dropped too.
+    import contextlib
+    for stale in paths.staging_dir().glob("pack-cache-*"):
+        with contextlib.suppress(OSError):
+            stale.unlink()
+    with contextlib.suppress(OSError):
+        new_manifest_tmp.unlink()
+    _RECORD_CACHE.clear()
+
     return UpdateStats(
         added=len(added),
         changed=len(changed),

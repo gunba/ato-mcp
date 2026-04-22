@@ -126,9 +126,6 @@ MOU:
 SAV:
   name: "Superannuation Advice"
   category: "Other_ATO_documents"
-COG:
-  name: "Commissioner's Guideline"
-  category: "Other_ATO_documents"
 DGC:
   name: "Draft Guidance"
   category: "Other_ATO_documents"

@@ -89,9 +89,6 @@ class Backend:
             conn.close()
             self._tls.conn = None
 
-    def ensure_fresh(self) -> None:
-        """Kept for API compatibility; the ``db`` property handles mtime checks."""
-
 
 _BACKEND: Backend | None = None
 _BACKEND_LOCK = threading.Lock()

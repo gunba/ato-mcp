@@ -28,6 +28,20 @@ _DATE_RE = re.compile(
 _STATUS_BANNER_RE = re.compile(r"\b(withdrawn|superseded|replaced by)\b", re.IGNORECASE)
 
 _DOC_TYPE_MAP: dict[str, dict[str, str]] | None = None
+_WARNED_UNMAPPED_PREFIXES: set[str] = set()
+
+
+def _warn_unmapped_prefix(prefix: str) -> None:
+    """Warn once per unknown docid prefix so the maintainer can update the map."""
+    if prefix in _WARNED_UNMAPPED_PREFIXES:
+        return
+    _WARNED_UNMAPPED_PREFIXES.add(prefix)
+    # Imported here to avoid a module-load dependency for scripts that only
+    # use the pure parsing helpers.
+    from ..util.log import get_logger
+    get_logger(__name__).warning(
+        "unmapped docid prefix %r — add it to data/doc_type_map.yaml", prefix
+    )
 
 
 def _load_doc_type_map() -> dict[str, dict[str, str]]:
@@ -108,6 +122,8 @@ def parse_docid(canonical_id: str) -> tuple[str | None, str | None]:
         return None, None
     prefix = segments[0].upper()
     name = _load_doc_type_map().get(prefix, {}).get("name")
+    if name is None:
+        _warn_unmapped_prefix(prefix)
     return prefix, name
 
 
