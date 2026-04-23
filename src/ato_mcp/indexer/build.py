@@ -137,7 +137,11 @@ def build(args: BuildArgs) -> Manifest:
             prefix, doc_type_name = meta_mod.parse_docid(canonical_id)
             doc_type = doc_type_name or prefix
             docid_code = meta_mod.extract_docid_code(canonical_id)
+            human_title = meta_mod.compose_human_title(headings)
             pub_date = meta_mod.extract_pub_date(markdown) if markdown else None
+            first_published_date = meta_mod.extract_first_published_date(
+                markdown or "", canonical_id, pub_date
+            )
             effective_date = None
             doc_status = meta_mod.extract_status(markdown) or "active" if markdown else None
             downloaded_at = rec.get("downloaded_at") or datetime.now(timezone.utc).isoformat()
@@ -176,7 +180,8 @@ def build(args: BuildArgs) -> Manifest:
                 INSERT_DOCUMENT,
                 (
                     doc_id, canonical_id, href, category, doc_type, docid_code, title,
-                    pub_date, effective_date, doc_status, 1 if has_content else 0,
+                    human_title, pub_date, first_published_date, effective_date, doc_status,
+                    1 if has_content else 0,
                     downloaded_at, ch, "PENDING",  # pack_sha8 backfilled below
                 ),
             )
@@ -203,7 +208,9 @@ def build(args: BuildArgs) -> Manifest:
                 "doc_type": doc_type,
                 "docid_code": docid_code,
                 "title": title,
+                "human_title": human_title,
                 "pub_date": pub_date,
+                "first_published_date": first_published_date,
                 "effective_date": effective_date,
                 "status": doc_status,
                 "has_content": has_content,
@@ -334,7 +341,9 @@ def _insert_from_previous(
         (
             record["doc_id"], record["canonical_id"], record["href"], record["category"],
             record.get("doc_type"), record.get("docid_code"), record["title"],
-            record.get("pub_date"), record.get("effective_date"), record.get("status"),
+            record.get("human_title"),
+            record.get("pub_date"), record.get("first_published_date"),
+            record.get("effective_date"), record.get("status"),
             1 if record.get("has_content") else 0, record["downloaded_at"],
             record["content_hash"], prev_ref.pack_sha8,
         ),

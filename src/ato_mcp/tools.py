@@ -20,10 +20,6 @@ from . import formatters
 from .embed.model import EmbeddingModel, vec_to_bytes
 from .store import db as store_db
 from .store.queries import (
-    COUNT_CHUNKS,
-    COUNT_DOCUMENTS,
-    LIST_CATEGORIES,
-    LIST_DOC_TYPES,
     SELECT_CHUNKS_FOR_DOC,
     SELECT_DOCUMENT,
 )
@@ -154,6 +150,8 @@ def _build_sql_filter(
     doc_types: list[str] | None,
     date_from: str | None,
     date_to: str | None,
+    doc_scope: str | None = None,
+    category_scope: str | None = None,
 ) -> tuple[str, list[Any]]:
     clauses: list[str] = []
     params: list[Any] = []
@@ -171,7 +169,29 @@ def _build_sql_filter(
     if date_to:
         clauses.append("d.pub_date <= ?")
         params.append(date_to)
+    if doc_scope:
+        pattern = _glob_to_like(doc_scope)
+        # docid_code is the human form ("TR 2024/3"); doc_id is the slug ("tr_2024_3").
+        # Match either so the agent can paste whichever it has.
+        clauses.append(r"(d.doc_id LIKE ? ESCAPE '\' OR d.docid_code LIKE ? ESCAPE '\')")
+        params.extend([pattern, pattern])
+    if category_scope:
+        clauses.append(r"d.category LIKE ? ESCAPE '\'")
+        params.append(_glob_to_like(category_scope))
     return (" AND ".join(clauses), params) if clauses else ("", params)
+
+
+_GLOB_ESCAPE = str.maketrans({"\\": r"\\", "%": r"\%", "_": r"\_"})
+
+
+def _glob_to_like(pattern: str) -> str:
+    """Turn a shell glob into a SQL LIKE pattern (use with ``ESCAPE '\\'``).
+
+    ``*`` is the only wildcard we accept. Literal ``%``, ``_`` and ``\\``
+    in the input are escaped so ``tr_2024_3`` stays a specific slug rather
+    than collapsing into the LIKE single-char wildcard.
+    """
+    return pattern.translate(_GLOB_ESCAPE).replace("*", "%")
 
 
 # ---------------------------------------------------------------------------
@@ -309,19 +329,6 @@ def _load_hit(conn: sqlite3.Connection, chunk_id: int) -> dict | None:
     }
 
 
-def _dedupe_by_doc(hits: list[dict], k: int) -> list[dict]:
-    seen: set[str] = set()
-    out: list[dict] = []
-    for hit in hits:
-        if hit["doc_id"] in seen:
-            continue
-        seen.add(hit["doc_id"])
-        out.append(hit)
-        if len(out) >= k:
-            break
-    return out
-
-
 # ---------------------------------------------------------------------------
 # Public tool handlers
 
@@ -334,12 +341,17 @@ def search(
     doc_types: list[str] | None = None,
     date_from: str | None = None,
     date_to: str | None = None,
+    doc_scope: str | None = None,
+    category_scope: str | None = None,
     mode: Literal["hybrid", "vector", "keyword"] = "hybrid",
     format: Literal["markdown", "json"] = "markdown",
 ) -> str:
     backend = get_backend()
     k = max(1, min(k, MAX_K))
-    filter_sql, filter_params = _build_sql_filter(categories, doc_types, date_from, date_to)
+    filter_sql, filter_params = _build_sql_filter(
+        categories, doc_types, date_from, date_to,
+        doc_scope=doc_scope, category_scope=category_scope,
+    )
 
     internal_k = max(k * 5, 50)
     fts_hits: list[tuple[int, float]] = []
@@ -361,14 +373,13 @@ def search(
         fused = [(cid, -score) for cid, score in vec_hits]
 
     records: list[dict] = []
-    for chunk_id, score in fused:
+    for chunk_id, score in fused[:k]:
         hit = _load_hit(backend.db, chunk_id)
         if hit is None:
             continue
         hit["score"] = score
         hit["snippet"] = _highlight_snippet(hit["text"], query)
         records.append(hit)
-    records = _dedupe_by_doc(records, k)
     payload = [_slim_hit(r) for r in records]
     if format == "json":
         return formatters.as_json({"query": query, "mode": mode, "hits": payload})
@@ -426,42 +437,6 @@ def search_titles(
     if format == "json":
         return formatters.as_json({"query": query, "hits": hits})
     return formatters.format_hits_markdown(hits)
-
-
-def resolve(citation: str, *, format: Literal["markdown", "json"] = "markdown") -> str:
-    """Exact lookup by the URL-derived ``docid_code``.
-
-    The agent normally receives ``docid_code`` verbatim in ``search`` /
-    ``search_titles`` results (e.g. ``PCG2026D1/NAT/ATO/00001``) and passes
-    that back here for a direct fetch. Natural-language citations like
-    ``TR 2024/3`` or ``ATO ID 2006/34`` should go through ``search`` or
-    ``search_titles`` instead — those hit the FTS index which includes the
-    document's human-readable title.
-    """
-    backend = get_backend()
-    code = citation.strip()
-    rows = backend.db.execute(
-        "SELECT * FROM documents WHERE docid_code = ? LIMIT 10",
-        (code,),
-    ).fetchall()
-    hits = [_row_to_hit(r) for r in rows]
-    if format == "json":
-        return formatters.as_json({"citation": citation, "hits": hits})
-    return formatters.format_hits_markdown(hits)
-
-
-def _row_to_hit(row: sqlite3.Row) -> dict:
-    return {
-        "doc_id": row["doc_id"],
-        "docid_code": row["docid_code"],
-        "title": row["title"],
-        "category": row["category"],
-        "doc_type": row["doc_type"],
-        "heading_path": "",
-        "snippet": "",
-        "canonical_url": formatters.canonical_url(row["href"]),
-        "pub_date": row["pub_date"],
-    }
 
 
 def get_document(
@@ -578,30 +553,6 @@ def get_chunks(
     return "\n".join(lines)
 
 
-def list_categories(*, format: Literal["markdown", "json"] = "markdown") -> str:
-    backend = get_backend()
-    rows = backend.db.execute(LIST_CATEGORIES).fetchall()
-    items = [{"category": r["category"], "count": r["n"]} for r in rows]
-    if format == "json":
-        return formatters.as_json({"categories": items})
-    lines = ["| Category | Documents |", "|---|---|"]
-    for it in items:
-        lines.append(f"| {it['category']} | {it['count']} |")
-    return "\n".join(lines)
-
-
-def list_doc_types(*, format: Literal["markdown", "json"] = "markdown") -> str:
-    backend = get_backend()
-    rows = backend.db.execute(LIST_DOC_TYPES).fetchall()
-    items = [{"doc_type": r["doc_type"], "count": r["n"]} for r in rows]
-    if format == "json":
-        return formatters.as_json({"doc_types": items})
-    lines = ["| Doc Type | Documents |", "|---|---|"]
-    for it in items:
-        lines.append(f"| {it['doc_type']} | {it['count']} |")
-    return "\n".join(lines)
-
-
 def whats_new(
     *,
     since: str | None = None,
@@ -610,10 +561,13 @@ def whats_new(
     format: Literal["markdown", "json"] = "markdown",
 ) -> str:
     backend = get_backend()
+    # Historical publication date when the heuristic produced one, otherwise
+    # fall back to our ingest timestamp so newly-crawled docs still appear.
+    sort_expr = "COALESCE(first_published_date, downloaded_at)"
     clauses: list[str] = []
     params: list[Any] = []
     if since:
-        clauses.append("downloaded_at >= ?")
+        clauses.append(f"{sort_expr} >= ?")
         params.append(since)
     if categories:
         placeholders = ",".join("?" * len(categories))
@@ -622,9 +576,10 @@ def whats_new(
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
     params.append(limit)
     sql = f"""
-        SELECT doc_id, docid_code, title, category, doc_type, href, pub_date, downloaded_at
+        SELECT doc_id, docid_code, title, category, doc_type, href,
+               pub_date, first_published_date, downloaded_at
         FROM documents {where}
-        ORDER BY downloaded_at DESC LIMIT ?
+        ORDER BY {sort_expr} DESC LIMIT ?
     """
     rows = backend.db.execute(sql, params).fetchall()
     hits = [{
@@ -634,30 +589,17 @@ def whats_new(
         "category": r["category"],
         "doc_type": r["doc_type"],
         "heading_path": "",
-        "snippet": f"downloaded {r['downloaded_at']}",
+        "snippet": _whats_new_snippet(r),
         "canonical_url": formatters.canonical_url(r["href"]),
         "pub_date": r["pub_date"],
+        "first_published_date": r["first_published_date"],
     } for r in rows]
     if format == "json":
         return formatters.as_json({"since": since, "hits": hits})
     return formatters.format_hits_markdown(hits)
 
 
-def stats(*, format: Literal["markdown", "json"] = "json") -> str:
-    backend = get_backend()
-    docs = backend.db.execute(COUNT_DOCUMENTS).fetchone()["n"]
-    chunks = backend.db.execute(COUNT_CHUNKS).fetchone()["n"]
-    meta_rows = {r["key"]: r["value"] for r in backend.db.execute("SELECT * FROM meta").fetchall()}
-    info = {
-        "documents": docs,
-        "chunks": chunks,
-        "index_version": meta_rows.get("index_version"),
-        "last_update_at": meta_rows.get("last_update_at"),
-        "embedding_model_id": meta_rows.get("embedding_model_id"),
-        "schema_version": meta_rows.get("schema_version"),
-        "data_dir": str(paths.data_dir()),
-    }
-    if format == "markdown":
-        lines = [f"- **{k}**: {v}" for k, v in info.items()]
-        return "\n".join(lines)
-    return formatters.as_json(info)
+def _whats_new_snippet(row: sqlite3.Row) -> str:
+    if row["first_published_date"]:
+        return f"published {row['first_published_date']}"
+    return f"ingested {row['downloaded_at']}"

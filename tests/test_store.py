@@ -24,8 +24,8 @@ def _seed_doc(conn, doc_id: str, title: str, text: str) -> int:
         INSERT_DOCUMENT,
         (
             doc_id, f"/law/view/document?docid={doc_id}", f"/law/view/document?docid={doc_id}",
-            "Public_rulings", "TR", "TR 2024/3", title,
-            "2024-07-01", None, "active", 1, "2026-04-18T00:00:00Z",
+            "Public_rulings", "TR", "TR 2024/3", title, None,
+            "2024-07-01", "2024-07-01", None, "active", 1, "2026-04-18T00:00:00Z",
             "sha256:" + "0" * 64, "deadbeef",
         ),
     )

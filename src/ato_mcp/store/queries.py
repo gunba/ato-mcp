@@ -4,9 +4,9 @@ from __future__ import annotations
 INSERT_DOCUMENT = """
 INSERT OR REPLACE INTO documents
     (doc_id, canonical_id, href, category, doc_type, docid_code, title,
-     pub_date, effective_date, status, has_content, downloaded_at,
-     content_hash, pack_sha8)
-VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+     human_title, pub_date, first_published_date, effective_date, status,
+     has_content, downloaded_at, content_hash, pack_sha8)
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 """
 
 DELETE_DOCUMENT = "DELETE FROM documents WHERE doc_id = ?"

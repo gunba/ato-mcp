@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from collections import Counter
 from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
@@ -198,6 +199,69 @@ def extract_pub_date(markdown: str) -> str | None:
         "july": 7, "august": 8, "september": 9, "october": 10, "november": 11, "december": 12,
     }[month_name.lower()]
     return f"{int(year):04d}-{month:02d}-{int(day):02d}"
+
+
+def compose_human_title(headings: list[str] | None) -> str | None:
+    """Join a document's HTML headings (``<h1>``, ``<h2>``, ...) into one string.
+
+    Intended as a first-pass human-readable title for search / display when
+    the extractor's single ``<title>`` tag is uninformative. Returns ``None``
+    when the doc has no headings. Collapses whitespace inside each heading
+    and de-dupes consecutive repeats (ATO templates frequently repeat the
+    top-level title). The main PC is expected to iterate on this heuristic
+    over time; this is only the seed.
+    """
+    if not headings:
+        return None
+    cleaned: list[str] = []
+    last: str | None = None
+    for raw in headings:
+        if raw is None:
+            continue
+        text = " ".join(raw.split())
+        if not text or text == last:
+            continue
+        cleaned.append(text)
+        last = text
+    if not cleaned:
+        return None
+    return " — ".join(cleaned)
+
+
+def extract_first_published_date(
+    markdown: str,
+    canonical_id: str,
+    pub_date: str | None,
+) -> str | None:
+    """Best-effort historical publication date used to order ``whats_new``.
+
+    Layers fall through until one succeeds:
+      1. A precise date in the first ~500 chars (title + first headings).
+      2. ``pub_date`` already extracted from the body (wider 2000-char scan).
+      3. Year embedded in the docid itself (e.g. ``TR20243`` -> ``2024``),
+         returned as ``YYYY-01-01``.
+      4. The most common 4-digit year across the full markdown body.
+      5. ``None`` if nothing surfaces.
+
+    Day-level precision from (1) or (2) wins; the later layers return a
+    year-only proxy (``YYYY-01-01``) which is still useful for chronological
+    sort / filter.
+    """
+    if markdown:
+        head_match = extract_pub_date(markdown[:500])
+        if head_match:
+            return head_match
+    if pub_date:
+        return pub_date
+    docid_year = year_for_docid(canonical_id)
+    if docid_year:
+        return f"{docid_year}-01-01"
+    if markdown:
+        years = _YEAR_RE.findall(markdown)
+        if years:
+            most_common = Counter(years).most_common(1)[0][0]
+            return f"{most_common}-01-01"
+    return None
 
 
 def extract_status(markdown: str) -> str | None:

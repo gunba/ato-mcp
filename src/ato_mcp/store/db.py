@@ -13,7 +13,7 @@ import sqlite_vec
 
 from ..util import paths
 
-SCHEMA_VERSION = "1"
+SCHEMA_VERSION = "3"
 EMBEDDING_DIM = 256
 EMBEDDING_DTYPE = "int8"
 
@@ -66,11 +66,32 @@ def init_db(path: Path | None = None) -> sqlite3.Connection:
     conn = connect(path, mode="rwc")
     conn.executescript(_SCHEMA_PATH.read_text(encoding="utf-8"))
     conn.execute(_VEC_TABLE_DDL)
+    _migrate(conn)
     conn.execute(
-        "INSERT OR IGNORE INTO meta(key, value) VALUES (?, ?)",
+        "INSERT INTO meta(key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         ("schema_version", SCHEMA_VERSION),
     )
     return conn
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Apply in-place column additions for pre-existing databases.
+
+    ``CREATE TABLE IF NOT EXISTS`` in schema.sql is a no-op once the table
+    exists, so new columns have to be ALTER-ed in. We detect older schemas
+    by inspecting ``pragma_table_info`` rather than trusting the stored
+    ``schema_version`` — a DB shipped before the meta key existed reports
+    no version, but its column set is unambiguous.
+    """
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(documents)").fetchall()}
+    if "first_published_date" not in cols:
+        conn.execute("ALTER TABLE documents ADD COLUMN first_published_date TEXT")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_doc_firstpub ON documents(first_published_date)"
+        )
+    if "human_title" not in cols:
+        conn.execute("ALTER TABLE documents ADD COLUMN human_title TEXT")
 
 
 def get_meta(conn: sqlite3.Connection, key: str) -> str | None:

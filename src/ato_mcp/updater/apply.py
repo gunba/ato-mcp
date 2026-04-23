@@ -347,7 +347,9 @@ def _insert_record(conn: sqlite3.Connection, record: dict, ref: DocRef) -> None:
         (
             record["doc_id"], record["canonical_id"], record["href"], record["category"],
             record.get("doc_type"), record.get("docid_code"), record["title"],
-            record.get("pub_date"), record.get("effective_date"), record.get("status"),
+            record.get("human_title"),
+            record.get("pub_date"), record.get("first_published_date"),
+            record.get("effective_date"), record.get("status"),
             1 if record.get("has_content") else 0, record["downloaded_at"],
             record["content_hash"], ref.pack_sha8,
         ),
