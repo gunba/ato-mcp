@@ -15,13 +15,14 @@ from ato_mcp.indexer.pack import (
 def _record(doc_id: str) -> dict:
     return {
         "doc_id": doc_id,
-        "canonical_id": f"/law/view/document?docid={doc_id}",
         "href": f"/law/view/document?docid={doc_id}",
         "category": "Cases",
         "doc_type": "JUD",
-        "docid_code": None,
+        "human_code": None,
         "title": f"Document {doc_id}",
+        "human_title": None,
         "pub_date": None,
+        "first_published_date": None,
         "effective_date": None,
         "status": "active",
         "has_content": True,

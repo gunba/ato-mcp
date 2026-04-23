@@ -12,14 +12,15 @@ for offline verification (``ato-mcp doctor``).
 Records are the fundamental delta unit. A document record contains:
 
     {
-        "doc_id": str,
-        "canonical_id": str,
+        "doc_id": str,                    # full docid path incl. prefix
         "href": str,
         "category": str,
         "doc_type": str | None,
-        "docid_code": str | None,
+        "human_code": str | None,         # short human citation, main-PC populated
         "title": str,
+        "human_title": str | None,        # long generated title
         "pub_date": str | None,
+        "first_published_date": str | None,
         "effective_date": str | None,
         "status": str | None,
         "has_content": bool,

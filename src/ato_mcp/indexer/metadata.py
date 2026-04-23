@@ -4,9 +4,11 @@ The canonical_id for every ATO document is a URL fragment of the form
 ``/law/view/document?docid=<PREFIX>/<CODE>/.../<VERSION>`` where PREFIX is one
 of ~40 known document-type codes (TR, GSTR, ATOID, PCG, TA, LCR, PS LA, ...).
 
-We use the prefix as the primary doc_type signal; titles + content provide
-human-readable ``docid_code`` ("TR 2024/3") and publication dates when
-present.
+We use the prefix as the primary doc_type signal; ``doc_id`` in the v4 schema
+is the entire docid path verbatim (prefix included), which is unique per
+document. A short human citation like ``"TR 2024/3"`` lives in ``human_code``
+and is populated by the main-PC corpus parser rather than derived from the
+URL here.
 """
 from __future__ import annotations
 
@@ -21,7 +23,6 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 import yaml
 
-_SLUG_RE = re.compile(r"[^A-Za-z0-9]+")
 _DATE_RE = re.compile(
     r"\b(\d{1,2})\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{4})\b",
     re.IGNORECASE,
@@ -73,31 +74,43 @@ def _load_doc_type_map() -> dict[str, dict[str, str]]:
 @dataclass
 class DocMetadata:
     doc_id: str
-    canonical_id: str
     href: str
     category: str
     doc_type: str | None
-    docid_code: str | None
+    human_code: str | None
     title: str
+    human_title: str | None
     pub_date: str | None
+    first_published_date: str | None
     effective_date: str | None
     status: str | None
     has_content: bool
     content_hash: str
 
 
-def slugify(text: str, fallback: str = "doc", max_len: int = 80) -> str:
-    cleaned = _SLUG_RE.sub("_", text.strip()).strip("_").lower()
-    if not cleaned:
-        cleaned = fallback
-    return cleaned[:max_len]
+def _extract_docid_path(canonical_id: str) -> str | None:
+    """Pull the ``docid=<path>`` query value out of an ATO canonical URL.
+
+    The returned string is the verbatim docid path (prefix included), e.g.
+    ``"TXR/TR20133/NAT/ATO/00001"``. This is the ``doc_id`` primary key in
+    the v4 schema — no slugification, case preserved.
+    """
+    parsed = urlparse(canonical_id)
+    docid_values = parse_qs(parsed.query).get("docid")
+    if not docid_values:
+        return None
+    return unquote(docid_values[0]) or None
 
 
 def doc_id_for(canonical_id: str) -> str:
-    parsed = urlparse(canonical_id)
-    docid_values = parse_qs(parsed.query).get("docid")
-    seed = unquote(docid_values[0]) if docid_values else canonical_id
-    return slugify(seed)
+    """Return the primary-key ``doc_id`` for this URL.
+
+    ``doc_id`` is the ATO's docid path verbatim — prefix, case, and slashes
+    preserved — because the path form is both unique and human-inspectable.
+    Falls back to the raw URL if the ``docid=`` query parameter is missing,
+    so we always have *some* unique key even for malformed inputs.
+    """
+    return _extract_docid_path(canonical_id) or canonical_id
 
 
 def category_from_path(payload_path: str | None) -> str:
@@ -113,11 +126,9 @@ def parse_docid(canonical_id: str) -> tuple[str | None, str | None]:
     """Return ``(prefix, doc_type_name)``. Prefix is uppercased first segment
     of the docid, e.g. ``TR`` from ``TR/TR20243/NAT/ATO/00001``.
     """
-    parsed = urlparse(canonical_id)
-    docid_values = parse_qs(parsed.query).get("docid")
-    if not docid_values:
+    docid = _extract_docid_path(canonical_id)
+    if not docid:
         return None, None
-    docid = unquote(docid_values[0])
     segments = [s for s in docid.split("/") if s]
     if not segments:
         return None, None
@@ -148,11 +159,9 @@ _YEAR_RE = re.compile(r"(?:19|20)\d{2}")
 
 def year_for_docid(canonical_id: str) -> str | None:
     """Best-effort year extraction from the docid body. E.g. ``CR202612`` → ``2026``."""
-    parsed = urlparse(canonical_id)
-    docid_values = parse_qs(parsed.query).get("docid")
-    if not docid_values:
+    docid = _extract_docid_path(canonical_id)
+    if not docid:
         return None
-    docid = unquote(docid_values[0])
     segments = [s for s in docid.split("/") if s]
     for seg in segments[:2]:
         m = _YEAR_RE.search(seg)
@@ -275,7 +284,7 @@ def content_hash(markdown: str, metadata: dict[str, Any]) -> str:
     """Stable hash of (cleaned markdown + key metadata). Used for delta diffing."""
     h = hashlib.sha256()
     h.update(markdown.encode("utf-8", errors="replace"))
-    for key in ("title", "doc_type", "docid_code", "pub_date", "status"):
+    for key in ("title", "doc_type", "pub_date", "status"):
         value = metadata.get(key)
         if value:
             h.update(b"\0")
@@ -285,40 +294,3 @@ def content_hash(markdown: str, metadata: dict[str, Any]) -> str:
     return "sha256:" + h.hexdigest()
 
 
-def extract_docid_code(canonical_id: str | None) -> str | None:
-    """Return the URL-derived docid_code, verbatim minus the category prefix.
-
-    Every ATO document's canonical URL carries a ``docid`` query parameter of
-    the form ``<CATEGORY>/<rest...>`` where ``<CATEGORY>`` is the segment we
-    already track separately as ``doc_type`` (NEM, DPC, JUD, AID, TXR, ...).
-    The rest is the document's stable identifier, including any trailing page
-    number. Examples::
-
-        NEM/EM202412/NAT/ATO/00003   ->  EM202412/NAT/ATO/00003
-        DPC/PCG2026D1/NAT/ATO/00001  ->  PCG2026D1/NAT/ATO/00001
-        AID/AID200634/00001          ->  AID200634/00001
-        JUD/2020ATC10-558/00001      ->  2020ATC10-558/00001
-        JUD/*2012*AATA129/00002      ->  *2012*AATA129/00002
-
-    This replaces the previous regex-over-title-and-body implementation.
-    That approach had 3% coverage (the hardcoded 21-prefix regex didn't
-    match most docid formats) and cross-contaminated results — an ATO ID
-    page that cited ``TR 2024/3`` in its opening paragraph inherited that
-    code as its own.
-
-    A human-readable citation (``TR 2024/3``, ``ATO ID 2006/34``) is a
-    separate concern handled by title extraction. The URL-derived form
-    here is what the agent passes back verbatim when retrieving a
-    document, and is always unambiguous.
-    """
-    if not canonical_id:
-        return None
-    parsed = urlparse(canonical_id)
-    docid_values = parse_qs(parsed.query).get("docid")
-    if not docid_values:
-        return None
-    docid = unquote(docid_values[0])
-    if "/" not in docid:
-        return None
-    _prefix, _sep, rest = docid.partition("/")
-    return rest or None

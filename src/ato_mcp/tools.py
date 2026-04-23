@@ -170,11 +170,13 @@ def _build_sql_filter(
         clauses.append("d.pub_date <= ?")
         params.append(date_to)
     if doc_scope:
+        # Auto-detect: a `/` anywhere in the scope means the agent is scoping
+        # by the machine doc_id path (e.g. "TXR/TR20133/*"). Otherwise assume
+        # the short human citation form (e.g. "TR 2013/3").
         pattern = _glob_to_like(doc_scope)
-        # docid_code is the human form ("TR 2024/3"); doc_id is the slug ("tr_2024_3").
-        # Match either so the agent can paste whichever it has.
-        clauses.append(r"(d.doc_id LIKE ? ESCAPE '\' OR d.docid_code LIKE ? ESCAPE '\')")
-        params.extend([pattern, pattern])
+        column = "d.doc_id" if "/" in doc_scope else "d.human_code"
+        clauses.append(f"{column} LIKE ? ESCAPE '\\'")
+        params.append(pattern)
     if category_scope:
         clauses.append(r"d.category LIKE ? ESCAPE '\'")
         params.append(_glob_to_like(category_scope))
@@ -303,7 +305,8 @@ def _load_hit(conn: sqlite3.Connection, chunk_id: int) -> dict | None:
     row = conn.execute(
         """
         SELECT c.chunk_id, c.doc_id, c.ord, c.heading_path, c.anchor, c.text,
-               d.docid_code, d.title, d.category, d.doc_type, d.href, d.pub_date
+               d.human_code, d.title, d.human_title, d.category, d.doc_type,
+               d.href, d.pub_date
         FROM chunks c JOIN documents d ON d.doc_id = c.doc_id
         WHERE c.chunk_id = ?
         """,
@@ -319,8 +322,9 @@ def _load_hit(conn: sqlite3.Connection, chunk_id: int) -> dict | None:
         "heading_path": row["heading_path"] or "",
         "anchor": row["anchor"],
         "text": text,
-        "docid_code": row["docid_code"],
+        "human_code": row["human_code"],
         "title": row["title"],
+        "human_title": row["human_title"],
         "category": row["category"],
         "doc_type": row["doc_type"],
         "href": row["href"],
@@ -387,7 +391,7 @@ def search(
 
 
 def _slim_hit(hit: dict) -> dict:
-    keys = ("doc_id", "docid_code", "title", "category", "doc_type",
+    keys = ("doc_id", "human_code", "title", "human_title", "category", "doc_type",
             "heading_path", "snippet", "canonical_url", "score", "chunk_id")
     return {k: hit.get(k) for k in keys}
 
@@ -410,7 +414,7 @@ def search_titles(
     params.append(k)
     sql = f"""
         SELECT t.doc_id AS doc_id, bm25(title_fts) AS score,
-               d.docid_code, d.title, d.category, d.doc_type, d.href, d.pub_date
+               d.human_code, d.title, d.human_title, d.category, d.doc_type, d.href, d.pub_date
         FROM title_fts t
         JOIN documents d ON d.doc_id = t.doc_id
         WHERE title_fts MATCH ? {where}
@@ -424,12 +428,13 @@ def search_titles(
     for row in rows:
         hits.append({
             "doc_id": row["doc_id"],
-            "docid_code": row["docid_code"],
+            "human_code": row["human_code"],
             "title": row["title"],
+            "human_title": row["human_title"],
             "category": row["category"],
             "doc_type": row["doc_type"],
             "heading_path": "",
-            "snippet": row["title"],
+            "snippet": row["human_title"] or row["title"],
             "canonical_url": formatters.canonical_url(row["href"]),
             "pub_date": row["pub_date"],
             "score": row["score"],
@@ -507,7 +512,11 @@ def get_section(
             "canonical_url": formatters.canonical_url(doc_row["href"]),
             "chunks": payload,
         })
-    header = f"**{doc_row['title']}** — [{doc_row['docid_code'] or doc_row['doc_id']}]({formatters.canonical_url(doc_row['href'])})\n\n"
+    header = (
+        f"**{doc_row['human_title'] or doc_row['title']}** — "
+        f"[{doc_row['human_code'] or doc_row['doc_id']}]"
+        f"({formatters.canonical_url(doc_row['href'])})\n\n"
+    )
     body = "\n\n".join(f"### {c['heading_path'] or '(intro)'}\n\n{c['text']}" for c in payload)
     return header + body + "\n"
 
@@ -524,7 +533,7 @@ def get_chunks(
     rows = backend.db.execute(
         f"""
         SELECT c.chunk_id, c.doc_id, c.ord, c.heading_path, c.anchor, c.text,
-               d.docid_code, d.title, d.href
+               d.human_code, d.title, d.human_title, d.href
         FROM chunks c JOIN documents d ON d.doc_id = c.doc_id
         WHERE c.chunk_id IN ({placeholders})
         """,
@@ -536,7 +545,8 @@ def get_chunks(
             "chunk_id": row["chunk_id"],
             "doc_id": row["doc_id"],
             "title": row["title"],
-            "docid_code": row["docid_code"],
+            "human_title": row["human_title"],
+            "human_code": row["human_code"],
             "heading_path": row["heading_path"] or "",
             "anchor": row["anchor"],
             "canonical_url": formatters.canonical_url(row["href"]),
@@ -546,8 +556,10 @@ def get_chunks(
         return formatters.as_json({"chunks": records})
     lines = []
     for r in records:
+        label = r.get("human_code") or r["doc_id"]
+        title = r.get("human_title") or r.get("title") or label
         lines.append(
-            f"**{r['docid_code'] or r['doc_id']}** — [{r['title']}]({r['canonical_url']}) — "
+            f"**{label}** — [{title}]({r['canonical_url']}) — "
             f"{r['heading_path']}\n\n{r['text']}\n\n---"
         )
     return "\n".join(lines)
@@ -576,7 +588,7 @@ def whats_new(
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
     params.append(limit)
     sql = f"""
-        SELECT doc_id, docid_code, title, category, doc_type, href,
+        SELECT doc_id, human_code, title, human_title, category, doc_type, href,
                pub_date, first_published_date, downloaded_at
         FROM documents {where}
         ORDER BY {sort_expr} DESC LIMIT ?
@@ -584,8 +596,9 @@ def whats_new(
     rows = backend.db.execute(sql, params).fetchall()
     hits = [{
         "doc_id": r["doc_id"],
-        "docid_code": r["docid_code"],
+        "human_code": r["human_code"],
         "title": r["title"],
+        "human_title": r["human_title"],
         "category": r["category"],
         "doc_type": r["doc_type"],
         "heading_path": "",

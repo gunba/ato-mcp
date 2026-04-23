@@ -37,7 +37,7 @@ _NAV_LIKE_CLASSES = (
 class ExtractedDoc:
     markdown: str
     title: str | None
-    html_title: str | None = None  # raw <title> (browser tab text) — used for docid_code
+    html_title: str | None = None  # raw <title> (browser tab text)
     headings: list[str] = field(default_factory=list)
     anchors: list[tuple[str, str]] = field(default_factory=list)  # (heading_text, anchor_id)
 

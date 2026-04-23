@@ -23,8 +23,8 @@ def format_hits_markdown(hits: list[dict]) -> str:
         return "_No matches._"
     lines = ["| # | Doc | Category | Heading | Snippet |", "|---|---|---|---|---|"]
     for i, hit in enumerate(hits, start=1):
-        code = hit.get("docid_code") or hit["doc_id"]
-        title = hit.get("title") or code
+        code = hit.get("human_code") or hit["doc_id"]
+        title = hit.get("human_title") or hit.get("title") or code
         category = hit.get("category") or ""
         heading = (hit.get("heading_path") or "").replace("|", "\\|")
         snippet = (hit.get("snippet") or "").replace("|", "\\|").replace("\n", " ")
@@ -37,11 +37,11 @@ def format_hits_markdown(hits: list[dict]) -> str:
 
 def format_document_outline_markdown(doc: dict, chunks: list[dict]) -> str:
     header = (
-        f"# {doc['title']}\n\n"
+        f"# {doc.get('human_title') or doc['title']}\n\n"
         f"- **Doc ID:** `{doc['doc_id']}`\n"
         f"- **Category:** {doc.get('category') or ''}\n"
         f"- **Type:** {doc.get('doc_type') or ''}\n"
-        f"- **Code:** {doc.get('docid_code') or ''}\n"
+        f"- **Citation:** {doc.get('human_code') or ''}\n"
         f"- **Published:** {doc.get('pub_date') or 'n/a'}\n"
         f"- **Source:** {doc['canonical_url']}\n\n"
     )
@@ -65,10 +65,10 @@ def format_document_outline_markdown(doc: dict, chunks: list[dict]) -> str:
 
 def format_document_full_markdown(doc: dict, chunks: list[dict]) -> str:
     header = (
-        f"# {doc['title']}\n\n"
+        f"# {doc.get('human_title') or doc['title']}\n\n"
         f"**Source:** {doc['canonical_url']}\n"
         f"**Type:** {doc.get('doc_type') or ''}  \n"
-        f"**Code:** {doc.get('docid_code') or ''}  \n"
+        f"**Citation:** {doc.get('human_code') or ''}  \n"
         f"**Published:** {doc.get('pub_date') or 'n/a'}\n\n---\n\n"
     )
     blocks = []

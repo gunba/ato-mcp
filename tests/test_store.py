@@ -23,13 +23,13 @@ def _seed_doc(conn, doc_id: str, title: str, text: str) -> int:
     conn.execute(
         INSERT_DOCUMENT,
         (
-            doc_id, f"/law/view/document?docid={doc_id}", f"/law/view/document?docid={doc_id}",
+            doc_id, f"/law/view/document?docid={doc_id}",
             "Public_rulings", "TR", "TR 2024/3", title, None,
             "2024-07-01", "2024-07-01", None, "active", 1, "2026-04-18T00:00:00Z",
             "sha256:" + "0" * 64, "deadbeef",
         ),
     )
-    conn.execute(INSERT_TITLE_FTS, (doc_id, "TR 2024/3", title, ""))
+    conn.execute(INSERT_TITLE_FTS, (doc_id, "TR 2024/3", title, "", ""))
     compressed = zstd.ZstdCompressor(level=3).compress(text.encode("utf-8"))
     cur = conn.execute(INSERT_CHUNK, (doc_id, 0, "Root", None, compressed))
     rowid = cur.lastrowid
@@ -40,8 +40,10 @@ def _seed_doc(conn, doc_id: str, title: str, text: str) -> int:
 
 def test_schema_inserts_and_queries(tmp_path: Path) -> None:
     conn = store_db.init_db(tmp_path / "ato.db")
-    _seed_doc(conn, "d1", "R&D tax incentive ruling", "Research and development activities definition.")
-    _seed_doc(conn, "d2", "Capital works deductions", "Division 43 applies to buildings.")
+    _seed_doc(conn, "TXR/TR20243/NAT/ATO/00001", "R&D tax incentive ruling",
+              "Research and development activities definition.")
+    _seed_doc(conn, "TXR/TR9725/NAT/ATO/00001", "Capital works deductions",
+              "Division 43 applies to buildings.")
 
     docs = conn.execute("SELECT COUNT(*) AS n FROM documents").fetchone()["n"]
     assert docs == 2
@@ -51,7 +53,7 @@ def test_schema_inserts_and_queries(tmp_path: Path) -> None:
         "SELECT doc_id FROM title_fts WHERE title_fts MATCH ?",
         ("incentive",),
     ).fetchall()
-    assert [r["doc_id"] for r in rows] == ["d1"]
+    assert [r["doc_id"] for r in rows] == ["TXR/TR20243/NAT/ATO/00001"]
 
     # FTS over chunk text
     rows = conn.execute(

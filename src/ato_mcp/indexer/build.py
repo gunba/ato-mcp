@@ -136,7 +136,8 @@ def build(args: BuildArgs) -> Manifest:
 
             prefix, doc_type_name = meta_mod.parse_docid(canonical_id)
             doc_type = doc_type_name or prefix
-            docid_code = meta_mod.extract_docid_code(canonical_id)
+            # human_code is populated by the main-PC corpus parser, not here.
+            human_code: str | None = None
             human_title = meta_mod.compose_human_title(headings)
             pub_date = meta_mod.extract_pub_date(markdown) if markdown else None
             first_published_date = meta_mod.extract_first_published_date(
@@ -149,7 +150,6 @@ def build(args: BuildArgs) -> Manifest:
             meta_fields = {
                 "title": title,
                 "doc_type": doc_type,
-                "docid_code": docid_code,
                 "pub_date": pub_date,
                 "status": doc_status,
             }
@@ -179,15 +179,15 @@ def build(args: BuildArgs) -> Manifest:
             conn.execute(
                 INSERT_DOCUMENT,
                 (
-                    doc_id, canonical_id, href, category, doc_type, docid_code, title,
-                    human_title, pub_date, first_published_date, effective_date, doc_status,
+                    doc_id, href, category, doc_type, human_code, title, human_title,
+                    pub_date, first_published_date, effective_date, doc_status,
                     1 if has_content else 0,
                     downloaded_at, ch, "PENDING",  # pack_sha8 backfilled below
                 ),
             )
             conn.execute(
                 INSERT_TITLE_FTS,
-                (doc_id, docid_code or "", title, " ".join(headings)),
+                (doc_id, human_code or "", title, human_title or "", " ".join(headings)),
             )
             for i, c in enumerate(chunks):
                 compressed_text = zstd.ZstdCompressor(level=3).compress(c.text.encode("utf-8"))
@@ -202,11 +202,10 @@ def build(args: BuildArgs) -> Manifest:
             # Build a pack record. pack_sha8 + offset/length filled after pack close.
             record = {
                 "doc_id": doc_id,
-                "canonical_id": canonical_id,
                 "href": href,
                 "category": category,
                 "doc_type": doc_type,
-                "docid_code": docid_code,
+                "human_code": human_code,
                 "title": title,
                 "human_title": human_title,
                 "pub_date": pub_date,
@@ -339,8 +338,8 @@ def _insert_from_previous(
     conn.execute(
         INSERT_DOCUMENT,
         (
-            record["doc_id"], record["canonical_id"], record["href"], record["category"],
-            record.get("doc_type"), record.get("docid_code"), record["title"],
+            record["doc_id"], record["href"], record["category"],
+            record.get("doc_type"), record.get("human_code"), record["title"],
             record.get("human_title"),
             record.get("pub_date"), record.get("first_published_date"),
             record.get("effective_date"), record.get("status"),
@@ -350,7 +349,13 @@ def _insert_from_previous(
     )
     conn.execute(
         INSERT_TITLE_FTS,
-        (record["doc_id"], record.get("docid_code") or "", record["title"], ""),
+        (
+            record["doc_id"],
+            record.get("human_code") or "",
+            record["title"],
+            record.get("human_title") or "",
+            "",
+        ),
     )
     for c in record.get("chunks", []):
         compressed_text = zstd.ZstdCompressor(level=3).compress(c["text"].encode("utf-8"))

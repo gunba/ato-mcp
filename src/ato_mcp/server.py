@@ -40,9 +40,10 @@ def search(
     Returns the top ``k`` chunks ranked by RRF fusion. Multiple chunks from
     the same document are allowed — ranking decides distribution.
 
-    Scope with ``doc_scope`` (e.g. ``"TR 2024/3"``, ``"TR 2024/*"``, ``"tr_*"``)
-    to narrow to one doc or a glob of docs. Scope with ``category_scope``
-    (e.g. ``"Public_rulings"``, ``"Public_*"``) to restrict by folder.
+    ``doc_scope`` auto-detects: a value containing ``/`` matches against the
+    machine ``doc_id`` path (e.g. ``"TXR/TR20133/*"``); otherwise it matches
+    against the short human citation ``human_code`` (e.g. ``"TR 2013/3"``).
+    ``category_scope`` is a glob over ``category`` (e.g. ``"Public_*"``).
     Both accept shell-style ``*`` wildcards.
     """
     return T.search(
@@ -158,6 +159,13 @@ def _build_instructions() -> str:
         f"updated {meta_rows.get('last_update_at', 'unknown')}. "
         f"Embedding: {meta_rows.get('embedding_model_id', 'unknown')}.",
         "",
+        "Identifiers:",
+        "  doc_id      Unique machine ID. The full ATO docid path with slashes,",
+        "              e.g. `TXR/TR20133/NAT/ATO/00001`. Stable, use this whenever",
+        "              you need to refer to a specific document.",
+        "  human_code  Short human citation e.g. `TR 2013/3`. May be NULL; may be",
+        "              ambiguous (versions / addenda share citations).",
+        "",
         "Categories (use with `category_scope` glob or the `categories` filter):",
         "  " + ", ".join(categories),
         "",
@@ -166,9 +174,11 @@ def _build_instructions() -> str:
         "",
         "Retrieval flow:",
         "  1. `search(query, ...)` — hybrid BM25+vector. Returns chunks with",
-        "     heading_path + docid_code. Scope with `doc_scope=\"TR 2024/*\"` or",
-        "     `category_scope=\"Public_*\"` (shell-style globs).",
-        "  2. `search_titles(\"TR 2024/3\")` — direct citation lookup.",
+        "     heading_path + human_code + doc_id. Scope with",
+        "       `doc_scope=\"TXR/TR20133/*\"` (slash → matches doc_id path) or",
+        "       `doc_scope=\"TR 2013/3\"`    (no slash → matches human_code) or",
+        "       `category_scope=\"Public_*\"` (shell-style globs).",
+        "  2. `search_titles(\"TR 2013/3\")` — direct citation / title lookup.",
         "  3. `get_document(doc_id, format=\"outline\")` — cheap heading-only TOC.",
         "  4. `get_section(doc_id, heading_path=...)` or `get_chunks([ids])` —",
         "     expand context once you know what you want.",

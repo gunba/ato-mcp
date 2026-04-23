@@ -13,7 +13,7 @@ import sqlite_vec
 
 from ..util import paths
 
-SCHEMA_VERSION = "3"
+SCHEMA_VERSION = "4"
 EMBEDDING_DIM = 256
 EMBEDDING_DTYPE = "int8"
 
@@ -76,15 +76,34 @@ def init_db(path: Path | None = None) -> sqlite3.Connection:
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
-    """Apply in-place column additions for pre-existing databases.
+    """Apply in-place schema changes for pre-existing databases.
 
     ``CREATE TABLE IF NOT EXISTS`` in schema.sql is a no-op once the table
-    exists, so new columns have to be ALTER-ed in. We detect older schemas
-    by inspecting ``pragma_table_info`` rather than trusting the stored
-    ``schema_version`` — a DB shipped before the meta key existed reports
-    no version, but its column set is unambiguous.
+    exists, so structural changes have to be applied here. We detect older
+    schemas by inspecting ``pragma_table_info`` rather than trusting the
+    stored ``schema_version`` — a DB shipped before the meta key existed
+    reports no version, but its column set is unambiguous.
+
+    v4 rewrites the identifier model: ``doc_id`` switches from a slug to
+    the full docid path, and ``canonical_id`` + ``docid_code`` are dropped.
+    Row content cannot be reconstructed from v3 data (the slug is lossy),
+    so v3 → v4 demands a full rebuild. Earlier versions (v1, v2) only
+    needed ALTER-TABLE column additions and are handled in-place for
+    completeness.
     """
     cols = {row["name"] for row in conn.execute("PRAGMA table_info(documents)").fetchall()}
+
+    legacy_v1_or_v2 = "canonical_id" in cols or "docid_code" in cols
+    if legacy_v1_or_v2:
+        raise RuntimeError(
+            "This database is pre-v4 (it still has canonical_id / docid_code columns).\n"
+            "v4 changed the identifier model and needs a fresh build. Run\n"
+            "  ato-mcp build-index ...\n"
+            "to rebuild from ato_pages/, or delete ato.db and run `ato-mcp init`."
+        )
+
+    # Additive columns on a v4-shaped DB: these are here for forward compatibility
+    # if we ever need to extend again without a full rebuild.
     if "first_published_date" not in cols:
         conn.execute("ALTER TABLE documents ADD COLUMN first_published_date TEXT")
         conn.execute(
@@ -92,6 +111,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
         )
     if "human_title" not in cols:
         conn.execute("ALTER TABLE documents ADD COLUMN human_title TEXT")
+    if "human_code" not in cols:
+        conn.execute("ALTER TABLE documents ADD COLUMN human_code TEXT")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_doc_human_code ON documents(human_code)"
+        )
 
 
 def get_meta(conn: sqlite3.Connection, key: str) -> str | None:
