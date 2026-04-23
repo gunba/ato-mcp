@@ -15,6 +15,7 @@ document's ``content_hash`` is unchanged, the existing pack slot is reused.
 from __future__ import annotations
 
 import json
+import struct
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -38,11 +39,16 @@ from ..util.log import get_logger
 from . import chunk as chunk_mod
 from . import extract as extract_mod
 from . import metadata as meta_mod
-from .pack import PackBuilder, PackedDocRef, encode_embedding
+from .pack import TRAILER_MAGIC, PackBuilder, PackedDocRef, encode_embedding
 
 LOGGER = get_logger(__name__)
 
 BASE_URL = "https://www.ato.gov.au"
+
+# Commit the in-progress transaction every N newly-processed docs so a kill
+# mid-run only loses at most this many docs of work. Packs sealed at each
+# checkpoint become immutable on disk and are picked up on restart.
+CHECKPOINT_EVERY = 1000
 
 
 @dataclass
@@ -67,18 +73,31 @@ def build(args: BuildArgs) -> Manifest:
     packs_dir = args.out_dir / "packs"
     packs_dir.mkdir(parents=True, exist_ok=True)
 
+    # Clean stale tmp pack files left by a prior crashed run.
+    for stale in packs_dir.glob(".pack-writing-*.bin.zst.tmp"):
+        stale.unlink()
+
     prev_manifest: Manifest | None = None
     prev_docs: dict[str, DocRef] = {}
     prev_pack_info: dict[str, PackInfo] = {}
+    prev_packs_dir: Path | None = None
     if args.previous_manifest and args.previous_manifest.exists():
         prev_manifest = load_manifest(args.previous_manifest)
         prev_docs = prev_manifest.doc_index()
         prev_pack_info = prev_manifest.pack_index()
+        prev_packs_dir = Path(args.previous_manifest).parent / "packs"
         LOGGER.info("Loaded previous manifest with %d documents", len(prev_docs))
 
     conn = store_db.init_db(args.db_path)
     store_db.set_meta(conn, "embedding_model_id", args.model_id)
     store_db.set_meta(conn, "index_version", _today_version())
+
+    # Resume support: any doc_id already in documents with a sealed pack
+    # (pack_sha8 != PENDING) is skipped this run. The prior commit landed its
+    # rows + pack bytes atomically, so the state is safe to keep.
+    resume_done = _load_resume_state(conn)
+    if resume_done:
+        LOGGER.info("Resuming: %d documents already committed; will skip them", len(resume_done))
 
     index_records = _iter_index(args.pages_dir)
     if args.limit is not None:
@@ -95,6 +114,7 @@ def build(args: BuildArgs) -> Manifest:
     reused_pack_shas: set[str] = set()
     processed = 0
     reused = 0
+    since_checkpoint = 0
     t0 = time.monotonic()
 
     conn.execute("BEGIN")
@@ -103,6 +123,8 @@ def build(args: BuildArgs) -> Manifest:
             canonical_id = rec["canonical_id"]
             href = rec.get("href") or canonical_id
             doc_id = meta_mod.doc_id_for(canonical_id)
+            if doc_id in resume_done:
+                continue
             category = meta_mod.category_from_path(rec.get("payload_path"))
             status = rec.get("status")
             has_content = status == "success"
@@ -162,7 +184,11 @@ def build(args: BuildArgs) -> Manifest:
                 reused_pack_shas.add(prev_ref.pack_sha8)
                 reused += 1
                 processed += 1
+                since_checkpoint += 1
                 _insert_from_previous(conn, rec, prev_ref, args.previous_manifest, prev_pack_info)
+                if since_checkpoint >= CHECKPOINT_EVERY:
+                    _checkpoint(conn, pack_builder, doc_refs)
+                    since_checkpoint = 0
                 continue
 
             chunks = (
@@ -242,32 +268,38 @@ def build(args: BuildArgs) -> Manifest:
                 )
             )
             processed += 1
+            since_checkpoint += 1
             if processed % 500 == 0:
                 LOGGER.info("processed=%d reused=%d", processed, reused)
+            if since_checkpoint >= CHECKPOINT_EVERY:
+                _checkpoint(conn, pack_builder, doc_refs)
+                since_checkpoint = 0
 
-        packs_written = pack_builder.close()
-        _backfill_pack_slots(doc_refs, packs_written, conn)
-        store_db.set_meta(conn, "last_update_at", datetime.now(timezone.utc).isoformat())
-        conn.execute("COMMIT")
+        # Final checkpoint seals the last pack and commits leftover docs.
+        _checkpoint(conn, pack_builder, doc_refs)
     except Exception:
         conn.execute("ROLLBACK")
         raise
 
-    # Build the manifest
-    new_packs: list[PackInfo] = []
-    for path, sha8, sha256, size, _refs in packs_written:
-        new_packs.append(
-            PackInfo(
-                sha8=sha8,
-                sha256=sha256,
-                size=size,
-                url=f"packs/pack-{sha8}.bin.zst",  # relative; release step rewrites
-            )
-        )
-    # Reused packs carry their previous URL + hash unchanged.
-    for sha8 in reused_pack_shas:
-        if sha8 not in {p.sha8 for p in new_packs} and sha8 in prev_pack_info:
+    # Build the manifest from DB state so resumed runs pick up work committed
+    # in prior sessions as well as this one.
+    pack_search_dirs = [packs_dir]
+    if prev_packs_dir is not None:
+        pack_search_dirs.append(prev_packs_dir)
+    doc_refs_final = _load_doc_refs_from_db(conn, pack_search_dirs)
+    new_packs = _scan_packs_dir(packs_dir)
+    have = {p.sha8 for p in new_packs}
+    # Any pack referenced by a doc_ref but not in our new packs dir must be
+    # a reused pack — pull its PackInfo from the previous manifest.
+    referenced = {r.pack_sha8 for r in doc_refs_final}
+    for sha8 in referenced - have:
+        if sha8 in prev_pack_info:
             new_packs.append(prev_pack_info[sha8])
+        else:
+            raise RuntimeError(
+                f"doc references pack {sha8} but it's neither in {packs_dir} "
+                f"nor in the previous manifest"
+            )
 
     manifest = Manifest(
         index_version=_today_version(),
@@ -278,12 +310,15 @@ def build(args: BuildArgs) -> Manifest:
             size=args.model_size or 0,
             url=args.model_url or f"model/{args.model_id}.onnx.zst",
         ),
-        documents=doc_refs,
+        documents=doc_refs_final,
         packs=new_packs,
     )
     (args.out_dir / "manifest.json").write_bytes(manifest.to_bytes())
     dt = time.monotonic() - t0
-    LOGGER.info("Indexed %d docs (%d reused) in %.1fs", processed, reused, dt)
+    LOGGER.info(
+        "Indexed %d docs this session (%d reused); manifest has %d total in %.1fs",
+        processed, reused, len(doc_refs_final), dt,
+    )
     return manifest
 
 
@@ -390,3 +425,116 @@ def _take(it: Iterator[dict], n: int) -> Iterator[dict]:
 
 def _today_version() -> str:
     return datetime.now(timezone.utc).strftime("%Y.%m.%d")
+
+
+def _checkpoint(conn, pack_builder: PackBuilder, doc_refs: list[DocRef]) -> None:
+    """Seal the current pack, backfill pack_sha8 for this session's new docs,
+    and commit + reopen the transaction. Safe to call when nothing is pending.
+    """
+    pack_builder.flush()
+    sealed = pack_builder.finalized_packs
+    pending = [r for r in doc_refs if r.pack_sha8 == "PENDING"]
+    if pending:
+        _backfill_pack_slots(pending, sealed, conn)
+    store_db.set_meta(conn, "last_update_at", datetime.now(timezone.utc).isoformat())
+    conn.execute("COMMIT")
+    conn.execute("BEGIN")
+
+
+def _load_resume_state(conn) -> set[str]:
+    """Doc IDs already sealed in a prior checkpoint of this DB.
+
+    A row is resumable only if its pack has been sealed (pack_sha8 != PENDING).
+    PENDING rows live in an uncommitted transaction anyway; a crash rolled
+    them back. Returns the set of doc_ids to skip on this session.
+    """
+    try:
+        rows = conn.execute(
+            "SELECT doc_id FROM documents WHERE pack_sha8 IS NOT NULL AND pack_sha8 != 'PENDING'"
+        ).fetchall()
+    except Exception:
+        return set()
+    return {r["doc_id"] for r in rows}
+
+
+def _load_doc_refs_from_db(conn, pack_search_dirs: list[Path]) -> list[DocRef]:
+    """Reconstruct the manifest's document list from committed DB state."""
+    rows = conn.execute(
+        "SELECT doc_id, content_hash, pack_sha8, category, doc_type, title, has_content "
+        "FROM documents WHERE pack_sha8 != 'PENDING' ORDER BY doc_id"
+    ).fetchall()
+    refs: list[DocRef] = [
+        DocRef(
+            doc_id=row["doc_id"],
+            content_hash=row["content_hash"],
+            pack_sha8=row["pack_sha8"],
+            offset=0,
+            length=0,
+            category=row["category"] or "",
+            doc_type=row["doc_type"],
+            title=row["title"],
+            has_content=bool(row["has_content"]),
+        )
+        for row in rows
+    ]
+    # offset/length aren't stored in the DB; read them from each pack's trailer.
+    _populate_offsets_from_packs(refs, pack_search_dirs)
+    return refs
+
+
+def _populate_offsets_from_packs(refs: list[DocRef], pack_search_dirs: list[Path]) -> None:
+    """Fill offset/length on doc_refs by reading each referenced pack's trailer.
+
+    Searches the supplied directories in order so incremental builds can find
+    reused packs in the previous release directory.
+    """
+    import orjson
+
+    by_pack: dict[str, list[DocRef]] = {}
+    for ref in refs:
+        by_pack.setdefault(ref.pack_sha8, []).append(ref)
+
+    trailer_struct = struct.Struct("<6sIQI")
+    for sha8, group in by_pack.items():
+        pack_path: Path | None = None
+        for search_dir in pack_search_dirs:
+            candidate = search_dir / f"pack-{sha8}.bin.zst"
+            if candidate.exists():
+                pack_path = candidate
+                break
+        if pack_path is None:
+            raise RuntimeError(
+                f"pack {sha8} not found in any of {pack_search_dirs}"
+            )
+        with open(pack_path, "rb") as fh:
+            fh.seek(0, 2)
+            size = fh.tell()
+            fh.seek(size - trailer_struct.size)
+            magic, _count, index_offset, index_len = trailer_struct.unpack(fh.read(trailer_struct.size))
+            if magic != TRAILER_MAGIC:
+                raise RuntimeError(f"pack {pack_path} has bad trailer magic")
+            fh.seek(index_offset)
+            index_blob = fh.read(index_len)
+        entries = orjson.loads(zstd.ZstdDecompressor().decompress(index_blob))
+        lut = {e["doc_id"]: (e["offset"], e["length"]) for e in entries}
+        for ref in group:
+            hit = lut.get(ref.doc_id)
+            if hit is None:
+                raise RuntimeError(f"doc {ref.doc_id} missing from pack {sha8}")
+            ref.offset, ref.length = hit
+
+
+def _scan_packs_dir(packs_dir: Path) -> list[PackInfo]:
+    """List every sealed pack present in the release packs dir."""
+    out: list[PackInfo] = []
+    for p in sorted(packs_dir.glob("pack-*.bin.zst")):
+        sha8 = p.stem.split("-", 1)[1].split(".", 1)[0]
+        out.append(
+            PackInfo(
+                sha8=sha8,
+                sha256="",  # filled in by the release step when needed
+                size=p.stat().st_size,
+                url=f"packs/pack-{sha8}.bin.zst",
+            )
+        )
+    return out
