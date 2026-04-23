@@ -5,6 +5,15 @@ Continue, etc.) tasked with installing or operating `ato-mcp` on the
 user's machine. Read this first; fall back to [README.md](README.md) for
 design detail.
 
+## On the main PC (has the source corpus + GPU)
+
+If you're operating on the machine that holds `ato_pages/` and the
+embedding-build GPU, your runbook is
+[docs/main-pc-runbook.md](docs/main-pc-runbook.md). That covers the v4
+schema rebuild, the `human_code` parser you're expected to iterate on,
+and `human_title` refinement. The schema will refuse to open a pre-v4
+DB with a clear rebuild message — don't try to migrate in place.
+
 ## Prerequisite: GitHub auth (private repo)
 
 `ato-mcp` lives in a private GitHub repo. Both `pipx install git+https://…`
