@@ -33,6 +33,8 @@ def search(
     doc_scope: str | None = None,
     category_scope: str | None = None,
     mode: Literal["hybrid", "vector", "keyword"] = "hybrid",
+    sort_by: Literal["relevance", "recency"] = "relevance",
+    recency_half_life_years: float | None = None,
     format: Literal["markdown", "json"] = "markdown",
 ) -> str:
     """Hybrid BM25 + vector search across the ATO corpus.
@@ -45,6 +47,15 @@ def search(
     against the short human citation ``human_code`` (e.g. ``"TR 2013/3"``).
     ``category_scope`` is a glob over ``category`` (e.g. ``"Public_*"``).
     Both accept shell-style ``*`` wildcards.
+
+    ``date_from`` / ``date_to`` filter on ``COALESCE(first_published_date,
+    pub_date)`` so historical documents without a header-date scrape still
+    reach the filter via their docid-derived year.
+
+    ``sort_by='recency'`` re-sorts the top-k by publication date descending
+    instead of relevance. ``recency_half_life_years`` (e.g. ``5.0``) boosts
+    more recent hits during relevance ranking — useful for tax law where
+    later guidance typically supersedes earlier.
     """
     return T.search(
         query,
@@ -56,6 +67,8 @@ def search(
         doc_scope=doc_scope,
         category_scope=category_scope,
         mode=mode,
+        sort_by=sort_by,
+        recency_half_life_years=recency_half_life_years,
         format=format,
     )
 
@@ -73,21 +86,41 @@ def search_titles(
 
 @mcp.tool
 def get_document(
-    doc_id: str, format: Literal["outline", "markdown", "json"] = "outline"
-) -> str:
-    """Fetch a document. ``outline`` is cheap (~2 KB); ``markdown`` returns full content."""
-    return T.get_document(doc_id, format=format)
-
-
-@mcp.tool
-def get_section(
     doc_id: str,
+    format: Literal["outline", "markdown", "json"] = "outline",
     anchor: str | None = None,
     heading_path: str | None = None,
-    format: Literal["markdown", "json"] = "markdown",
+    from_ord: int | None = None,
+    include_children: bool = False,
+    count: int | None = None,
+    max_chars: int | None = None,
 ) -> str:
-    """Fetch a single section of a document by anchor or heading path."""
-    return T.get_section(doc_id, anchor=anchor, heading_path=heading_path, format=format)
+    """Fetch a document, or a slice of one, through a single tool.
+
+    Modes:
+
+    * No selector + ``format='outline'`` → table of contents (cheap,
+      includes ``start_ord``/``chunk_count``/``bytes`` per heading).
+    * No selector + ``format='markdown'`` → full document body. Combine
+      with ``max_chars`` to cap size.
+    * ``anchor`` or ``heading_path`` → chunks at that heading.
+      ``include_children=True`` rolls up the entire subtree (section +
+      all nested sub-sections) until the next sibling or higher heading.
+    * ``from_ord=N`` → walk forward from an ordinal cursor. Pair with
+      ``count`` (chunk limit) or ``max_chars`` (char budget) to paginate
+      through a long document. Truncated JSON responses carry
+      ``continuation_ord`` for the follow-up call.
+    """
+    return T.get_document(
+        doc_id,
+        format=format,
+        anchor=anchor,
+        heading_path=heading_path,
+        from_ord=from_ord,
+        include_children=include_children,
+        count=count,
+        max_chars=max_chars,
+    )
 
 
 @mcp.tool

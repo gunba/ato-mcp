@@ -178,9 +178,55 @@ def test_get_document_outline(seeded_db: Path) -> None:
     assert "Research and development ruling" in out
 
 
-def test_get_section_returns_content(seeded_db: Path) -> None:
-    out = tools.get_section(DOC_TR, heading_path="Ruling", format="markdown")
+def test_get_document_section_via_heading_path(seeded_db: Path) -> None:
+    out = tools.get_document(DOC_TR, heading_path="Ruling", format="markdown")
     assert "Commissioner" in out
+
+
+def test_get_document_from_ord_paginates(seeded_db: Path) -> None:
+    # Walk from ord=1 with count=1 — should return one chunk and a cursor.
+    out = tools.get_document(DOC_TR, from_ord=1, count=1, format="json")
+    data = json.loads(out)
+    assert len(data["chunks"]) == 1
+    assert data["chunks"][0]["ord"] == 1
+
+
+def test_get_document_max_chars_truncates(seeded_db: Path) -> None:
+    out = tools.get_document(DOC_TR, format="json", max_chars=50)
+    data = json.loads(out)
+    assert len(data["chunks"]) >= 1
+    # Continuation cursor should be set when we stopped early.
+    total = sum(len(c["text"]) for c in data["chunks"])
+    if data.get("continuation_ord") is not None:
+        assert total <= 1000  # well under the doc
+
+
+def test_get_document_outline_carries_positions(seeded_db: Path) -> None:
+    out = tools.get_document(DOC_TR, format="outline")
+    assert "start_ord" not in out  # table rendering, not raw field names
+    assert "| ord |" in out
+    assert "chunks" in out
+
+
+def test_recency_boost_applies_decay() -> None:
+    """Unit test for the recency boost math — independent of FTS."""
+    from ato_mcp.tools import _apply_recency_boost
+    recs = [
+        {"score": 1.0, "first_published_date": "2025-11-10", "pub_date": None},  # fresh
+        {"score": 1.0, "first_published_date": "2020-01-01", "pub_date": None},  # 6 yr
+        {"score": 1.0, "first_published_date": None, "pub_date": None},          # unknown
+    ]
+    _apply_recency_boost(recs, half_life_years=5.0)
+    # Fresh should land highest, 6-year-old lower, unknown untouched (1.0).
+    assert recs[0]["score"] > recs[2]["score"] > recs[1]["score"], [r["score"] for r in recs]
+
+
+def test_search_exposes_first_published_date(seeded_db: Path) -> None:
+    out = tools.search("eligibility", mode="keyword", k=3, format="json")
+    data = json.loads(out)
+    assert data["hits"]
+    for h in data["hits"]:
+        assert "first_published_date" in h
 
 
 def test_whats_new_orders_by_first_published(seeded_db: Path) -> None:

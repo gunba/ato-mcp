@@ -163,11 +163,14 @@ def _build_sql_filter(
         placeholders = ",".join("?" * len(doc_types))
         clauses.append(f"d.doc_type IN ({placeholders})")
         params.extend(doc_types)
+    # Date filter uses COALESCE so rulings whose docid-derived year populated
+    # first_published_date (YYYY-01-01) still respond to time-range filters
+    # even when no precise header date was scraped.
     if date_from:
-        clauses.append("d.pub_date >= ?")
+        clauses.append("COALESCE(d.first_published_date, d.pub_date) >= ?")
         params.append(date_from)
     if date_to:
-        clauses.append("d.pub_date <= ?")
+        clauses.append("COALESCE(d.first_published_date, d.pub_date) <= ?")
         params.append(date_to)
     if doc_scope:
         # Auto-detect: a `/` anywhere in the scope means the agent is scoping
@@ -306,7 +309,7 @@ def _load_hit(conn: sqlite3.Connection, chunk_id: int) -> dict | None:
         """
         SELECT c.chunk_id, c.doc_id, c.ord, c.heading_path, c.anchor, c.text,
                d.human_code, d.title, d.human_title, d.category, d.doc_type,
-               d.href, d.pub_date
+               d.href, d.pub_date, d.first_published_date, d.status
         FROM chunks c JOIN documents d ON d.doc_id = c.doc_id
         WHERE c.chunk_id = ?
         """,
@@ -329,6 +332,8 @@ def _load_hit(conn: sqlite3.Connection, chunk_id: int) -> dict | None:
         "doc_type": row["doc_type"],
         "href": row["href"],
         "pub_date": row["pub_date"],
+        "first_published_date": row["first_published_date"],
+        "status": row["status"],
         "canonical_url": formatters.canonical_url(row["href"]),
     }
 
@@ -348,6 +353,8 @@ def search(
     doc_scope: str | None = None,
     category_scope: str | None = None,
     mode: Literal["hybrid", "vector", "keyword"] = "hybrid",
+    sort_by: Literal["relevance", "recency"] = "relevance",
+    recency_half_life_years: float | None = None,
     format: Literal["markdown", "json"] = "markdown",
 ) -> str:
     backend = get_backend()
@@ -376,23 +383,59 @@ def search(
     else:
         fused = [(cid, -score) for cid, score in vec_hits]
 
+    # Over-fetch so recency boost can re-order the frontier before we cut to k.
+    frontier = max(k * 2, 20) if recency_half_life_years else k
     records: list[dict] = []
-    for chunk_id, score in fused[:k]:
+    for chunk_id, score in fused[:frontier]:
         hit = _load_hit(backend.db, chunk_id)
         if hit is None:
             continue
         hit["score"] = score
         hit["snippet"] = _highlight_snippet(hit["text"], query)
         records.append(hit)
+
+    if recency_half_life_years and recency_half_life_years > 0:
+        _apply_recency_boost(records, half_life_years=recency_half_life_years)
+        records.sort(key=lambda r: r["score"], reverse=True)
+    if sort_by == "recency":
+        records.sort(
+            key=lambda r: r.get("first_published_date") or r.get("pub_date") or "",
+            reverse=True,
+        )
+    records = records[:k]
+
     payload = [_slim_hit(r) for r in records]
     if format == "json":
         return formatters.as_json({"query": query, "mode": mode, "hits": payload})
     return formatters.format_hits_markdown(payload)
 
 
+def _apply_recency_boost(records: list[dict], *, half_life_years: float) -> None:
+    """Multiply each record's ``score`` by a recency factor in (0.5, 1.5].
+
+    Factor = 0.5 + exp(-age_years * ln2 / half_life_years). That puts a
+    today-published doc at 1.5× score, a half-life-aged doc at 1.0×, and
+    very old docs at ≈0.5×. Missing dates get the neutral 1.0×.
+    """
+    import datetime as _dt
+    import math
+    now_year = _dt.datetime.now(tz=_dt.timezone.utc).year
+    decay = math.log(2) / half_life_years
+    for r in records:
+        date = r.get("first_published_date") or r.get("pub_date")
+        year = None
+        if date and len(date) >= 4 and date[:4].isdigit():
+            year = int(date[:4])
+        if year is None:
+            continue
+        age = max(0, now_year - year)
+        r["score"] = r["score"] * (0.5 + math.exp(-age * decay))
+
+
 def _slim_hit(hit: dict) -> dict:
     keys = ("doc_id", "human_code", "title", "human_title", "category", "doc_type",
-            "heading_path", "snippet", "canonical_url", "score", "chunk_id")
+            "heading_path", "snippet", "canonical_url", "score", "chunk_id",
+            "first_published_date", "pub_date", "status")
     return {k: hit.get(k) for k in keys}
 
 
@@ -448,77 +491,210 @@ def get_document(
     doc_id: str,
     *,
     format: Literal["outline", "markdown", "json"] = "outline",
-) -> str:
-    backend = get_backend()
-    row = backend.db.execute(SELECT_DOCUMENT, (doc_id,)).fetchone()
-    if row is None:
-        return f"_Document not found: `{doc_id}`_"
-    doc = dict(row)
-    doc["canonical_url"] = formatters.canonical_url(row["href"])
-    chunks_rows = backend.db.execute(SELECT_CHUNKS_FOR_DOC, (doc_id,)).fetchall()
-    chunks = [
-        {
-            "chunk_id": r["chunk_id"],
-            "ord": r["ord"],
-            "heading_path": r["heading_path"] or "",
-            "anchor": r["anchor"],
-            "text": _decompress(r["text"]),
-        }
-        for r in chunks_rows
-    ]
-    if format == "json":
-        return formatters.as_json({"document": doc, "chunks": chunks})
-    if format == "markdown":
-        return formatters.format_document_full_markdown(doc, chunks)
-    return formatters.format_document_outline_markdown(doc, chunks)
-
-
-def get_section(
-    doc_id: str,
-    *,
     anchor: str | None = None,
     heading_path: str | None = None,
-    format: Literal["markdown", "json"] = "markdown",
+    from_ord: int | None = None,
+    include_children: bool = False,
+    count: int | None = None,
+    max_chars: int | None = None,
 ) -> str:
+    """Return a document or a slice of it.
+
+    Three retrieval modes, all through one tool:
+
+    * **Whole document** (no selector) — `format='outline'` for the TOC,
+      `format='markdown'` for the full body. `max_chars` caps either.
+    * **A specific section** (`anchor=` or `heading_path=`) — returns the
+      chunk(s) at that heading. With `include_children=True` the return
+      grows to cover all nested sub-headings until the next sibling or
+      higher-level heading.
+    * **An ordinal range** (`from_ord=N`) — walk forward from a cursor
+      position. Combine with `count` or `max_chars` to paginate through
+      a long document without reading it all at once. The JSON payload
+      carries `continuation_ord` when truncation happened.
+
+    Outline entries include `start_ord`, `chunk_count`, and `bytes` so the
+    caller can budget before asking for body text.
+    """
     backend = get_backend()
     doc_row = backend.db.execute(SELECT_DOCUMENT, (doc_id,)).fetchone()
     if doc_row is None:
         return f"_Document not found: `{doc_id}`_"
-    chunks_rows = backend.db.execute(SELECT_CHUNKS_FOR_DOC, (doc_id,)).fetchall()
-    selected = []
-    for row in chunks_rows:
-        if anchor and row["anchor"] == anchor:
-            selected.append(row)
-        elif heading_path and row["heading_path"] == heading_path:
-            selected.append(row)
-    if not selected and not (anchor or heading_path):
-        # With no selector, return the first heading block.
-        selected = chunks_rows[:1]
-    if not selected:
-        return f"_Section not found in {doc_id} (anchor={anchor}, heading_path={heading_path!r})._"
-    payload = [
+    doc = dict(doc_row)
+    doc["canonical_url"] = formatters.canonical_url(doc_row["href"])
+
+    if format == "outline":
+        outline = _outline_for_doc(backend.db, doc_id, anchor=anchor,
+                                   heading_path=heading_path, from_ord=from_ord)
+        return formatters.format_document_outline_markdown(doc, outline_entries=outline)
+
+    chunks = _select_chunks(
+        backend.db, doc_id,
+        anchor=anchor, heading_path=heading_path, from_ord=from_ord,
+        include_children=include_children,
+        count=count, max_chars=max_chars,
+    )
+    if chunks is None:
+        return (
+            f"_Section not found in {doc_id} "
+            f"(anchor={anchor!r}, heading_path={heading_path!r}, from_ord={from_ord})._"
+        )
+    selected, continuation_ord = chunks
+
+    if format == "json":
+        return formatters.as_json({
+            "document": doc,
+            "chunks": selected,
+            "continuation_ord": continuation_ord,
+        })
+    return formatters.format_document_section_markdown(doc, selected, continuation_ord)
+
+
+def _outline_for_doc(
+    conn: sqlite3.Connection,
+    doc_id: str,
+    *,
+    anchor: str | None,
+    heading_path: str | None,
+    from_ord: int | None,
+) -> list[dict]:
+    """Outline = one row per distinct heading_path, ordered by first-appearance.
+
+    Returns `[{anchor, heading_path, depth, start_ord, chunk_count, bytes}, ...]`
+    where `bytes` is the compressed-on-disk size of the chunk text — caller
+    can multiply by ~3 for a rough uncompressed char estimate. When a
+    selector is supplied, the outline is narrowed to that subtree.
+    """
+    rows = conn.execute(
+        """
+        SELECT heading_path, anchor, MIN(ord) AS start_ord,
+               COUNT(*) AS chunk_count, SUM(LENGTH(text)) AS bytes
+        FROM chunks
+        WHERE doc_id = ?
+        GROUP BY heading_path
+        ORDER BY start_ord ASC
+        """,
+        (doc_id,),
+    ).fetchall()
+    entries = [
         {
+            "heading_path": r["heading_path"] or "",
+            "anchor": r["anchor"],
+            "depth": (r["heading_path"] or "").count(" › ") + 1 if r["heading_path"] else 0,
+            "start_ord": r["start_ord"],
+            "chunk_count": r["chunk_count"],
+            "bytes": r["bytes"],
+        }
+        for r in rows
+    ]
+
+    if anchor is None and heading_path is None and from_ord is None:
+        return entries
+
+    # Narrow to a subtree. Find the anchor entry, then keep descendants.
+    start_idx: int | None = None
+    for i, e in enumerate(entries):
+        if anchor and e["anchor"] == anchor:
+            start_idx = i
+            break
+        if heading_path and e["heading_path"] == heading_path:
+            start_idx = i
+            break
+        if from_ord is not None and e["start_ord"] >= from_ord:
+            start_idx = i
+            break
+    if start_idx is None:
+        return []
+    start = entries[start_idx]
+    start_path = start["heading_path"]
+    out = [start]
+    for e in entries[start_idx + 1:]:
+        hp = e["heading_path"]
+        if start_path and (hp == start_path or hp.startswith(start_path + " › ")):
+            out.append(e)
+        elif not start_path:
+            # Starting at the intro — keep everything.
+            out.append(e)
+        else:
+            break
+    return out
+
+
+def _select_chunks(
+    conn: sqlite3.Connection,
+    doc_id: str,
+    *,
+    anchor: str | None,
+    heading_path: str | None,
+    from_ord: int | None,
+    include_children: bool,
+    count: int | None,
+    max_chars: int | None,
+) -> tuple[list[dict], int | None] | None:
+    """Return (chunks, continuation_ord). None means "not found"."""
+    rows = conn.execute(SELECT_CHUNKS_FOR_DOC, (doc_id,)).fetchall()
+    if not rows:
+        return ([], None)
+
+    if anchor is None and heading_path is None and from_ord is None:
+        candidates = list(rows)
+        start_path = None
+    else:
+        start_idx: int | None = None
+        for i, r in enumerate(rows):
+            if anchor and r["anchor"] == anchor:
+                start_idx = i
+                break
+            if heading_path and r["heading_path"] == heading_path:
+                start_idx = i
+                break
+            if from_ord is not None and r["ord"] >= from_ord:
+                start_idx = i
+                break
+        if start_idx is None:
+            return None
+        candidates = list(rows[start_idx:])
+        start_path = candidates[0]["heading_path"] or ""
+
+    if (anchor or heading_path) and not include_children:
+        # Return only chunks at the exact heading path / anchor.
+        if anchor:
+            candidates = [r for r in candidates if r["anchor"] == anchor]
+        elif heading_path:
+            candidates = [r for r in candidates if r["heading_path"] == heading_path]
+    elif (anchor or heading_path) and include_children:
+        subtree: list = []
+        for r in candidates:
+            hp = r["heading_path"] or ""
+            if start_path == "" or hp == start_path or hp.startswith(start_path + " › "):
+                subtree.append(r)
+            else:
+                break
+        candidates = subtree
+
+    # Apply count / max_chars limits. We decompress lazily: only enough to
+    # hit the budget.
+    out: list[dict] = []
+    total_chars = 0
+    continuation_ord: int | None = None
+    for i, r in enumerate(candidates):
+        text = _decompress(r["text"])
+        if max_chars is not None and out and total_chars + len(text) > max_chars:
+            continuation_ord = r["ord"]
+            break
+        out.append({
             "chunk_id": r["chunk_id"],
             "ord": r["ord"],
             "heading_path": r["heading_path"] or "",
             "anchor": r["anchor"],
-            "text": _decompress(r["text"]),
-        }
-        for r in selected
-    ]
-    if format == "json":
-        return formatters.as_json({
-            "doc_id": doc_id,
-            "canonical_url": formatters.canonical_url(doc_row["href"]),
-            "chunks": payload,
+            "text": text,
         })
-    header = (
-        f"**{doc_row['human_title'] or doc_row['title']}** — "
-        f"[{doc_row['human_code'] or doc_row['doc_id']}]"
-        f"({formatters.canonical_url(doc_row['href'])})\n\n"
-    )
-    body = "\n\n".join(f"### {c['heading_path'] or '(intro)'}\n\n{c['text']}" for c in payload)
-    return header + body + "\n"
+        total_chars += len(text)
+        if count is not None and len(out) >= count:
+            if i + 1 < len(candidates):
+                continuation_ord = candidates[i + 1]["ord"]
+            break
+    return (out, continuation_ord)
 
 
 def get_chunks(

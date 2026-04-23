@@ -35,32 +35,86 @@ def format_hits_markdown(hits: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def format_document_outline_markdown(doc: dict, chunks: list[dict]) -> str:
+def format_document_outline_markdown(
+    doc: dict,
+    chunks: list[dict] | None = None,
+    *,
+    outline_entries: list[dict] | None = None,
+) -> str:
+    """Render a document outline as a markdown table.
+
+    Two input shapes are accepted for backward compat:
+
+    * ``outline_entries`` (preferred): precomputed list of dicts with
+      ``{heading_path, anchor, depth, start_ord, chunk_count, bytes}``.
+    * ``chunks``: raw chunks list — the function derives a basic outline
+      from distinct heading_paths.
+    """
     header = (
         f"# {doc.get('human_title') or doc['title']}\n\n"
         f"- **Doc ID:** `{doc['doc_id']}`\n"
         f"- **Category:** {doc.get('category') or ''}\n"
         f"- **Type:** {doc.get('doc_type') or ''}\n"
         f"- **Citation:** {doc.get('human_code') or ''}\n"
-        f"- **Published:** {doc.get('pub_date') or 'n/a'}\n"
+        f"- **Published:** {doc.get('first_published_date') or doc.get('pub_date') or 'n/a'}\n"
         f"- **Source:** {doc['canonical_url']}\n\n"
     )
-    if not chunks:
+    entries = outline_entries
+    if entries is None and chunks is not None:
+        seen: set[str] = set()
+        entries = []
+        for c in chunks:
+            hp = c.get("heading_path") or ""
+            if hp in seen:
+                continue
+            seen.add(hp)
+            entries.append({
+                "heading_path": hp,
+                "anchor": c.get("anchor"),
+                "depth": hp.count(" › ") + 1 if hp else 0,
+                "start_ord": c.get("ord"),
+                "chunk_count": 1,
+                "bytes": len((c.get("text") or "").encode("utf-8")),
+            })
+    if not entries:
         return header + "_No content available for this document._\n"
-    # Outline: take the first chunk per unique heading_path.
-    seen: set[str] = set()
-    body_lines: list[str] = ["## Outline\n"]
-    for c in chunks:
-        heading = c.get("heading_path") or ""
-        if heading in seen:
-            continue
-        seen.add(heading)
-        first_line = (c.get("text") or "").strip().splitlines()
-        lead = first_line[0] if first_line else ""
-        if len(lead) > 220:
-            lead = lead[:217].rstrip() + "..."
-        body_lines.append(f"- **{heading or '(intro)'}** — {lead}")
-    return header + "\n".join(body_lines) + "\n"
+    lines = [
+        "## Outline\n",
+        "| # | Heading | Anchor | ord | chunks | bytes |",
+        "|---|---|---|---|---|---|",
+    ]
+    for i, e in enumerate(entries, start=1):
+        heading = (e.get("heading_path") or "(intro)").replace("|", "\\|")
+        indent = "&nbsp;&nbsp;" * max(0, (e.get("depth") or 1) - 1)
+        lines.append(
+            f"| {i} | {indent}{heading} | `{e.get('anchor') or ''}` "
+            f"| {e.get('start_ord')} | {e.get('chunk_count')} | {e.get('bytes')} |"
+        )
+    return header + "\n".join(lines) + "\n"
+
+
+def format_document_section_markdown(
+    doc: dict,
+    chunks: list[dict],
+    continuation_ord: int | None = None,
+) -> str:
+    """Render a section (or range) of a document as markdown."""
+    header = (
+        f"**{doc.get('human_title') or doc['title']}** — "
+        f"[{doc.get('human_code') or doc['doc_id']}]({doc['canonical_url']})\n\n"
+    )
+    if not chunks:
+        return header + "_No chunks returned._\n"
+    body = "\n\n".join(
+        f"### {c['heading_path'] or '(intro)'}\n\n{c['text']}" for c in chunks
+    )
+    tail = ""
+    if continuation_ord is not None:
+        tail = (
+            f"\n\n---\n\n_Truncated. Continue with "
+            f"`get_document(doc_id, from_ord={continuation_ord})`._"
+        )
+    return header + body + tail + "\n"
 
 
 def format_document_full_markdown(doc: dict, chunks: list[dict]) -> str:
