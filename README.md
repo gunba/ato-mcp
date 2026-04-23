@@ -54,6 +54,43 @@ ato-mcp init                                     # downloads model + index (~700
 
 On Windows, substitute `%LOCALAPPDATA%\ato-mcp\` for the data directory.
 
+### Offline install (no git, no gh)
+
+On locked-down machines where `git` and the `gh` CLI are blocked, use the
+browser-only path. Each release ships two extra assets:
+
+- `ato_mcp-<version>-py3-none-any.whl` — the CLI, a ~100 KB pure-Python wheel
+- `ato-mcp-offline-<tag>.tar.zst.part01.bin`, `.part02.bin`, ... — a
+  pre-populated data directory (~2.5 GB total), split into <2 GB parts
+  to fit GitHub's release-asset cap
+
+On the locked machine:
+
+```bash
+# Download all assets via the browser from
+# https://github.com/gunba/ato-mcp/releases/latest, then:
+
+pipx install ~/Downloads/ato_mcp-*.whl
+mkdir -p ~/.local/share/ato-mcp                   # $XDG_DATA_HOME/ato-mcp/
+# The offline bundle is split into .part01.bin, .part02.bin, ... because
+# GitHub caps release assets at 2 GiB. `cat` reassembles them in order:
+cat ~/Downloads/ato-mcp-offline-*.tar.zst.part*.bin | \
+  tar -I zstd -x -C ~/.local/share/ato-mcp
+ato-mcp doctor                                    # verifies the bundle
+claude mcp add --scope user ato -- ato-mcp serve
+```
+
+If `zstd` isn't installed, grab it via your distro's package manager
+(`sudo apt install zstd`, `sudo dnf install zstd`, `brew install zstd`,
+etc.) — it's tiny and has no network dependencies once the package is
+cached locally.
+
+The bundle extracts to the same layout `ato-mcp init` would produce, so
+`ato-mcp stats`, `doctor`, and the MCP server all work identically.
+Future `ato-mcp update` calls still require network access to fetch
+manifest deltas — on a fully offline machine, just download a newer
+bundle and re-extract.
+
 ### Wire up Claude Code
 
 ```bash
@@ -267,7 +304,8 @@ model/embeddinggemma-<sha8>.onnx.zst     # rarely changes
 ## Maintainer workflow (updating the release)
 
 Only needed if you are publishing new index releases. End users never run
-these.
+these. See [MAINTENANCE.md](MAINTENANCE.md) for the full runbook (health
+checks, reconcile script, dependency bumps, release tags).
 
 Scraping defaults are polite: **1 worker, 1 s between requests (~1 req/s)**.
 Increase only if you have reason.

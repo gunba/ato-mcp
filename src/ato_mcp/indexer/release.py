@@ -69,11 +69,15 @@ def bundle_model(
     tar_buffer = io.BytesIO()
     with tarfile.open(fileobj=tar_buffer, mode="w") as tar:
         for name in include:
-            src = model_dir / name
-            if not src.exists():
-                raise FileNotFoundError(f"model bundle missing {src}")
-            # Flatten — store with just the base name.
-            tar.add(str(src), arcname=name)
+            # Search both model_dir and model_dir/onnx (onnx-community models
+            # ship the weights in an onnx/ subdir while the tokenizer sits at
+            # the top level).
+            for candidate in (model_dir / name, model_dir / "onnx" / name):
+                if candidate.exists():
+                    tar.add(str(candidate), arcname=name)
+                    break
+            else:
+                raise FileNotFoundError(f"model bundle missing {name} under {model_dir}")
     tar_buffer.seek(0)
     cctx = zstd.ZstdCompressor(level=level)
     with open(out_path, "wb") as fh:

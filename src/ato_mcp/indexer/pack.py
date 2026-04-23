@@ -226,3 +226,15 @@ class PackBuilder:
     def close(self) -> list[tuple[Path, str, str, int, list[PackedDocRef]]]:
         self._finalize()
         return list(self._packs)
+
+    def flush(self) -> None:
+        """Seal the in-flight pack right now so it hits disk.
+
+        Use at checkpoint boundaries to make partial progress durable. Safe
+        to call repeatedly; a no-op when no writer is open.
+        """
+        self._finalize()
+
+    @property
+    def finalized_packs(self) -> list[tuple[Path, str, str, int, list[PackedDocRef]]]:
+        return list(self._packs)

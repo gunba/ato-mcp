@@ -19,3 +19,4 @@ ato_pages/
 *.onnx
 *.onnx_data
 *.bin.zst
+logs/

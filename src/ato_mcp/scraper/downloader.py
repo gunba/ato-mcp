@@ -186,6 +186,20 @@ class LinkDownloader:
 	def _download_link(self, link: Dict[str, any], existing: Optional[Dict[str, any]], *, force: bool) -> Optional[DownloadResult]:
 		canonical_id = link["canonical_id"]
 		if not self._should_download(link, existing, force):
+			# Orphan payload: file on disk but no success row in the index. Emit a
+			# synthetic success so the builder sees the doc, without refetching.
+			if not force and (existing is None or existing.get("status") != "success") and self._payload_exists(link):
+				payload_path = self._build_payload_path(link, ensure_dirs=False)
+				return DownloadResult(
+					canonical_id=canonical_id,
+					href=link.get("href"),
+					status="success",
+					payload_path=str(payload_path.relative_to(self.output_dir)),
+					assets=[],
+					error=None,
+					http_status=None,
+					downloaded_at=self._now(),
+				)
 			return None
 
 		href = link.get("href")
