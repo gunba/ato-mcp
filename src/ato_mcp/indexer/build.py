@@ -158,8 +158,7 @@ def build(args: BuildArgs) -> Manifest:
 
             prefix, doc_type_name = meta_mod.parse_docid(canonical_id)
             doc_type = doc_type_name or prefix
-            # human_code is populated by the main-PC corpus parser, not here.
-            human_code: str | None = None
+            human_code = meta_mod.human_code_for_doc_id(doc_id)
             human_title = meta_mod.compose_human_title(headings)
             pub_date = meta_mod.extract_pub_date(markdown) if markdown else None
             first_published_date = meta_mod.extract_first_published_date(

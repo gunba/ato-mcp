@@ -299,6 +299,69 @@ def release(
     typer.echo(f"release {tag} published with manifest + packs")
 
 
+@app.command("backfill-human-codes")
+def backfill_human_codes(
+    db_path: Optional[Path] = typer.Option(
+        None,
+        help="Path to the ato.db to update. Defaults to the live install path.",
+    ),
+) -> None:
+    """Maintainer: recompute ``human_code`` for every doc whose code is NULL.
+
+    Applies the rules in ``ato_mcp.indexer.metadata.human_code_for_doc_id``
+    against ``documents.doc_id`` and writes the result into both the
+    ``documents`` table and the ``title_fts`` index. Safe to re-run as the
+    rule set grows — each pass only touches rows still NULL.
+
+    No embedding work; runs in minutes.
+    """
+    from .indexer.metadata import human_code_for_doc_id
+    from .store import db as store_db
+
+    target = db_path or paths.db_path()
+    if not target.exists():
+        typer.echo(f"no DB at {target}", err=True)
+        raise typer.Exit(code=1)
+
+    conn = store_db.connect(target, mode="rw")
+    try:
+        rows = conn.execute(
+            "SELECT doc_id FROM documents WHERE human_code IS NULL"
+        ).fetchall()
+        updated = 0
+        conn.execute("BEGIN")
+        try:
+            for row in rows:
+                did = row["doc_id"]
+                hc = human_code_for_doc_id(did)
+                if hc is None:
+                    continue
+                conn.execute(
+                    "UPDATE documents SET human_code = ? WHERE doc_id = ?",
+                    (hc, did),
+                )
+                conn.execute(
+                    "UPDATE title_fts SET human_code = ? WHERE doc_id = ?",
+                    (hc, did),
+                )
+                updated += 1
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        residual = conn.execute(
+            "SELECT COUNT(*) AS n FROM documents WHERE human_code IS NULL"
+        ).fetchone()["n"]
+    finally:
+        conn.close()
+
+    typer.echo(
+        f"backfill-human-codes: updated {updated} rows; "
+        f"{residual} documents still have NULL human_code "
+        f"(iterate rules in ato_mcp.indexer.metadata to shrink this)."
+    )
+
+
 def _bundled_pubkey_path() -> Path | None:
     candidate = Path(__file__).parent / "keys" / "maintainer.pub"
     return candidate if candidate.exists() else None

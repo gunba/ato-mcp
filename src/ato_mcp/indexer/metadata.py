@@ -280,6 +280,79 @@ def extract_status(markdown: str) -> str | None:
     return None
 
 
+# Series codes that use the <SERIES><YEAR><NUMBER> format with an optional
+# 'D' draft marker before the number. Listed longest-first because Python's
+# regex alternation is left-to-right, not longest-match — SMSFRB must beat
+# SMSFR, GSTR must beat GST, FBTR must beat FBT.
+#
+# IT is deliberately excluded: the Income Tax Ruling series predates
+# year-based numbering and is always cited by sequence number alone (IT 117,
+# IT 131). Including it would mis-parse "IT117" as "IT 11/7". Legacy
+# un-yeared series are an iteration target for later rule additions.
+_YEAR_SERIES = sorted([
+    "SMSFRB", "SMSFR", "SMSFD",
+    "GSTR", "GSTD", "FBTR", "WETR", "WETD",
+    "LCR", "SGR", "FTR", "PCG", "LCG", "PRR", "CLR", "COG", "TXD", "TPA", "FBT",
+    "CR", "PR", "TR", "TD", "MT", "TA", "LI", "LG", "WT",
+], key=len, reverse=True)
+_YEAR_SERIES_ALT = "|".join(_YEAR_SERIES)
+
+# 4-digit-year form: TR20243 -> TR 2024/3, PCG2025D6 -> PCG 2025/D6.
+_RE_YEAR4 = re.compile(rf"^({_YEAR_SERIES_ALT})(\d{{4}})(D?)(\d+)$")
+# Pre-2000 legacy 2-digit-year form: TR9725 -> TR 97/25. Year must start
+# with 8 or 9 (1980s/1990s); otherwise "MT2005" (a legacy un-yeared MT
+# ruling number 2005) would mis-parse as "MT 20/05".
+_RE_YEAR2 = re.compile(rf"^({_YEAR_SERIES_ALT})([89]\d)(\d+)$")
+# PS LA — final.
+_RE_PSLA = re.compile(r"^PSLA(\d{4})(\d+)$")
+# PS LA — draft (the PSD inner prefix itself marks it as draft; render with D).
+_RE_PSLA_DRAFT = re.compile(r"^PSD(\d{4})D?(\d+)$")
+# ATO ID: ATOID or AID inner prefix -> "ATO ID YYYY/NN".
+_RE_ATOID = re.compile(r"^(?:ATOID|AID)(\d{4})(\d+)$")
+
+
+def human_code_for_doc_id(doc_id: str) -> str | None:
+    """Derive the short human citation (e.g. ``"TR 2024/3"``) from ``doc_id``.
+
+    Operates on the *second* path segment of the v4 docid — the series code.
+    For ``"TXR/TR20243/NAT/ATO/00001"`` that's ``"TR20243"`` → ``"TR 2024/3"``.
+
+    Returns ``None`` for formats the rule set doesn't recognise (legacy
+    un-yeared IT/TD, consolidated EC/addendum suffixes, malformed paths);
+    callers must tolerate nulls by leaving ``documents.human_code`` unset.
+    Growing the rules is the main-PC iteration loop per
+    ``docs/main-pc-runbook.md`` §2.
+    """
+    segments = [s for s in doc_id.split("/") if s]
+    if len(segments) < 2:
+        return None
+    body = segments[1]
+    # Try modern 4-digit year first so e.g. TR20081 is "TR 2008/1", not
+    # "TR 20/081" as the 2-digit-year rule would emit.
+    m = _RE_YEAR4.match(body)
+    if m:
+        series, year, draft, number = m.groups()
+        return f"{series} {year}/{draft}{number}"
+    m = _RE_PSLA.match(body)
+    if m:
+        year, number = m.groups()
+        return f"PS LA {year}/{number}"
+    m = _RE_PSLA_DRAFT.match(body)
+    if m:
+        year, number = m.groups()
+        return f"PS LA {year}/D{number}"
+    m = _RE_ATOID.match(body)
+    if m:
+        year, number = m.groups()
+        return f"ATO ID {year}/{number}"
+    # Legacy 2-digit year applies only when the 4-digit rule didn't match.
+    m = _RE_YEAR2.match(body)
+    if m:
+        series, year, number = m.groups()
+        return f"{series} {year}/{number}"
+    return None
+
+
 def content_hash(markdown: str, metadata: dict[str, Any]) -> str:
     """Stable hash of (cleaned markdown + key metadata). Used for delta diffing."""
     h = hashlib.sha256()
