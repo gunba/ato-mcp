@@ -39,6 +39,7 @@ from ..util.log import get_logger
 from . import chunk as chunk_mod
 from . import extract as extract_mod
 from . import metadata as meta_mod
+from . import rules as rules_mod
 from .pack import TRAILER_MAGIC, PackBuilder, PackedDocRef, encode_embedding
 
 LOGGER = get_logger(__name__)
@@ -158,14 +159,20 @@ def build(args: BuildArgs) -> Manifest:
 
             prefix, doc_type_name = meta_mod.parse_docid(canonical_id)
             doc_type = doc_type_name or prefix
-            human_code = meta_mod.human_code_for_doc_id(doc_id)
-            human_title = meta_mod.compose_human_title(headings)
             pub_date = meta_mod.extract_pub_date(markdown) if markdown else None
-            first_published_date = meta_mod.extract_first_published_date(
-                markdown or "", canonical_id, pub_date
-            )
+            derived = rules_mod.derive_metadata(rules_mod.RuleInputs(
+                doc_id=doc_id,
+                title=title,
+                headings=tuple(headings),
+                body_head=markdown[:3000] if markdown else "",
+                category=category,
+                pub_date=pub_date,
+            ))
+            human_code = derived.human_code
+            human_title = meta_mod.compose_human_title(headings)
+            first_published_date = derived.first_published_date
             effective_date = None
-            doc_status = meta_mod.extract_status(markdown) or "active" if markdown else None
+            doc_status = derived.status or (meta_mod.extract_status(markdown) or "active" if markdown else None)
             downloaded_at = rec.get("downloaded_at") or datetime.now(timezone.utc).isoformat()
 
             meta_fields = {

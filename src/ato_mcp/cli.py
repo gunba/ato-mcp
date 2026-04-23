@@ -299,67 +299,175 @@ def release(
     typer.echo(f"release {tag} published with manifest + packs")
 
 
-@app.command("backfill-human-codes")
-def backfill_human_codes(
+@app.command("backfill-metadata")
+def backfill_metadata(
     db_path: Optional[Path] = typer.Option(
         None,
         help="Path to the ato.db to update. Defaults to the live install path.",
     ),
+    fields: str = typer.Option(
+        "all",
+        help=(
+            "Comma-separated fields to refresh: "
+            "`human_code`, `first_published_date`, `status`, or `all`. "
+            "Runs the rule engine on every document where the target field "
+            "is currently NULL (or all documents when `--force`)."
+        ),
+    ),
+    force: bool = typer.Option(
+        False,
+        help="Recompute even when the target field is already populated.",
+    ),
+    limit: Optional[int] = typer.Option(
+        None, help="Process at most N documents (for smoke tests)."
+    ),
 ) -> None:
-    """Maintainer: recompute ``human_code`` for every doc whose code is NULL.
+    """Maintainer: re-derive metadata (human_code, year, status) from rules.
 
-    Applies the rules in ``ato_mcp.indexer.metadata.human_code_for_doc_id``
-    against ``documents.doc_id`` and writes the result into both the
-    ``documents`` table and the ``title_fts`` index. Safe to re-run as the
-    rule set grows — each pass only touches rows still NULL.
-
-    No embedding work; runs in minutes.
+    Reads each document's title + chunk headings + first chunk's text from
+    the live DB (no HTML re-fetch, no GPU), runs
+    ``ato_mcp.indexer.rules.derive_metadata``, and writes the output to
+    ``documents`` + ``title_fts``. Safe to run repeatedly — each pass picks
+    up rows that grew a value since the previous pass, so you can iterate
+    the rule set in ``rules.py`` and re-run this in minutes to grow
+    coverage without touching embeddings.
     """
-    from .indexer.metadata import human_code_for_doc_id
+    from .indexer import rules as rules_mod
     from .store import db as store_db
+    from .store.queries import (
+        DELETE_TITLE_FTS_BY_DOC,
+        INSERT_TITLE_FTS,
+    )
 
     target = db_path or paths.db_path()
     if not target.exists():
         typer.echo(f"no DB at {target}", err=True)
         raise typer.Exit(code=1)
 
+    requested = {f.strip() for f in fields.split(",") if f.strip()}
+    valid = {"human_code", "first_published_date", "status", "all"}
+    unknown = requested - valid
+    if unknown:
+        typer.echo(f"unknown fields: {sorted(unknown)}", err=True)
+        raise typer.Exit(code=1)
+    if "all" in requested:
+        requested = {"human_code", "first_published_date", "status"}
+
     conn = store_db.connect(target, mode="rw")
     try:
-        rows = conn.execute(
-            "SELECT doc_id FROM documents WHERE human_code IS NULL"
-        ).fetchall()
-        updated = 0
+        where = []
+        if not force:
+            where = [f"{f} IS NULL" for f in requested]
+            where_sql = " OR ".join(where) if where else "1=1"
+        else:
+            where_sql = "1=1"
+        sql = (
+            "SELECT doc_id, title, category, pub_date FROM documents "
+            f"WHERE {where_sql} ORDER BY doc_id"
+        )
+        if limit is not None:
+            sql += f" LIMIT {int(limit)}"
+        rows = conn.execute(sql).fetchall()
+        total = len(rows)
+        typer.echo(f"backfill-metadata: {total} candidate rows")
+
+        updated = {f: 0 for f in requested}
+        import zstandard as zstd_mod
+        dctx = zstd_mod.ZstdDecompressor()
+
         conn.execute("BEGIN")
         try:
-            for row in rows:
-                did = row["doc_id"]
-                hc = human_code_for_doc_id(did)
-                if hc is None:
+            for i, row in enumerate(rows, start=1):
+                doc_id = row["doc_id"]
+                # Pull chunk heading_paths and the first chunk's decompressed
+                # text. Reading every chunk would be wasteful; the rule
+                # engine only cares about first ~3000 chars of body_head.
+                chunk_rows = conn.execute(
+                    "SELECT ord, heading_path, text FROM chunks "
+                    "WHERE doc_id = ? ORDER BY ord ASC LIMIT 3",
+                    (doc_id,),
+                ).fetchall()
+                headings = []
+                body_head = ""
+                seen_headings: set[str] = set()
+                for cr in chunk_rows:
+                    hp = (cr["heading_path"] or "").strip()
+                    if hp and hp not in seen_headings:
+                        seen_headings.add(hp)
+                        # Split the breadcrumb so each heading component is a
+                        # candidate for citation regexes.
+                        for seg in hp.split(" › "):
+                            if seg and seg not in headings:
+                                headings.append(seg)
+                    if not body_head:
+                        body_head = dctx.decompress(cr["text"]).decode(
+                            "utf-8", errors="replace"
+                        )[:3000]
+                derived = rules_mod.derive_metadata(rules_mod.RuleInputs(
+                    doc_id=doc_id,
+                    title=row["title"],
+                    headings=tuple(headings),
+                    body_head=body_head,
+                    category=row["category"],
+                    pub_date=row["pub_date"],
+                ))
+
+                updates: dict[str, str] = {}
+                if "human_code" in requested and derived.human_code:
+                    updates["human_code"] = derived.human_code
+                if "first_published_date" in requested and derived.first_published_date:
+                    updates["first_published_date"] = derived.first_published_date
+                if "status" in requested and derived.status:
+                    updates["status"] = derived.status
+                if not updates:
                     continue
+                set_clause = ", ".join(f"{k} = ?" for k in updates)
+                if not force:
+                    # Preserve any pre-existing non-NULL values.
+                    set_clause = ", ".join(
+                        f"{k} = COALESCE({k}, ?)" for k in updates
+                    )
                 conn.execute(
-                    "UPDATE documents SET human_code = ? WHERE doc_id = ?",
-                    (hc, did),
+                    f"UPDATE documents SET {set_clause} WHERE doc_id = ?",
+                    (*updates.values(), doc_id),
                 )
-                conn.execute(
-                    "UPDATE title_fts SET human_code = ? WHERE doc_id = ?",
-                    (hc, did),
-                )
-                updated += 1
+                if "human_code" in updates:
+                    # Title FTS carries human_code; refresh the row.
+                    conn.execute(
+                        "UPDATE title_fts SET human_code = ? WHERE doc_id = ?",
+                        (updates["human_code"], doc_id),
+                    )
+                for f in updates:
+                    updated[f] += 1
+                if i % 5000 == 0:
+                    typer.echo(f"  processed {i}/{total}")
             conn.execute("COMMIT")
         except Exception:
             conn.execute("ROLLBACK")
             raise
-        residual = conn.execute(
-            "SELECT COUNT(*) AS n FROM documents WHERE human_code IS NULL"
-        ).fetchone()["n"]
+
+        # Residual counts after write.
+        residuals = {}
+        for f in requested:
+            residuals[f] = conn.execute(
+                f"SELECT COUNT(*) AS n FROM documents WHERE {f} IS NULL"
+            ).fetchone()["n"]
     finally:
         conn.close()
 
-    typer.echo(
-        f"backfill-human-codes: updated {updated} rows; "
-        f"{residual} documents still have NULL human_code "
-        f"(iterate rules in ato_mcp.indexer.metadata to shrink this)."
-    )
+    for f in requested:
+        typer.echo(
+            f"  {f}: updated={updated[f]}, still NULL={residuals[f]}"
+        )
+    typer.echo("backfill-metadata: done")
+
+
+@app.command("backfill-human-codes", hidden=True)
+def backfill_human_codes_alias(
+    db_path: Optional[Path] = typer.Option(None),
+) -> None:
+    """Deprecated alias for `backfill-metadata --fields human_code`."""
+    backfill_metadata(db_path=db_path, fields="human_code", force=False, limit=None)
 
 
 def _bundled_pubkey_path() -> Path | None:
