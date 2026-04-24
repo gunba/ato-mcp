@@ -345,13 +345,13 @@ def backfill_metadata(
         raise typer.Exit(code=1)
 
     requested = {f.strip() for f in fields.split(",") if f.strip()}
-    valid = {"human_code", "first_published_date", "status", "all"}
+    valid = {"human_code", "human_title", "first_published_date", "status", "all"}
     unknown = requested - valid
     if unknown:
         typer.echo(f"unknown fields: {sorted(unknown)}", err=True)
         raise typer.Exit(code=1)
     if "all" in requested:
-        requested = {"human_code", "first_published_date", "status"}
+        requested = {"human_code", "human_title", "first_published_date", "status"}
 
     conn = store_db.connect(target, mode="rw")
     try:
@@ -370,6 +370,14 @@ def backfill_metadata(
         rows = conn.execute(sql).fetchall()
         total = len(rows)
         typer.echo(f"backfill-metadata: {total} candidate rows")
+
+        # Build doc_id -> title_fts.rowid once so per-row FTS updates use
+        # the INTEGER primary key (O(1)) instead of scanning the UNINDEXED
+        # doc_id column (~25ms/row -> ~0.01ms/row).
+        fts_rowid = {
+            r["doc_id"]: r["rowid"]
+            for r in conn.execute("SELECT rowid, doc_id FROM title_fts").fetchall()
+        }
 
         updated = {f: 0 for f in requested}
         import zstandard as zstd_mod
@@ -415,31 +423,44 @@ def backfill_metadata(
                 updates: dict[str, str] = {}
                 if "human_code" in requested and derived.human_code:
                     updates["human_code"] = derived.human_code
+                if "human_title" in requested and derived.human_title:
+                    updates["human_title"] = derived.human_title
                 if "first_published_date" in requested and derived.first_published_date:
                     updates["first_published_date"] = derived.first_published_date
                 if "status" in requested and derived.status:
                     updates["status"] = derived.status
                 if not updates:
                     continue
-                set_clause = ", ".join(f"{k} = ?" for k in updates)
                 if not force:
                     # Preserve any pre-existing non-NULL values.
                     set_clause = ", ".join(
                         f"{k} = COALESCE({k}, ?)" for k in updates
                     )
+                else:
+                    set_clause = ", ".join(f"{k} = ?" for k in updates)
                 conn.execute(
                     f"UPDATE documents SET {set_clause} WHERE doc_id = ?",
                     (*updates.values(), doc_id),
                 )
-                if "human_code" in updates:
-                    # Title FTS carries human_code; refresh the row.
-                    conn.execute(
-                        "UPDATE title_fts SET human_code = ? WHERE doc_id = ?",
-                        (updates["human_code"], doc_id),
-                    )
+                # Refresh only the columns the FTS mirrors, and only when we
+                # actually wrote a new value for them. Use rowid so the FTS
+                # update is O(1) instead of O(n) per row.
+                rowid = fts_rowid.get(doc_id)
+                if rowid is not None:
+                    fts_updates: dict[str, str] = {}
+                    if "human_code" in updates:
+                        fts_updates["human_code"] = updates["human_code"]
+                    if "human_title" in updates:
+                        fts_updates["human_title"] = updates["human_title"]
+                    if fts_updates:
+                        fts_set = ", ".join(f"{k} = ?" for k in fts_updates)
+                        conn.execute(
+                            f"UPDATE title_fts SET {fts_set} WHERE rowid = ?",
+                            (*fts_updates.values(), rowid),
+                        )
                 for f in updates:
                     updated[f] += 1
-                if i % 5000 == 0:
+                if i % 20000 == 0:
                     typer.echo(f"  processed {i}/{total}")
             conn.execute("COMMIT")
         except Exception:
