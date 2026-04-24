@@ -96,7 +96,7 @@ def _decompress(blob: bytes) -> str:
     return zstd.ZstdDecompressor().decompress(blob).decode("utf-8")
 
 
-_WORD_RE = re.compile(r"[A-Za-z0-9']+")
+_WORD_RE = re.compile(r"[A-Za-z0-9']+(?:-[A-Za-z0-9']+)*")
 
 
 def _highlight_snippet(text: str, query: str, max_chars: int = SNIPPET_CHARS) -> str:
@@ -200,6 +200,15 @@ def _fts_search(
 
 
 def _fts_query(query: str) -> str:
+    """Turn a free-text query into an FTS5-safe MATCH expression.
+
+    Tokens are space-joined, which FTS5 interprets as implicit AND — every
+    returned chunk must contain every query term. Single-char tokens (e.g.
+    the ``R``/``D`` from ``R&D``) are dropped so they don't turn queries
+    into zero-result noise searches. Hyphenated tokens (``"s 8-1"``,
+    ``"355-25"``) are preserved as phrases so section-number lookups keep
+    working even though FTS5 indexes them as separate tokens internally.
+    """
     tokens = [t for t in _WORD_RE.findall(query) if len(t) >= 2]
     if not tokens:
         return '""'
