@@ -241,22 +241,152 @@ def test_smsfrb_citation_in_h3():
 
 
 # ---------------------------------------------------------------------------
-# EPA — edited private advice — no citation
+# EPA — edited private advice — auth-number code, NULL citation year when no
+# date is visible in body.
 
 
-def test_epa_returns_null_citation():
+def test_epa_synthesises_auth_number_code():
     ins = RuleInputs(
         doc_id="EV/1012378745518",
         headings=(),
         category="Edited_private_advice",
     )
     assert classify(ins) == Template.EPA
-    assert derive_metadata(ins).human_code is None
+    d = derive_metadata(ins)
+    # The ATO auth number becomes the human_code so the field is never null.
+    assert d.human_code == "EV 1012378745518"
+
+
+def test_epa_extracts_date_of_advice_from_body():
+    ins = RuleInputs(
+        doc_id="EV/1051375298526",
+        headings=(),
+        body_head="**Date of advice: 22 May 2018** | ...",
+        category="Edited_private_advice",
+    )
+    d = derive_metadata(ins)
+    assert d.first_published_date == "2018-05-22"
+    assert d.citation_year == 2018
 
 
 # ---------------------------------------------------------------------------
-# OTHER / docid fallback — a doc with no useful headings still gets a code
-# from its docid when the docid body is parseable
+# LEGISLATION_SECTION — PAC / REG docids
+
+
+def test_legislation_section_pac_from_heading():
+    ins = RuleInputs(
+        doc_id="PAC/19210026/1",
+        headings=("EXCISE TARIFF ACT 1921",),
+        category="Legislation_and_supporting_material",
+    )
+    assert classify(ins) == Template.LEGISLATION_SECTION
+    d = derive_metadata(ins)
+    assert "EXCISE TARIFF ACT 1921" in (d.human_code or "")
+    assert d.human_code and d.human_code.endswith(" s 1")
+    assert d.citation_year == 1921
+
+
+def test_legislation_section_reg_from_heading():
+    ins = RuleInputs(
+        doc_id="REG/19560090/10",
+        headings=("Customs (Prohibited Imports) Regulations 1956",),
+        category="Legislation_and_supporting_material",
+    )
+    assert classify(ins) == Template.LEGISLATION_SECTION
+    d = derive_metadata(ins)
+    assert "Customs (Prohibited Imports) Regulations 1956" in (d.human_code or "")
+    assert d.human_code and d.human_code.endswith(" reg 10")
+    assert d.citation_year == 1956
+
+
+def test_legislation_section_fallback_to_docid():
+    ins = RuleInputs(
+        doc_id="PAC/19210026/5B",
+        headings=(),
+        category="Legislation_and_supporting_material",
+    )
+    d = derive_metadata(ins)
+    assert d.human_code is not None
+    assert "5B" in d.human_code
+    assert d.citation_year == 1921
+
+
+# ---------------------------------------------------------------------------
+# HIST_CASE — JUD/*YYYY*REPORT docids
+
+
+def test_historical_case_body_header_name():
+    ins = RuleInputs(
+        doc_id="JUD/*1881*17chd746/00001",
+        headings=(),
+        body_head="*## Ex parte Walton, In re Levy* | **(1881) 17 Ch.D. 746** |",
+        category="Cases",
+    )
+    assert classify(ins) == Template.HIST_CASE
+    d = derive_metadata(ins)
+    assert d.human_code == "Ex parte Walton, In re Levy"
+    assert d.citation_year == 1881
+
+
+def test_historical_case_bracketed_citation():
+    ins = RuleInputs(
+        doc_id="JUD/*1921*2AC171/00001",
+        headings=(),
+        body_head=(
+            "*## Commissioners of Inland Revenue v Blott* | **[1921] 2 A.C. 171** |"
+        ),
+        category="Cases",
+    )
+    d = derive_metadata(ins)
+    assert d.human_code == "Commissioners of Inland Revenue v Blott"
+    assert d.citation_year == 1921
+
+
+def test_historical_case_year_falls_back_to_docid():
+    ins = RuleInputs(
+        doc_id="JUD/*1915*hca4/00001",
+        headings=(),
+        body_head="",  # nothing in body
+        category="Cases",
+    )
+    d = derive_metadata(ins)
+    # Even with no body, we get a code + year from the docid.
+    assert d.citation_year == 1915
+    assert d.human_code is not None
+
+
+# ---------------------------------------------------------------------------
+# Un-slashed legacy rulings (IT 1, MT 2005, CRP 2017/1 etc.)
+
+
+def test_it_legacy_ruling_un_slashed():
+    ins = RuleInputs(
+        doc_id="ITR/IT1/NAT/ATO/00001",
+        headings=("Taxation Ruling", "IT 1", "Taxation Ruling system: explanation and status"),
+        category="Public_rulings",
+    )
+    assert classify(ins) == Template.OFFICIAL_PUB
+    d = derive_metadata(ins)
+    assert d.human_code == "IT 1"
+
+
+# ---------------------------------------------------------------------------
+# Universal fallback — any doc with an outer_prefix + inner_body gets
+# a synthetic code
+
+
+def test_universal_fallback_populates_human_code():
+    ins = RuleInputs(
+        doc_id="NOTAPREFIX/XYZ/NAT/ATO/00001",
+        headings=(),
+        category="Unknown",
+    )
+    d = derive_metadata(ins)
+    # No template fires, but the universal fallback gives us a stable label.
+    assert d.human_code == "NOTAPREFIX XYZ"
+
+
+
 
 
 @pytest.mark.parametrize(

@@ -115,6 +115,7 @@ class Shape(str, Enum):
     DIS_PHRASE = "DIS_PHRASE"                     # "Decision impact statement"
     EM_PHRASE = "EM_PHRASE"                       # "Explanatory Memorandum"
     RULING_CITATION = "RULING_CITATION"           # "TR 2024/3" etc.
+    RULING_UNSLASHED = "RULING_UNSLASHED"         # "IT 1", "MT 2005", "CRP 2017/1"
     ATOID = "ATOID"                               # "ATO ID 2024/3"
     PSLA = "PSLA"                                 # "PS LA 2024/3"
     SMSFRB = "SMSFRB"                             # "SMSFRB 2020/1"
@@ -137,8 +138,15 @@ _RULING_SERIES_ALT = "|".join(sorted([
     "FBT", "GII", "CR", "PR", "TR", "TD", "MT", "TA", "LI", "LG", "WT", "IT",
 ], key=len, reverse=True))
 
+# Un-slashed legacy series: "IT 1", "IT 117", "MT 2005" — pre-year-based
+# numbering where the number itself is the identifier.
+_UNSLASHED_LEGACY_ALT = "|".join(["IT", "MT", "CRP"])
+
 _RE_RULING_CITATION = re.compile(
     rf"^({_RULING_SERIES_ALT})\s+\d{{1,4}}/D?\d+(?:[A-Z0-9]+)?(?:\s|$|\()"
+)
+_RE_RULING_UNSLASHED = re.compile(
+    rf"^({_UNSLASHED_LEGACY_ALT})\s+\d{{1,5}}(?:\s|$|[—-])"
 )
 _RE_ATOID = re.compile(r"^ATO\s+ID\s+\d{4}/\d+")
 _RE_PSLA = re.compile(r"^PS\s+LA\s+\d{4}/")
@@ -160,8 +168,10 @@ _RE_CASE_NUMBER = re.compile(
     re.IGNORECASE,
 )
 _RE_ACT_TITLE = re.compile(
-    r"^(?:[A-Z][\w]*\s+)*(?:Act|Regulations?|Code|Rules)\s+(?:19|20)\d{2}"
-    r"(?:\s*\(Cth\))?\s*$"
+    r"^(?:[A-Za-z][\w'&-]*|\([^)]+\))(?:\s+(?:[A-Za-z][\w'&-]*|\([^)]+\)))*"
+    r"\s+(?:Act|Regulations?|Code|Rules)\s+(?:19|20)\d{2}"
+    r"(?:\s*\(Cth\))?\s*$",
+    re.IGNORECASE,
 )
 _RE_BILL_TITLE = re.compile(r"\bBill\s+(?:19|20)\d{2}\b")
 
@@ -227,6 +237,8 @@ def shape_of(heading: str) -> Shape:
         return Shape.SMSFRB
     if _RE_RULING_CITATION.match(t):
         return Shape.RULING_CITATION
+    if _RE_RULING_UNSLASHED.match(t):
+        return Shape.RULING_UNSLASHED
     # Structural phrases (exact or close-prefix match on a known set).
     # We match the *start* of the heading since some have trailing qualifiers
     # ("Taxation Ruling" vs "Taxation Ruling - TR 2024/3").
@@ -265,8 +277,10 @@ class Template(str, Enum):
     OFFICIAL_PUB = "OFFICIAL_PUB"
     CASE_H1 = "CASE_H1"
     CASE_H2 = "CASE_H2"
+    HIST_CASE = "HIST_CASE"
     DIS = "DIS"
     ACT = "ACT"
+    LEGISLATION_SECTION = "LEGISLATION_SECTION"
     BILL_EM = "BILL_EM"
     SMSFRB = "SMSFRB"
     EPA = "EPA"
@@ -293,7 +307,13 @@ def classify(ins: RuleInputs) -> Template:
     """
     shapes: list[Shape] = [shape_of(h) for h in ins.headings[:6]]
     has = lambda s: s in shapes  # noqa: E731 — tiny helper
-    any_citation = any(s in (Shape.RULING_CITATION, Shape.ATOID, Shape.PSLA) for s in shapes)
+    any_citation = any(
+        s in (
+            Shape.RULING_CITATION, Shape.RULING_UNSLASHED,
+            Shape.ATOID, Shape.PSLA,
+        )
+        for s in shapes
+    )
     any_type_phrase = any(s in (
         Shape.RULING_TYPE_PHRASE, Shape.GUIDELINE_TYPE_PHRASE, Shape.ALERT_PHRASE,
         Shape.ATOID_PHRASE, Shape.PSLA_PHRASE,
@@ -303,10 +323,27 @@ def classify(ins: RuleInputs) -> Template:
     if has(Shape.SMSFRB) or has(Shape.SMSFRB_PHRASE):
         return Template.SMSFRB
 
+    # Historical case: docid like JUD/*YYYY*REPORT/... — the year is
+    # encoded in the docid itself between asterisks. Route before the
+    # generic CASE_H1 so year-from-docid takes precedence over the
+    # (often absent) neutral citation.
+    if ins.outer_prefix == "JUD" and _RE_DOCID_JUD_STAR.match(ins.inner_body):
+        return Template.HIST_CASE
+
+    # Legislation-section: PAC/REG docs address a single section of an
+    # Act or Regulation. The docid body encodes the Act number + section.
+    if ins.outer_prefix in ("PAC", "REG") and _RE_DOCID_ACT_SECTION.match(ins.inner_body):
+        return Template.LEGISLATION_SECTION
+
     # OFFICIAL_PUB — both a type phrase and a citation somewhere. A
     # missing type phrase is tolerated if a citation appears (covers pages
     # where the H1 is a URL artefact).
     if any_citation and (any_type_phrase or True):
+        return Template.OFFICIAL_PUB
+
+    # Un-slashed legacy ruling ("IT 1", "MT 2005") without a modern
+    # citation — still an OFFICIAL_PUB template, just the legacy shape.
+    if any(s == Shape.RULING_UNSLASHED for s in shapes):
         return Template.OFFICIAL_PUB
 
     # DIS — DIS phrase at any depth, with a case name nearby.
@@ -369,6 +406,24 @@ _MONTH = {m.lower(): i for i, m in enumerate(
     ["January", "February", "March", "April", "May", "June",
      "July", "August", "September", "October", "November", "December"], 1)}
 _RE_OLD_REPORT = re.compile(r"\((?P<year>1[89]\d{2}|20\d{2})\)\s+(?:L\.?R\.?|AC|QB|KB|Ch|CLR|ALR|ATC|ATR|FCR|HL|PC|NSWLR|VR|QR|SASR)")
+
+# Historical case docid — JUD/*YYYY*<reporter><number>/<part>.
+# Example: ``JUD/*1881*17chd746/00001``.
+_RE_DOCID_JUD_STAR = re.compile(r"^\*(?P<year>\d{4})\*(?P<rest>.+)$")
+
+# Legislation-section docid — PAC/<year><actno>/<section>, REG/<year><regno>/<regnum>.
+# Example: ``PAC/19210026/1`` = Act of 1921 No.26, section 1.
+_RE_DOCID_ACT_SECTION = re.compile(r"^(?P<year>\d{4})(?P<actno>\d{4})$")
+
+# Body MailTo encoding — ATO pages embed a mailto URL whose Body contains
+# %0D-separated breadcrumb lines that mirror the navigation context. This
+# is present on nearly every legislation / case doc and often survives
+# when the extractor otherwise returned only a URL heading.
+_RE_MAILTO_BODY = re.compile(r"MailTo:\?Subject=[^&]*&Body=([^)\s\"]+)")
+
+# Case header seen at the top of judgement bodies:
+# ``*## <Case Name>* | **(YYYY) REPORT ...** |`` or ``**[YYYY] NEUTRAL ...**``.
+_RE_CASE_HEADER_NAME = re.compile(r"^\*##\s+(?P<name>[^*\n]+?)\s*\*")
 
 
 def _clean_citation_with_variant(raw: str) -> tuple[str, str | None, str | None]:
@@ -461,11 +516,27 @@ def _extract_official_pub(ins: RuleInputs) -> DerivedMetadata:
     artefact at h0 may push the real citation to h3.
     """
     citation_heading: str | None = None
+    unslashed_heading: str | None = None
     for h in ins.headings[:6]:
         s = shape_of(h)
         if s in (Shape.RULING_CITATION, Shape.ATOID, Shape.PSLA):
             citation_heading = h
             break
+        if unslashed_heading is None and s == Shape.RULING_UNSLASHED:
+            unslashed_heading = h
+    if citation_heading is None and unslashed_heading is not None:
+        # Legacy un-yeared series — "IT 1", "MT 2005". The heading IS the
+        # human_code; no slash, no year.
+        t = " ".join(unslashed_heading.split())
+        # Strip trailing separators.
+        t = re.sub(r"\s*[—-].*$", "", t).strip()
+        precise = _precise_date(ins.body_head[:600])
+        return DerivedMetadata(
+            human_code=t or None,
+            human_title=_human_title(ins),
+            first_published_date=precise,
+            citation_year=None,
+        )
     if citation_heading is None:
         # Classifier routed us here but no citation shape matched — fall
         # back to docid.
@@ -645,6 +716,154 @@ def _extract_act(ins: RuleInputs) -> DerivedMetadata:
     )
 
 
+# --- Template: Legislation section (PAC / REG) ------------------------------
+
+
+def _parse_mailto_body(body_head: str) -> list[str]:
+    """Extract the %0D-separated breadcrumb lines from the body's mailto URL.
+
+    Returns decoded trimmed lines, excluding empty ones and the trailing
+    ``Link: https://...`` line. Many ATO legislation / judgement pages that
+    otherwise lack h1 text carry their real breadcrumb here.
+    """
+    m = _RE_MAILTO_BODY.search(body_head or "")
+    if not m:
+        return []
+    raw = m.group(1)
+    # URL decode — %0D is the line separator, but actual content may also
+    # have %20 (space) etc. We handle %0D manually to preserve line breaks.
+    parts = raw.split("%0D")
+    out: list[str] = []
+    for p in parts:
+        # Collapse any remaining % escapes via urllib.
+        try:
+            from urllib.parse import unquote
+            text = unquote(p).strip()
+        except Exception:
+            text = p.strip()
+        if not text or text.lower().startswith("link:"):
+            continue
+        out.append(text)
+    return out
+
+
+def _extract_legislation_section(ins: RuleInputs) -> DerivedMetadata:
+    """PAC/REG docs — one section of an Act / Regulation.
+
+    Priority for the human_code:
+      1. Split the first non-URL heading on ` — ` and pick the Act-title
+         piece (ends in ``Act YYYY`` or ``Regulations YYYY``).
+      2. Parse the mailto body's breadcrumb: lines 2/3 typically contain
+         the Act name and ``SECTION N``.
+      3. Fallback to ``<prefix> <docid body>`` (e.g. ``PAC 19210026/1``).
+    """
+    # docid body like "19210026" → year=1921, act_no=26; we'll use this for
+    # year + fallback label.
+    inner = ins.inner_body
+    m = _RE_DOCID_ACT_SECTION.match(inner)
+    year: int | None = None
+    act_no: str | None = None
+    if m:
+        year = int(m["year"])
+        act_no = m["actno"].lstrip("0") or "0"
+    # Section identifier is the path segment after the body.
+    segs = [s for s in ins.doc_id.split("/") if s]
+    section_id = segs[2] if len(segs) >= 3 else ""
+
+    act_name: str | None = None
+    # 1. Headings (already decomposed by the CLI on " › " and " — ").
+    for h in ins.headings[:6]:
+        t = " ".join(h.split())
+        if _RE_ACT_TITLE.match(t):
+            act_name = t
+            break
+    # 2. MailTo breadcrumb.
+    if not act_name:
+        for line in _parse_mailto_body(ins.body_head):
+            if _RE_ACT_TITLE.match(line):
+                act_name = line
+                break
+
+    if act_name:
+        label = f"{act_name}"
+        if section_id:
+            label = f"{act_name} s {section_id}" if ins.outer_prefix == "PAC" else f"{act_name} reg {section_id}"
+    else:
+        # Fallback: docid-derived.
+        if ins.outer_prefix == "PAC":
+            label = f"Act {year} No. {act_no} s {section_id}" if year else f"PAC {inner}/{section_id}"
+        else:  # REG
+            label = f"Regulations {year} reg {section_id}" if year else f"REG {inner}/{section_id}"
+
+    # Year fallback from docid.
+    if year is None:
+        ym = _RE_ACT_YEAR.search(act_name or "")
+        year = int(ym["year"]) if ym else None
+
+    precise = _precise_date(ins.body_head[:600])
+    first_pub = precise or (f"{year}-01-01" if year else None) or ins.pub_date
+    return DerivedMetadata(
+        human_code=label,
+        human_title=_human_title(ins) or act_name,
+        first_published_date=first_pub,
+        citation_year=year,
+    )
+
+
+# --- Template: Historical Case (JUD/*YYYY*...) ------------------------------
+
+
+def _extract_historical_case(ins: RuleInputs) -> DerivedMetadata:
+    """Pre-modern cases whose docid encodes the year between asterisks.
+
+    Body typically starts with ``*## <Case Name>* | **(YYYY) REPORT**``
+    or has a breadcrumb mailto carrying ``<Court (YYYY)> | <Case> - (date)``.
+    Year comes from the docid (authoritative); case name from body header
+    or mailto breadcrumb.
+    """
+    m = _RE_DOCID_JUD_STAR.match(ins.inner_body)
+    year: int | None = int(m["year"]) if m else None
+
+    # Pull case name from the body header line: ``*## Name *``.
+    case_name: str | None = None
+    hdr = _RE_CASE_HEADER_NAME.search(ins.body_head[:400])
+    if hdr:
+        case_name = " ".join(hdr["name"].split())
+    # Fallback — mailto breadcrumb line containing a ``name (date)`` form.
+    if case_name is None:
+        for line in _parse_mailto_body(ins.body_head):
+            # Skip the "Cases" and "Court (YYYY)" labels.
+            if line.lower() in ("cases",):
+                continue
+            # A case line usually has " v " or " - (date)".
+            if " v " in line or " - (" in line:
+                # Trim trailing " - (date)" tail.
+                nm = re.sub(r"\s*-\s*\([^)]+\)\s*$", "", line).strip()
+                if nm and len(nm) < 200:
+                    case_name = nm
+                    break
+    # Fallback — first non-URL, non-empty heading.
+    if case_name is None:
+        for h in ins.headings[:4]:
+            t = " ".join(h.split())
+            if t and not t.startswith("/law/view/") and len(t) < 200:
+                case_name = t
+                break
+
+    # If STILL nothing, use the docid body itself (last resort).
+    if case_name is None:
+        case_name = ins.inner_body or None
+
+    precise = _precise_date(ins.body_head[:600])
+    first_pub = precise or (f"{year}-01-01" if year else None) or ins.pub_date
+    return DerivedMetadata(
+        human_code=case_name,
+        human_title=_human_title(ins) or case_name,
+        first_published_date=first_pub,
+        citation_year=year,
+    )
+
+
 # --- Template: Bill / Explanatory Memorandum --------------------------------
 
 
@@ -652,10 +871,19 @@ def _extract_bill_em(ins: RuleInputs) -> DerivedMetadata:
     """Bill / EM — no canonical short code but we can give a useful label.
 
     Prefer the Bill title in h2 if present; otherwise h1. Year from the
-    "Bill YYYY" token.
+    "Bill YYYY" token. For NEM/SRS/EXM etc where headings degrade to a
+    URL, fall back to scanning ``**<Bill title>**`` markers in body_head.
     """
     source = ins.h2 if _RE_BILL_YEAR.search(ins.h2) else ins.h1
     title = " ".join(source.split())
+    # Body fallback — ATO-rendered Bills/EMs put the Bill/Act title inside
+    # `**...**` markers in the first few lines.
+    if not _RE_BILL_YEAR.search(title) and not _RE_ACT_TITLE.match(title):
+        for line in re.findall(r"\*\*([^*]+?)\*\*", ins.body_head[:800]):
+            line = " ".join(line.split())
+            if _RE_BILL_YEAR.search(line) or _RE_ACT_TITLE.match(line):
+                title = line
+                break
     ym = _RE_BILL_YEAR.search(title) or _RE_ACT_YEAR.search(title)
     year = int(ym["year"]) if ym else None
     label = None
@@ -664,10 +892,12 @@ def _extract_bill_em(ins: RuleInputs) -> DerivedMetadata:
             label = f"EM to {title}"
         else:
             label = title
+    precise = _precise_date(ins.body_head[:600])
+    first_pub = precise or (f"{year}-01-01" if year else None) or ins.pub_date
     return DerivedMetadata(
         human_code=label,
-        human_title=_human_title(ins),
-        first_published_date=f"{year}-01-01" if year else None,
+        human_title=_human_title(ins) or title,
+        first_published_date=first_pub,
         citation_year=year,
     )
 
@@ -732,19 +962,38 @@ def _extract_from_docid(ins: RuleInputs) -> tuple[str | None, int | None, str | 
     return None, None, None
 
 
-def _extract_epa(ins: RuleInputs) -> DerivedMetadata:
-    """Edited private advice — no citable short form; leave human_code NULL.
+_RE_DATE_OF_ADVICE = re.compile(
+    r"\bDate\s+of\s+(?:advice|ruling|issue)\s*[:\-]?\s*"
+    r"(?P<day>\d{1,2})\s+(?P<mon>January|February|March|April|May|June|July|August|September|October|November|December)\s+(?P<year>\d{4})",
+    re.IGNORECASE,
+)
 
-    We can still pull a year from the docid body (EV/1012345678901 has
-    no year; most EPA docids don't), or from pub_date if one was scraped.
+
+def _extract_epa(ins: RuleInputs) -> DerivedMetadata:
+    """Edited private advice — EPA docs.
+
+    The ATO identifies each EPA by its authorisation number (the inner
+    segment of the docid, e.g. ``EV/1012101718232``). We surface that as
+    the human_code so the field is populated AND the value is useful for
+    lookup. Date comes from "Date of advice: ..." in the body when
+    present; older EPAs don't carry it.
     """
+    # Strip any leading space artefact ("EV/ 1011343943821" → "1011343943821").
+    auth = ins.inner_body.strip()
+    code = f"{ins.outer_prefix} {auth}".strip() if auth else None
     year = None
-    if ins.pub_date and len(ins.pub_date) >= 4 and ins.pub_date[:4].isdigit():
+    precise: str | None = None
+    m = _RE_DATE_OF_ADVICE.search(ins.body_head[:1500])
+    if m:
+        month = _MONTH[m["mon"].lower()]
+        precise = f"{int(m['year']):04d}-{month:02d}-{int(m['day']):02d}"
+        year = int(m["year"])
+    if year is None and ins.pub_date and len(ins.pub_date) >= 4 and ins.pub_date[:4].isdigit():
         year = int(ins.pub_date[:4])
-    first_pub = ins.pub_date or (f"{year}-01-01" if year else None)
+    first_pub = precise or ins.pub_date or (f"{year}-01-01" if year else None)
     return DerivedMetadata(
-        human_code=None,
-        human_title=None,
+        human_code=code,
+        human_title=_human_title(ins) or (ins.title if ins.title else None),
         first_published_date=first_pub,
         citation_year=year,
     )
@@ -776,13 +1025,31 @@ _EXTRACTORS: dict[Template, Callable[[RuleInputs], DerivedMetadata]] = {
     Template.OFFICIAL_PUB: _extract_official_pub,
     Template.CASE_H1: _extract_case_h1,
     Template.CASE_H2: _extract_case_h2,
+    Template.HIST_CASE: _extract_historical_case,
     Template.DIS: _extract_dis,
     Template.ACT: _extract_act,
+    Template.LEGISLATION_SECTION: _extract_legislation_section,
     Template.BILL_EM: _extract_bill_em,
     Template.SMSFRB: _extract_smsfrb,
     Template.EPA: _extract_epa,
     Template.OTHER: _extract_other,
 }
+
+
+def _universal_fallback_code(ins: RuleInputs) -> str | None:
+    """Last-resort human_code from the docid itself.
+
+    ATO's docid has the shape ``<PREFIX>/<body>/<part>``. The prefix is a
+    ~3-letter publication class (PAC, NEM, RPC, ...) and body is the
+    identifier within that class. Combining them gives a unique,
+    human-readable label that mirrors how the ATO's own URL bar
+    identifies the doc — always populated, always addressable.
+    """
+    if ins.outer_prefix and ins.inner_body:
+        return f"{ins.outer_prefix} {ins.inner_body}"
+    if ins.outer_prefix:
+        return ins.outer_prefix
+    return None
 
 
 def derive_metadata(inputs: RuleInputs) -> DerivedMetadata:
@@ -792,7 +1059,7 @@ def derive_metadata(inputs: RuleInputs) -> DerivedMetadata:
     # If the template extractor came up empty on human_code, try the docid
     # fallback so e.g. a scraper-damaged OFFICIAL_PUB page (no h2) still
     # surfaces its canonical code.
-    if result.human_code is None and template != Template.EPA:
+    if result.human_code is None:
         fallback_code, fb_year, fb_status = _extract_from_docid(inputs)
         if fallback_code:
             result = replace(
@@ -801,7 +1068,61 @@ def derive_metadata(inputs: RuleInputs) -> DerivedMetadata:
                 citation_year=result.citation_year or fb_year,
                 status=result.status or fb_status,
             )
+    # Universal fallback — guarantees every doc has SOME code even when
+    # nothing parsed. Downstream tools can treat this as "weakly
+    # identified" if needed.
+    if result.human_code is None:
+        universal = _universal_fallback_code(inputs)
+        if universal:
+            result = replace(result, human_code=universal)
+    # Date fallback — prefer template-derived, then pub_date, then year from
+    # docid (``*YYYY*`` / 4-digit prefix), then None.
+    if result.first_published_date is None:
+        if inputs.pub_date:
+            result = replace(result, first_published_date=inputs.pub_date)
+        else:
+            fb_year = _year_from_docid(inputs)
+            if fb_year:
+                result = replace(
+                    result,
+                    first_published_date=f"{fb_year}-01-01",
+                    citation_year=result.citation_year or fb_year,
+                )
     return result
+
+
+def _year_from_docid(ins: RuleInputs) -> int | None:
+    """Scan the docid's path segments for a 4-digit year.
+
+    Handles:
+      - ``*YYYY*`` between asterisks (historical JUD).
+      - ``YYYYNNNN`` 4-digit-year prefix on 8-digit PAC/REG bodies.
+      - ``<series>YYYY<num>`` on ruling series docids (already handled by
+        ``_extract_from_docid`` but we allow a second pass here for cases
+        the template extractor missed).
+    """
+    body = ins.inner_body
+    m = _RE_DOCID_JUD_STAR.match(body)
+    if m:
+        try:
+            return int(m["year"])
+        except ValueError:
+            return None
+    m = _RE_DOCID_ACT_SECTION.match(body)
+    if m:
+        try:
+            return int(m["year"])
+        except ValueError:
+            return None
+    # Generic 4-digit prefix (NEM/200615 = 2006, though the trailing 15
+    # is part of the same id — we only want the year).
+    m = re.match(r"^((?:19|20)\d{2})", body)
+    if m:
+        try:
+            return int(m.group(1))
+        except ValueError:
+            return None
+    return None
 
 
 def template_of(inputs: RuleInputs) -> Template:

@@ -362,7 +362,7 @@ def backfill_metadata(
         else:
             where_sql = "1=1"
         sql = (
-            "SELECT doc_id, title, category, pub_date FROM documents "
+            "SELECT doc_id, title, category, pub_date, downloaded_at FROM documents "
             f"WHERE {where_sql} ORDER BY doc_id"
         )
         if limit is not None:
@@ -402,11 +402,19 @@ def backfill_metadata(
                     hp = (cr["heading_path"] or "").strip()
                     if hp and hp not in seen_headings:
                         seen_headings.add(hp)
-                        # Split the breadcrumb so each heading component is a
-                        # candidate for citation regexes.
-                        for seg in hp.split(" › "):
-                            if seg and seg not in headings:
-                                headings.append(seg)
+                        # Decompose the breadcrumb into atomic headings. ATO
+                        # pages use both " › " (hierarchy) and " — " (flat
+                        # concatenation in h1) as separators; splitting on
+                        # both exposes citations like "IT 1" or "CRP 2017/1"
+                        # that would otherwise be buried in a mega-heading.
+                        # URL-only artefacts are dropped.
+                        for top in hp.split(" › "):
+                            for seg in top.split(" — "):
+                                s = seg.strip()
+                                if not s or s.startswith("/law/view/"):
+                                    continue
+                                if s not in headings:
+                                    headings.append(s)
                     if not body_head:
                         body_head = dctx.decompress(cr["text"]).decode(
                             "utf-8", errors="replace"
@@ -427,6 +435,14 @@ def backfill_metadata(
                     updates["human_title"] = derived.human_title
                 if "first_published_date" in requested and derived.first_published_date:
                     updates["first_published_date"] = derived.first_published_date
+                elif "first_published_date" in requested:
+                    # Date-of-last-resort: use downloaded_at truncated to date.
+                    # This keeps the column populated for docs with no
+                    # extractable publication signal at the cost of a slight
+                    # over-estimate (we know we saw it NO LATER than this).
+                    dl = row["downloaded_at"] or ""
+                    if len(dl) >= 10 and dl[:10].count("-") == 2:
+                        updates["first_published_date"] = dl[:10]
                 if "status" in requested and derived.status:
                     updates["status"] = derived.status
                 if not updates:
