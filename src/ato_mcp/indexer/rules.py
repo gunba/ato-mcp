@@ -86,12 +86,21 @@ class RuleInputs:
 
 @dataclass(frozen=True)
 class DerivedMetadata:
-    human_code: str | None = None
-    human_title: str | None = None
-    first_published_date: str | None = None
-    citation_year: int | None = None
-    variant: str | None = None
-    status: str | None = None
+    """Output of the rule engine — two fields, nothing else.
+
+    ``title``: human-readable identifier, citation inlined when one exists.
+    Shaped like ``"TR 2024/3 — R&D tax incentive eligibility"`` for rulings,
+    ``"PepsiCo Inc v Commissioner of Taxation"`` for cases,
+    ``"Income Tax Assessment Act 1997"`` for Acts,
+    ``"EV 1012345678901"`` for edited private advice.
+
+    ``date``: ISO yyyy-mm-dd best-guess publication date used for filters
+    and recency sort. Authoritative-looking but not authoritative — we
+    surface whatever we could derive, in waterfall order:
+    precise body date → scraped ``pub_date`` → year-from-docid.
+    """
+    title: str | None = None
+    date: str | None = None
 
 
 _EMPTY = DerivedMetadata()
@@ -239,13 +248,13 @@ def shape_of(heading: str) -> Shape:
         return Shape.RULING_CITATION
     if _RE_RULING_UNSLASHED.match(t):
         return Shape.RULING_UNSLASHED
-    # Structural phrases (exact or close-prefix match on a known set).
-    # We match the *start* of the heading since some have trailing qualifiers
-    # ("Taxation Ruling" vs "Taxation Ruling - TR 2024/3").
+    # Structural phrases — exact match on a known set. We don't accept the
+    # phrase as a *prefix* because longer sentences that start with a type
+    # phrase ("Taxation Ruling system: explanation and status") would
+    # otherwise get classified as the type phrase itself.
     for sh, phrases in _TYPE_PHRASES.items():
-        for phrase in phrases:
-            if t_lower == phrase or t_lower.startswith(phrase + " ") or t_lower.startswith(phrase + "\n"):
-                return sh
+        if t_lower in phrases:
+            return sh
     # Acts / Bills.
     if _RE_ACT_TITLE.match(t):
         return Shape.ACT_TITLE
@@ -466,18 +475,6 @@ def _year_from_token(token: str) -> int | None:
     return None
 
 
-def _status_from_text(text: str) -> str | None:
-    if not text:
-        return None
-    if _RE_WITHDRAWN.search(text):
-        return "withdrawn"
-    if "/D" in text and re.search(r"/D\d", text):
-        return "draft"
-    if "EC" in text and re.search(r"\d/\d+EC\b", text):
-        return "consolidated"
-    return None
-
-
 def _precise_date(text: str) -> str | None:
     m = _RE_PRECISE_DATE.search(text)
     if not m:
@@ -487,22 +484,45 @@ def _precise_date(text: str) -> str | None:
     return f"{int(year):04d}-{month:02d}-{int(day):02d}"
 
 
-def _human_title(ins: RuleInputs, *, include_h2: bool = True) -> str | None:
-    """Compose a human-readable title from headings.
+_TYPE_PHRASE_SHAPES = {
+    Shape.RULING_TYPE_PHRASE, Shape.GUIDELINE_TYPE_PHRASE,
+    Shape.ATOID_PHRASE, Shape.PSLA_PHRASE, Shape.SMSFRB_PHRASE,
+    Shape.DIS_PHRASE, Shape.ALERT_PHRASE, Shape.EM_PHRASE,
+}
 
-    Default: ``h1 — h2 — h3`` if all three are present and non-duplicate;
-    deduplicated along the way so a doc whose h1 and h2 are identical
-    doesn't render as ``"X — X — Y"``.
+_CITATION_SHAPES = {
+    Shape.RULING_CITATION, Shape.RULING_UNSLASHED,
+    Shape.ATOID, Shape.PSLA, Shape.SMSFRB, Shape.NEUTRAL_CITATION,
+    Shape.NAME_V_NAME, Shape.RE_X, Shape.CASE_NUMBER,
+    Shape.ACT_TITLE, Shape.BILL_TITLE,
+}
+
+
+def _compose_title(primary: str | None, ins: RuleInputs) -> str | None:
+    """Build a human-readable title from a primary identifier + one subtitle.
+
+    ``primary`` is the specific identifier the template found — a citation,
+    case name, or Act name. We append at most one additional heading as a
+    subtitle, skipping type-phrase prefixes ("Taxation Ruling") and other
+    citation-shaped headings (which would just repeat the primary).
     """
-    parts: list[str] = []
-    seen: set[str] = set()
-    for h in ins.headings[:3]:
+    if not primary:
+        return None
+    primary = " ".join(primary.split())
+    parts = [primary]
+    seen = {primary.lower()}
+    for h in ins.headings[:5]:
         t = " ".join((h or "").split())
-        if not t or t in seen:
+        if not t or t.lower() in seen:
+            continue
+        if t.startswith("/law/view/"):
+            continue
+        s = shape_of(t)
+        if s in _TYPE_PHRASE_SHAPES or s in _CITATION_SHAPES:
             continue
         parts.append(t)
-        seen.add(t)
-    return " — ".join(parts) if parts else None
+        break
+    return " — ".join(parts)
 
 
 # --- Template: Official Publication -----------------------------------------
@@ -526,33 +546,27 @@ def _extract_official_pub(ins: RuleInputs) -> DerivedMetadata:
             unslashed_heading = h
     if citation_heading is None and unslashed_heading is not None:
         # Legacy un-yeared series — "IT 1", "MT 2005". The heading IS the
-        # human_code; no slash, no year.
+        # identifier; no slash, no year.
         t = " ".join(unslashed_heading.split())
-        # Strip trailing separators.
         t = re.sub(r"\s*[—-].*$", "", t).strip()
-        precise = _precise_date(ins.body_head[:600])
         return DerivedMetadata(
-            human_code=t or None,
-            human_title=_human_title(ins),
-            first_published_date=precise,
-            citation_year=None,
+            title=_compose_title(t, ins),
+            date=_precise_date(ins.body_head[:600]),
         )
     if citation_heading is None:
         # Classifier routed us here but no citation shape matched — fall
         # back to docid.
         return _extract_other(ins)
-    cleaned, variant, _ = _clean_citation_with_variant(citation_heading)
+    cleaned, _variant, _ = _clean_citation_with_variant(citation_heading)
     year = _year_from_token(cleaned)
-    status = _status_from_text(citation_heading)
     precise = _precise_date(ins.body_head[:600])
-    first_pub = precise or (f"{year}-01-01" if year else None)
+    # If the raw heading carried a ``(Withdrawn)`` marker, keep it — agents
+    # use that signal to avoid quoting superseded rulings.
+    if _RE_WITHDRAWN.search(citation_heading):
+        cleaned = f"{cleaned} (Withdrawn)"
     return DerivedMetadata(
-        human_code=cleaned or None,
-        human_title=_human_title(ins),
-        first_published_date=first_pub,
-        citation_year=year,
-        variant=variant,
-        status=status,
+        title=_compose_title(cleaned, ins),
+        date=precise or (f"{year}-01-01" if year else None),
     )
 
 
@@ -580,64 +594,52 @@ def _extract_case_h1(ins: RuleInputs) -> DerivedMetadata:
       case name, OR h1 is a concatenated "COURT — PARTY v PARTY — JUDGE"
       string (a single heading with em-dash separators).
     - Board of Review cases: h1 is "Case 9/93" or "Case K68".
-
-    Strategy: scan the first few headings, extract the best-looking case
-    identifier, and use that as human_code. Year comes from a neutral
-    citation or old-report citation if present in title/headings/body_head.
     """
-    human_code: str | None = None
+    name: str | None = None
     year: int | None = None
 
-    # Pass 1: direct heading match on a case-specific shape.
     for h in ins.headings[:5]:
         s = shape_of(h)
         if s == Shape.NEUTRAL_CITATION:
             m = _RE_NEUTRAL_TOKEN.match(h.strip())
             if m:
-                human_code = f"[{m['year']}] {m['court']} {m['num']}"
+                name = f"[{m['year']}] {m['court']} {m['num']}"
                 year = int(m["year"])
                 break
         if s == Shape.NAME_V_NAME:
-            human_code = _case_name_from(h)
+            name = _case_name_from(h)
             break
         if s == Shape.RE_X:
-            human_code = _case_name_from(h)
+            name = _case_name_from(h)
             break
         if s == Shape.CASE_NUMBER:
-            human_code = " ".join(h.split())
+            name = " ".join(h.split())
             break
 
-    # Pass 2: split em-dash-joined headings ("COURT — PARTY v PARTY — JUDGE")
-    # on " — " and look for a case-name sub-part.
-    if human_code is None:
+    if name is None:
         for h in ins.headings[:3]:
             for part in re.split(r"\s+—\s+", h):
                 part = " ".join(part.split())
                 ps = shape_of(part)
                 if ps == Shape.NAME_V_NAME and part != h:
-                    human_code = _case_name_from(part)
+                    name = _case_name_from(part)
                     break
                 if ps == Shape.NEUTRAL_CITATION:
                     m = _RE_NEUTRAL_TOKEN.match(part)
                     if m:
-                        human_code = f"[{m['year']}] {m['court']} {m['num']}"
+                        name = f"[{m['year']}] {m['court']} {m['num']}"
                         year = int(m["year"])
                         break
-            if human_code:
+            if name:
                 break
 
-    # Pass 3: the Cases bucket's ultimate fallback — use the first non-URL
-    # heading as-is. Not ideal but beats leaving human_code NULL for a
-    # bucket where EVERY doc has SOME identifier.
-    if human_code is None and ins.category == "Cases":
+    if name is None and ins.category == "Cases":
         for h in ins.headings[:3]:
             clean = " ".join(h.split())
             if clean and not clean.startswith("/law/view/") and len(clean) < 200:
-                human_code = clean
+                name = clean
                 break
 
-    # Year fallback: neutral citation, then old report, scanned in meta
-    # only (never body) to avoid bleeding in cited cases.
     if year is None:
         for src in [ins.title or "", *ins.headings[:5]]:
             m = _RE_NEUTRAL_TOKEN.search(src)
@@ -650,18 +652,15 @@ def _extract_case_h1(ins: RuleInputs) -> DerivedMetadata:
             year = int(old["year"])
 
     precise = _precise_date(ins.body_head[:600])
-    first_pub = precise or (f"{year}-01-01" if year else None)
     return DerivedMetadata(
-        human_code=human_code,
-        human_title=_human_title(ins),
-        first_published_date=first_pub,
-        citation_year=year,
+        title=name,
+        date=precise or (f"{year}-01-01" if year else None),
     )
 
 
 def _extract_case_h2(ins: RuleInputs) -> DerivedMetadata:
     """Court case layouts where h2 carries the case name."""
-    human_code = _case_name_from(ins.h2)
+    name = _case_name_from(ins.h2)
     neutral = _RE_NEUTRAL_TOKEN.search(ins.body_head[:500])
     year = int(neutral["year"]) if neutral else None
     if year is None:
@@ -669,29 +668,24 @@ def _extract_case_h2(ins: RuleInputs) -> DerivedMetadata:
         if old:
             year = int(old["year"])
     precise = _precise_date(ins.body_head[:600])
-    first_pub = precise or (f"{year}-01-01" if year else None)
     return DerivedMetadata(
-        human_code=human_code,
-        human_title=_human_title(ins),
-        first_published_date=first_pub,
-        citation_year=year,
+        title=name,
+        date=precise or (f"{year}-01-01" if year else None),
     )
 
 
 def _extract_dis(ins: RuleInputs) -> DerivedMetadata:
     """Decision Impact Statement — h1 is DIS phrase, h2 is the case name."""
     case_name = _case_name_from(ins.h2) if ins.h2 else _case_name_from(ins.h1)
-    # Try to pull year from body first few lines — DIS docs list the
-    # underlying case's citation early.
     neutral = _RE_NEUTRAL_TOKEN.search(ins.body_head[:1200])
     year = int(neutral["year"]) if neutral else None
     precise = _precise_date(ins.body_head[:600])
-    first_pub = precise or (f"{year}-01-01" if year else None)
+    # Prefix "DIS: " so the agent can distinguish a DIS title from the
+    # underlying judgement — both share the case name otherwise.
+    title = f"DIS: {case_name}" if case_name else None
     return DerivedMetadata(
-        human_code=case_name,
-        human_title=_human_title(ins),
-        first_published_date=first_pub,
-        citation_year=year,
+        title=title,
+        date=precise or (f"{year}-01-01" if year else None),
     )
 
 
@@ -699,20 +693,13 @@ def _extract_dis(ins: RuleInputs) -> DerivedMetadata:
 
 
 def _extract_act(ins: RuleInputs) -> DerivedMetadata:
-    """Act / Regulation / Code title in h1.
-
-    human_code = h1 (the Act's full name, which IS its canonical citation).
-    citation_year = the year in the Act's name (Income Tax Assessment
-    Act 1997 -> 1997 — authoritative for this doc type).
-    """
-    title = " ".join(ins.h1.split())
-    ym = _RE_ACT_YEAR.search(title)
+    """Act / Regulation / Code title in h1 — the Act's name IS the title."""
+    name = " ".join(ins.h1.split())
+    ym = _RE_ACT_YEAR.search(name)
     year = int(ym["year"]) if ym else None
     return DerivedMetadata(
-        human_code=title or None,
-        human_title=_human_title(ins),
-        first_published_date=f"{year}-01-01" if year else None,
-        citation_year=year,
+        title=name or None,
+        date=f"{year}-01-01" if year else None,
     )
 
 
@@ -750,15 +737,10 @@ def _parse_mailto_body(body_head: str) -> list[str]:
 def _extract_legislation_section(ins: RuleInputs) -> DerivedMetadata:
     """PAC/REG docs — one section of an Act / Regulation.
 
-    Priority for the human_code:
-      1. Split the first non-URL heading on ` — ` and pick the Act-title
-         piece (ends in ``Act YYYY`` or ``Regulations YYYY``).
-      2. Parse the mailto body's breadcrumb: lines 2/3 typically contain
-         the Act name and ``SECTION N``.
-      3. Fallback to ``<prefix> <docid body>`` (e.g. ``PAC 19210026/1``).
+    Title priority: extract Act name from headings or mailto breadcrumb,
+    append " s <num>" (for Acts) or " reg <num>" (for Regulations). Fall
+    back to the docid-derived form when no Act name is found.
     """
-    # docid body like "19210026" → year=1921, act_no=26; we'll use this for
-    # year + fallback label.
     inner = ins.inner_body
     m = _RE_DOCID_ACT_SECTION.match(inner)
     year: int | None = None
@@ -766,18 +748,15 @@ def _extract_legislation_section(ins: RuleInputs) -> DerivedMetadata:
     if m:
         year = int(m["year"])
         act_no = m["actno"].lstrip("0") or "0"
-    # Section identifier is the path segment after the body.
     segs = [s for s in ins.doc_id.split("/") if s]
     section_id = segs[2] if len(segs) >= 3 else ""
 
     act_name: str | None = None
-    # 1. Headings (already decomposed by the CLI on " › " and " — ").
     for h in ins.headings[:6]:
         t = " ".join(h.split())
         if _RE_ACT_TITLE.match(t):
             act_name = t
             break
-    # 2. MailTo breadcrumb.
     if not act_name:
         for line in _parse_mailto_body(ins.body_head):
             if _RE_ACT_TITLE.match(line):
@@ -785,28 +764,24 @@ def _extract_legislation_section(ins: RuleInputs) -> DerivedMetadata:
                 break
 
     if act_name:
-        label = f"{act_name}"
         if section_id:
-            label = f"{act_name} s {section_id}" if ins.outer_prefix == "PAC" else f"{act_name} reg {section_id}"
+            title = f"{act_name} s {section_id}" if ins.outer_prefix == "PAC" else f"{act_name} reg {section_id}"
+        else:
+            title = act_name
     else:
-        # Fallback: docid-derived.
         if ins.outer_prefix == "PAC":
-            label = f"Act {year} No. {act_no} s {section_id}" if year else f"PAC {inner}/{section_id}"
-        else:  # REG
-            label = f"Regulations {year} reg {section_id}" if year else f"REG {inner}/{section_id}"
+            title = f"Act {year} No. {act_no} s {section_id}" if year else f"PAC {inner}/{section_id}"
+        else:
+            title = f"Regulations {year} reg {section_id}" if year else f"REG {inner}/{section_id}"
 
-    # Year fallback from docid.
     if year is None:
         ym = _RE_ACT_YEAR.search(act_name or "")
         year = int(ym["year"]) if ym else None
 
     precise = _precise_date(ins.body_head[:600])
-    first_pub = precise or (f"{year}-01-01" if year else None) or ins.pub_date
     return DerivedMetadata(
-        human_code=label,
-        human_title=_human_title(ins) or act_name,
-        first_published_date=first_pub,
-        citation_year=year,
+        title=title,
+        date=precise or (f"{year}-01-01" if year else None) or ins.pub_date,
     )
 
 
@@ -818,49 +793,36 @@ def _extract_historical_case(ins: RuleInputs) -> DerivedMetadata:
 
     Body typically starts with ``*## <Case Name>* | **(YYYY) REPORT**``
     or has a breadcrumb mailto carrying ``<Court (YYYY)> | <Case> - (date)``.
-    Year comes from the docid (authoritative); case name from body header
-    or mailto breadcrumb.
     """
     m = _RE_DOCID_JUD_STAR.match(ins.inner_body)
     year: int | None = int(m["year"]) if m else None
 
-    # Pull case name from the body header line: ``*## Name *``.
-    case_name: str | None = None
+    name: str | None = None
     hdr = _RE_CASE_HEADER_NAME.search(ins.body_head[:400])
     if hdr:
-        case_name = " ".join(hdr["name"].split())
-    # Fallback — mailto breadcrumb line containing a ``name (date)`` form.
-    if case_name is None:
+        name = " ".join(hdr["name"].split())
+    if name is None:
         for line in _parse_mailto_body(ins.body_head):
-            # Skip the "Cases" and "Court (YYYY)" labels.
             if line.lower() in ("cases",):
                 continue
-            # A case line usually has " v " or " - (date)".
             if " v " in line or " - (" in line:
-                # Trim trailing " - (date)" tail.
                 nm = re.sub(r"\s*-\s*\([^)]+\)\s*$", "", line).strip()
                 if nm and len(nm) < 200:
-                    case_name = nm
+                    name = nm
                     break
-    # Fallback — first non-URL, non-empty heading.
-    if case_name is None:
+    if name is None:
         for h in ins.headings[:4]:
             t = " ".join(h.split())
             if t and not t.startswith("/law/view/") and len(t) < 200:
-                case_name = t
+                name = t
                 break
-
-    # If STILL nothing, use the docid body itself (last resort).
-    if case_name is None:
-        case_name = ins.inner_body or None
+    if name is None:
+        name = ins.inner_body or None
 
     precise = _precise_date(ins.body_head[:600])
-    first_pub = precise or (f"{year}-01-01" if year else None) or ins.pub_date
     return DerivedMetadata(
-        human_code=case_name,
-        human_title=_human_title(ins) or case_name,
-        first_published_date=first_pub,
-        citation_year=year,
+        title=name,
+        date=precise or (f"{year}-01-01" if year else None) or ins.pub_date,
     )
 
 
@@ -868,41 +830,25 @@ def _extract_historical_case(ins: RuleInputs) -> DerivedMetadata:
 
 
 def _extract_bill_em(ins: RuleInputs) -> DerivedMetadata:
-    """Bill / EM — no canonical short code but we can give a useful label.
-
-    Prefer the Bill title in h2 if present; otherwise h1. Year from the
-    "Bill YYYY" token. For NEM/SRS/EXM etc where headings degrade to a
-    URL, fall back to scanning ``**<Bill title>**`` markers in body_head.
-    """
+    """Bill / EM — no canonical short code but we can give a useful label."""
     source = ins.h2 if _RE_BILL_YEAR.search(ins.h2) else ins.h1
-    title = " ".join(source.split())
-    # Body fallback — ATO-rendered Bills/EMs put the Bill/Act title inside
-    # `**...**` markers in the first few lines.
-    if not _RE_BILL_YEAR.search(title) and not _RE_ACT_TITLE.match(title):
+    bill_title = " ".join(source.split())
+    if not _RE_BILL_YEAR.search(bill_title) and not _RE_ACT_TITLE.match(bill_title):
         for line in re.findall(r"\*\*([^*]+?)\*\*", ins.body_head[:800]):
             line = " ".join(line.split())
             if _RE_BILL_YEAR.search(line) or _RE_ACT_TITLE.match(line):
-                title = line
+                bill_title = line
                 break
-    ym = _RE_BILL_YEAR.search(title) or _RE_ACT_YEAR.search(title)
+    ym = _RE_BILL_YEAR.search(bill_title) or _RE_ACT_YEAR.search(bill_title)
     year = int(ym["year"]) if ym else None
-    label = None
-    if title:
-        if "Explanatory" not in title and ym:
-            label = f"EM to {title}"
-        else:
-            label = title
+    title = None
+    if bill_title:
+        title = f"EM to {bill_title}" if ("Explanatory" not in bill_title and ym) else bill_title
     precise = _precise_date(ins.body_head[:600])
-    first_pub = precise or (f"{year}-01-01" if year else None) or ins.pub_date
     return DerivedMetadata(
-        human_code=label,
-        human_title=_human_title(ins) or title,
-        first_published_date=first_pub,
-        citation_year=year,
+        title=title,
+        date=precise or (f"{year}-01-01" if year else None) or ins.pub_date,
     )
-
-
-# --- Template: SMSF Regulator's Bulletin ------------------------------------
 
 
 def _extract_smsfrb(ins: RuleInputs) -> DerivedMetadata:
@@ -911,12 +857,9 @@ def _extract_smsfrb(ins: RuleInputs) -> DerivedMetadata:
         if m:
             year = int(m["year"])
             return DerivedMetadata(
-                human_code=f"SMSFRB {m['year']}/{m['num']}",
-                human_title=_human_title(ins),
-                first_published_date=f"{year}-01-01",
-                citation_year=year,
+                title=_compose_title(f"SMSFRB {m['year']}/{m['num']}", ins),
+                date=f"{year}-01-01",
             )
-    # Fall through — no citation found; use docid body if possible.
     return _extract_other(ins)
 
 
@@ -970,50 +913,32 @@ _RE_DATE_OF_ADVICE = re.compile(
 
 
 def _extract_epa(ins: RuleInputs) -> DerivedMetadata:
-    """Edited private advice — EPA docs.
+    """Edited private advice — the auth number is the identity.
 
     The ATO identifies each EPA by its authorisation number (the inner
-    segment of the docid, e.g. ``EV/1012101718232``). We surface that as
-    the human_code so the field is populated AND the value is useful for
-    lookup. Date comes from "Date of advice: ..." in the body when
-    present; older EPAs don't carry it.
+    segment of the docid, e.g. ``EV/1012101718232``). Date comes from
+    ``Date of advice: ...`` in the body when present.
     """
-    # Strip any leading space artefact ("EV/ 1011343943821" → "1011343943821").
     auth = ins.inner_body.strip()
     code = f"{ins.outer_prefix} {auth}".strip() if auth else None
-    year = None
     precise: str | None = None
     m = _RE_DATE_OF_ADVICE.search(ins.body_head[:1500])
     if m:
         month = _MONTH[m["mon"].lower()]
         precise = f"{int(m['year']):04d}-{month:02d}-{int(m['day']):02d}"
-        year = int(m["year"])
-    if year is None and ins.pub_date and len(ins.pub_date) >= 4 and ins.pub_date[:4].isdigit():
-        year = int(ins.pub_date[:4])
-    first_pub = precise or ins.pub_date or (f"{year}-01-01" if year else None)
-    return DerivedMetadata(
-        human_code=code,
-        human_title=_human_title(ins) or (ins.title if ins.title else None),
-        first_published_date=first_pub,
-        citation_year=year,
-    )
+    date = precise or ins.pub_date
+    return DerivedMetadata(title=code, date=date)
 
 
 def _extract_other(ins: RuleInputs) -> DerivedMetadata:
-    """Fallback — try docid + pub_date; leave NULL if nothing fires."""
-    code, year, status = _extract_from_docid(ins)
-    if ins.pub_date and len(ins.pub_date) >= 4 and ins.pub_date[:4].isdigit():
-        y = int(ins.pub_date[:4])
-        if year is None:
-            year = y
+    """Fallback — try docid, pub_date, body date; leave NULL if nothing fires."""
+    code, year, _status = _extract_from_docid(ins)
+    if ins.pub_date and len(ins.pub_date) >= 4 and ins.pub_date[:4].isdigit() and year is None:
+        year = int(ins.pub_date[:4])
     precise = _precise_date(ins.body_head[:600])
-    first_pub = precise or ins.pub_date or (f"{year}-01-01" if year else None)
     return DerivedMetadata(
-        human_code=code,
-        human_title=_human_title(ins),
-        first_published_date=first_pub,
-        citation_year=year,
-        status=status,
+        title=code,
+        date=precise or ins.pub_date or (f"{year}-01-01" if year else None),
     )
 
 
@@ -1036,14 +961,12 @@ _EXTRACTORS: dict[Template, Callable[[RuleInputs], DerivedMetadata]] = {
 }
 
 
-def _universal_fallback_code(ins: RuleInputs) -> str | None:
-    """Last-resort human_code from the docid itself.
+def _universal_fallback_title(ins: RuleInputs) -> str | None:
+    """Last-resort title from the docid itself.
 
-    ATO's docid has the shape ``<PREFIX>/<body>/<part>``. The prefix is a
-    ~3-letter publication class (PAC, NEM, RPC, ...) and body is the
-    identifier within that class. Combining them gives a unique,
-    human-readable label that mirrors how the ATO's own URL bar
-    identifies the doc — always populated, always addressable.
+    ATO's docid has the shape ``<PREFIX>/<body>/<part>``. Combining the
+    prefix and body gives a unique, human-readable label that mirrors how
+    the ATO's own URL bar identifies the doc — always populated.
     """
     if ins.outer_prefix and ins.inner_body:
         return f"{ins.outer_prefix} {ins.inner_body}"
@@ -1053,41 +976,31 @@ def _universal_fallback_code(ins: RuleInputs) -> str | None:
 
 
 def derive_metadata(inputs: RuleInputs) -> DerivedMetadata:
-    """Classify the page's template, then run that template's extractor."""
+    """Classify the page's template, then run that template's extractor.
+
+    Two-stage fallback ensures every doc gets a title and a date:
+    title → template → docid-citation parser → ``<prefix> <body>``.
+    date  → template → pub_date → year-from-docid.
+    """
     template = classify(inputs)
     result = _EXTRACTORS[template](inputs)
-    # If the template extractor came up empty on human_code, try the docid
-    # fallback so e.g. a scraper-damaged OFFICIAL_PUB page (no h2) still
-    # surfaces its canonical code.
-    if result.human_code is None:
-        fallback_code, fb_year, fb_status = _extract_from_docid(inputs)
+    if result.title is None:
+        fallback_code, fb_year, _ = _extract_from_docid(inputs)
         if fallback_code:
-            result = replace(
-                result,
-                human_code=fallback_code,
-                citation_year=result.citation_year or fb_year,
-                status=result.status or fb_status,
-            )
-    # Universal fallback — guarantees every doc has SOME code even when
-    # nothing parsed. Downstream tools can treat this as "weakly
-    # identified" if needed.
-    if result.human_code is None:
-        universal = _universal_fallback_code(inputs)
+            result = replace(result, title=fallback_code)
+            if result.date is None and fb_year:
+                result = replace(result, date=f"{fb_year}-01-01")
+    if result.title is None:
+        universal = _universal_fallback_title(inputs)
         if universal:
-            result = replace(result, human_code=universal)
-    # Date fallback — prefer template-derived, then pub_date, then year from
-    # docid (``*YYYY*`` / 4-digit prefix), then None.
-    if result.first_published_date is None:
+            result = replace(result, title=universal)
+    if result.date is None:
         if inputs.pub_date:
-            result = replace(result, first_published_date=inputs.pub_date)
+            result = replace(result, date=inputs.pub_date)
         else:
             fb_year = _year_from_docid(inputs)
             if fb_year:
-                result = replace(
-                    result,
-                    first_published_date=f"{fb_year}-01-01",
-                    citation_year=result.citation_year or fb_year,
-                )
+                result = replace(result, date=f"{fb_year}-01-01")
     return result
 
 

@@ -157,8 +157,7 @@ def build(args: BuildArgs) -> Manifest:
             if not title:
                 title = (rec.get("title") or canonical_id).strip() or canonical_id
 
-            prefix, doc_type_name = meta_mod.parse_docid(canonical_id)
-            doc_type = doc_type_name or prefix
+            prefix, _ = meta_mod.parse_docid(canonical_id)
             pub_date = meta_mod.extract_pub_date(markdown) if markdown else None
             derived = rules_mod.derive_metadata(rules_mod.RuleInputs(
                 doc_id=doc_id,
@@ -168,18 +167,14 @@ def build(args: BuildArgs) -> Manifest:
                 category=category,
                 pub_date=pub_date,
             ))
-            human_code = derived.human_code
-            human_title = meta_mod.compose_human_title(headings)
-            first_published_date = derived.first_published_date
-            effective_date = None
-            doc_status = derived.status or (meta_mod.extract_status(markdown) or "active" if markdown else None)
+            derived_title = derived.title or title
+            derived_date = derived.date
             downloaded_at = rec.get("downloaded_at") or datetime.now(timezone.utc).isoformat()
 
             meta_fields = {
-                "title": title,
-                "doc_type": doc_type,
-                "pub_date": pub_date,
-                "status": doc_status,
+                "title": derived_title,
+                "type": category,
+                "date": derived_date,
             }
             ch = meta_mod.content_hash(markdown, meta_fields)
 
@@ -207,19 +202,17 @@ def build(args: BuildArgs) -> Manifest:
             else:
                 vectors_i8 = np.empty((0, store_db.EMBEDDING_DIM), dtype=np.int8)
 
-            # Insert document row
+            # Insert document row — v5 columns only.
             conn.execute(
                 INSERT_DOCUMENT,
                 (
-                    doc_id, href, category, doc_type, human_code, title, human_title,
-                    pub_date, first_published_date, effective_date, doc_status,
-                    1 if has_content else 0,
+                    doc_id, category, derived_title, derived_date,
                     downloaded_at, ch, "PENDING",  # pack_sha8 backfilled below
                 ),
             )
             conn.execute(
                 INSERT_TITLE_FTS,
-                (doc_id, human_code or "", title, human_title or "", " ".join(headings)),
+                (doc_id, derived_title, " ".join(headings)),
             )
             for i, c in enumerate(chunks):
                 compressed_text = zstd.ZstdCompressor(level=3).compress(c.text.encode("utf-8"))
@@ -234,17 +227,9 @@ def build(args: BuildArgs) -> Manifest:
             # Build a pack record. pack_sha8 + offset/length filled after pack close.
             record = {
                 "doc_id": doc_id,
-                "href": href,
-                "category": category,
-                "doc_type": doc_type,
-                "human_code": human_code,
-                "title": title,
-                "human_title": human_title,
-                "pub_date": pub_date,
-                "first_published_date": first_published_date,
-                "effective_date": effective_date,
-                "status": doc_status,
-                "has_content": has_content,
+                "type": category,
+                "title": derived_title,
+                "date": derived_date,
                 "downloaded_at": downloaded_at,
                 "content_hash": ch,
                 "anchors": anchors,
@@ -267,9 +252,8 @@ def build(args: BuildArgs) -> Manifest:
                     pack_sha8="PENDING",
                     offset=0,
                     length=0,
-                    category=category,
-                    doc_type=doc_type,
-                    title=title,
+                    type=category,
+                    title=derived_title,
                     has_content=has_content,
                 )
             )
@@ -379,24 +363,18 @@ def _insert_from_previous(
     conn.execute(
         INSERT_DOCUMENT,
         (
-            record["doc_id"], record["href"], record["category"],
-            record.get("doc_type"), record.get("human_code"), record["title"],
-            record.get("human_title"),
-            record.get("pub_date"), record.get("first_published_date"),
-            record.get("effective_date"), record.get("status"),
-            1 if record.get("has_content") else 0, record["downloaded_at"],
-            record["content_hash"], prev_ref.pack_sha8,
+            record["doc_id"],
+            record.get("type") or record.get("category") or "",
+            record["title"],
+            record.get("date") or record.get("first_published_date"),
+            record["downloaded_at"],
+            record["content_hash"],
+            prev_ref.pack_sha8,
         ),
     )
     conn.execute(
         INSERT_TITLE_FTS,
-        (
-            record["doc_id"],
-            record.get("human_code") or "",
-            record["title"],
-            record.get("human_title") or "",
-            "",
-        ),
+        (record["doc_id"], record["title"], ""),
     )
     for c in record.get("chunks", []):
         compressed_text = zstd.ZstdCompressor(level=3).compress(c["text"].encode("utf-8"))
@@ -466,7 +444,7 @@ def _load_resume_state(conn) -> set[str]:
 def _load_doc_refs_from_db(conn, pack_search_dirs: list[Path]) -> list[DocRef]:
     """Reconstruct the manifest's document list from committed DB state."""
     rows = conn.execute(
-        "SELECT doc_id, content_hash, pack_sha8, category, doc_type, title, has_content "
+        "SELECT doc_id, content_hash, pack_sha8, type, title "
         "FROM documents WHERE pack_sha8 != 'PENDING' ORDER BY doc_id"
     ).fetchall()
     refs: list[DocRef] = [
@@ -476,10 +454,9 @@ def _load_doc_refs_from_db(conn, pack_search_dirs: list[Path]) -> list[DocRef]:
             pack_sha8=row["pack_sha8"],
             offset=0,
             length=0,
-            category=row["category"] or "",
-            doc_type=row["doc_type"],
+            type=row["type"] or "",
             title=row["title"],
-            has_content=bool(row["has_content"]),
+            has_content=True,
         )
         for row in rows
     ]

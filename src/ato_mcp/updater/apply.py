@@ -322,8 +322,8 @@ def _delete_doc(conn: sqlite3.Connection, doc_id: str) -> None:
     ).fetchall()
     for row in rows:
         conn.execute(
-            "INSERT INTO title_fts(title_fts, rowid, doc_id, human_code, title, human_title, headings) "
-            "SELECT 'delete', rowid, doc_id, human_code, title, human_title, headings "
+            "INSERT INTO title_fts(title_fts, rowid, doc_id, title, headings) "
+            "SELECT 'delete', rowid, doc_id, title, headings "
             "FROM title_fts WHERE rowid = ?",
             (row["rowid"],),
         )
@@ -346,24 +346,18 @@ def _insert_record(conn: sqlite3.Connection, record: dict, ref: DocRef) -> None:
     conn.execute(
         INSERT_DOCUMENT,
         (
-            record["doc_id"], record["href"], record["category"],
-            record.get("doc_type"), record.get("human_code"), record["title"],
-            record.get("human_title"),
-            record.get("pub_date"), record.get("first_published_date"),
-            record.get("effective_date"), record.get("status"),
-            1 if record.get("has_content") else 0, record["downloaded_at"],
-            record["content_hash"], ref.pack_sha8,
+            record["doc_id"],
+            record.get("type") or record.get("category") or "",
+            record["title"],
+            record.get("date") or record.get("first_published_date"),
+            record["downloaded_at"],
+            record["content_hash"],
+            ref.pack_sha8,
         ),
     )
     conn.execute(
         INSERT_TITLE_FTS,
-        (
-            record["doc_id"],
-            record.get("human_code") or "",
-            record["title"],
-            record.get("human_title") or "",
-            "",
-        ),
+        (record["doc_id"], record["title"], ""),
     )
     for c in record.get("chunks", []):
         compressed_text = zstd.ZstdCompressor(level=3).compress(c["text"].encode("utf-8"))

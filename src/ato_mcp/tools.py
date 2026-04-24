@@ -1,9 +1,7 @@
-"""MCP tool implementations for ato-mcp.
+"""MCP tool implementations for ato-mcp (v5 schema).
 
-All tools accept ``format`` = ``"markdown"`` (default) or ``"json"``.
-Every hit carries ``canonical_url``. Tools are intentionally small and
-composable so agents can pipe ``search`` -> ``get_section`` with minimal
-token cost.
+5 tools. Every hit carries a ``canonical_url``; agents compose
+``search -> get_document`` with minimal token cost.
 """
 from __future__ import annotations
 
@@ -32,20 +30,15 @@ DEFAULT_K = 8
 MAX_K = 50
 RRF_K = 60
 SNIPPET_CHARS = 280
+# Recency half-life (years) applied when ``sort_by='relevance'`` with a
+# date-bearing query. Picked from tax-law practitioner intuition: a doc
+# 5 years old is roughly half as likely to be current.
+RECENCY_HALF_LIFE_YEARS = 5.0
 
 
 @dataclass
 class Backend:
-    """Shared embedding model plus per-thread read-only SQLite connections.
-
-    FastMCP dispatches synchronous tool handlers on a thread pool, and
-    ``sqlite3`` connections are thread-affine by default (``check_same_thread``).
-    A single shared connection would raise ``ProgrammingError`` when the pool
-    rotates threads. We instead give each worker thread its own connection via
-    ``threading.local``; SQLite handles concurrent readers cleanly. The
-    embedding model (ONNX Runtime session + Rust tokenizer) is thread-safe and
-    stays shared.
-    """
+    """Shared embedding model plus per-thread read-only SQLite connections."""
     model: EmbeddingModel | None
     _tls: threading.local
 
@@ -66,8 +59,6 @@ class Backend:
             current_mtime = paths.db_path().stat().st_mtime
         except FileNotFoundError:
             current_mtime = 0.0
-        # If a concurrent `ato-mcp update` replaced the DB since we last saw it,
-        # drop this thread's connection so we reopen against the new file.
         if conn is not None and getattr(tls, "mtime", 0.0) + 0.001 < current_mtime:
             conn.close()
             conn = None
@@ -78,9 +69,6 @@ class Backend:
         return conn
 
     def close(self) -> None:
-        """Close this thread's connection if any. Other threads' connections
-        stay open until their thread exits — the stdlib thread-local teardown
-        runs the sqlite3 destructor for us."""
         conn = getattr(self._tls, "conn", None)
         if conn is not None:
             conn.close()
@@ -92,12 +80,6 @@ _BACKEND_LOCK = threading.Lock()
 
 
 def get_backend() -> Backend:
-    """Return the process-wide backend, creating it once under a lock.
-
-    Double-checked locking keeps the fast path lock-free once ``_BACKEND`` is
-    set, and prevents the thread-pool TOCTOU race that would otherwise have
-    every concurrent first-call load its own copy of the 300 MB ONNX model.
-    """
     global _BACKEND
     if _BACKEND is None:
         with _BACKEND_LOCK:
@@ -136,7 +118,7 @@ def _highlight_snippet(text: str, query: str, max_chars: int = SNIPPET_CHARS) ->
         snippet = cleaned[start:end]
         if start > 0:
             snippet = "…" + snippet
-    # Bold query terms
+
     def _bold(m: re.Match) -> str:
         token = m.group(0)
         if token.lower() in words:
@@ -145,58 +127,48 @@ def _highlight_snippet(text: str, query: str, max_chars: int = SNIPPET_CHARS) ->
     return _WORD_RE.sub(_bold, snippet).strip()
 
 
-def _build_sql_filter(
-    categories: list[str] | None,
-    doc_types: list[str] | None,
-    date_from: str | None,
-    date_to: str | None,
-    doc_scope: str | None = None,
-    category_scope: str | None = None,
-) -> tuple[str, list[Any]]:
-    clauses: list[str] = []
-    params: list[Any] = []
-    if categories:
-        placeholders = ",".join("?" * len(categories))
-        clauses.append(f"d.category IN ({placeholders})")
-        params.extend(categories)
-    if doc_types:
-        placeholders = ",".join("?" * len(doc_types))
-        clauses.append(f"d.doc_type IN ({placeholders})")
-        params.extend(doc_types)
-    # Date filter uses COALESCE so rulings whose docid-derived year populated
-    # first_published_date (YYYY-01-01) still respond to time-range filters
-    # even when no precise header date was scraped.
-    if date_from:
-        clauses.append("COALESCE(d.first_published_date, d.pub_date) >= ?")
-        params.append(date_from)
-    if date_to:
-        clauses.append("COALESCE(d.first_published_date, d.pub_date) <= ?")
-        params.append(date_to)
-    if doc_scope:
-        # Auto-detect: a `/` anywhere in the scope means the agent is scoping
-        # by the machine doc_id path (e.g. "TXR/TR20133/*"). Otherwise assume
-        # the short human citation form (e.g. "TR 2013/3").
-        pattern = _glob_to_like(doc_scope)
-        column = "d.doc_id" if "/" in doc_scope else "d.human_code"
-        clauses.append(f"{column} LIKE ? ESCAPE '\\'")
-        params.append(pattern)
-    if category_scope:
-        clauses.append(r"d.category LIKE ? ESCAPE '\'")
-        params.append(_glob_to_like(category_scope))
-    return (" AND ".join(clauses), params) if clauses else ("", params)
-
-
 _GLOB_ESCAPE = str.maketrans({"\\": r"\\", "%": r"\%", "_": r"\_"})
 
 
 def _glob_to_like(pattern: str) -> str:
-    """Turn a shell glob into a SQL LIKE pattern (use with ``ESCAPE '\\'``).
-
-    ``*`` is the only wildcard we accept. Literal ``%``, ``_`` and ``\\``
-    in the input are escaped so ``tr_2024_3`` stays a specific slug rather
-    than collapsing into the LIKE single-char wildcard.
-    """
+    """Turn a shell glob into a SQL LIKE pattern (use with ``ESCAPE '\\'``)."""
     return pattern.translate(_GLOB_ESCAPE).replace("*", "%")
+
+
+def _build_sql_filter(
+    types: list[str] | None,
+    date_from: str | None,
+    date_to: str | None,
+    doc_scope: str | None,
+) -> tuple[str, list[Any]]:
+    """Build a WHERE fragment for the documents table.
+
+    ``types`` accepts exact matches or shell globs (``Public_*``) — both
+    compose with OR within the list. ``doc_scope`` is a glob over the
+    ``doc_id`` path.
+    """
+    clauses: list[str] = []
+    params: list[Any] = []
+    if types:
+        ors: list[str] = []
+        for t in types:
+            if "*" in t:
+                ors.append("d.type LIKE ? ESCAPE '\\'")
+                params.append(_glob_to_like(t))
+            else:
+                ors.append("d.type = ?")
+                params.append(t)
+        clauses.append("(" + " OR ".join(ors) + ")")
+    if date_from:
+        clauses.append("d.date >= ?")
+        params.append(date_from)
+    if date_to:
+        clauses.append("d.date <= ?")
+        params.append(date_to)
+    if doc_scope:
+        clauses.append("d.doc_id LIKE ? ESCAPE '\\'")
+        params.append(_glob_to_like(doc_scope))
+    return (" AND ".join(clauses), params) if clauses else ("", params)
 
 
 # ---------------------------------------------------------------------------
@@ -211,7 +183,6 @@ def _fts_search(
     filter_sql: str,
     filter_params: list[Any],
 ) -> list[tuple[int, float]]:
-    """Return [(chunk_id, bm25_score), ...]. Lower bm25 is better."""
     where = f"AND {filter_sql}" if filter_sql else ""
     sql = f"""
         SELECT f.rowid AS chunk_id, bm25(chunks_fts) AS score
@@ -229,15 +200,6 @@ def _fts_search(
 
 
 def _fts_query(query: str) -> str:
-    """Turn a free-text query into an FTS5-safe MATCH expression.
-
-    Tokens are space-joined, which FTS5 interprets as implicit AND — every
-    returned chunk must contain every query term. Previous OR-join behaviour
-    made common words like "tax" match ~500K chunks and then BM25-rank all
-    of them, producing >30 s tails on natural-language queries. Single-char
-    tokens (e.g. ``R``/``D`` from ``R&D``) are dropped so they don't turn
-    queries into zero-result searches for punctuation artefacts.
-    """
     tokens = [t for t in _WORD_RE.findall(query) if len(t) >= 2]
     if not tokens:
         return '""'
@@ -246,12 +208,6 @@ def _fts_query(query: str) -> str:
 
 @lru_cache(maxsize=128)
 def _encode_query_cached(query: str) -> bytes:
-    """Embed ``query`` once and reuse the int8 vector for repeated calls.
-
-    Keyed on the raw query string. A typical agent session asks the same
-    question a handful of times (retry on format, follow-up with narrower k,
-    etc.); caching skips ~500-800 ms of ONNX encoding per hit. The cache is
-    process-local and uses ~32 KB at maxsize (128 × 256 bytes)."""
     backend = get_backend()
     if backend.model is None:
         return b""
@@ -281,10 +237,7 @@ def _vec_search(
         ORDER BY v.distance ASC LIMIT ?
     """
     try:
-        rows = conn.execute(
-            sql,
-            [q_vec, limit, *filter_params, limit],
-        ).fetchall()
+        rows = conn.execute(sql, [q_vec, limit, *filter_params, limit]).fetchall()
     except sqlite3.OperationalError as exc:
         LOGGER.warning("vector search failed: %s", exc)
         return []
@@ -308,8 +261,7 @@ def _load_hit(conn: sqlite3.Connection, chunk_id: int) -> dict | None:
     row = conn.execute(
         """
         SELECT c.chunk_id, c.doc_id, c.ord, c.heading_path, c.anchor, c.text,
-               d.human_code, d.title, d.human_title, d.category, d.doc_type,
-               d.href, d.pub_date, d.first_published_date, d.status
+               d.type, d.title, d.date
         FROM chunks c JOIN documents d ON d.doc_id = c.doc_id
         WHERE c.chunk_id = ?
         """,
@@ -325,16 +277,10 @@ def _load_hit(conn: sqlite3.Connection, chunk_id: int) -> dict | None:
         "heading_path": row["heading_path"] or "",
         "anchor": row["anchor"],
         "text": text,
-        "human_code": row["human_code"],
+        "type": row["type"],
         "title": row["title"],
-        "human_title": row["human_title"],
-        "category": row["category"],
-        "doc_type": row["doc_type"],
-        "href": row["href"],
-        "pub_date": row["pub_date"],
-        "first_published_date": row["first_published_date"],
-        "status": row["status"],
-        "canonical_url": formatters.canonical_url(row["href"]),
+        "date": row["date"],
+        "canonical_url": formatters.canonical_url(row["doc_id"]),
     }
 
 
@@ -346,23 +292,17 @@ def search(
     query: str,
     *,
     k: int = DEFAULT_K,
-    categories: list[str] | None = None,
-    doc_types: list[str] | None = None,
+    types: list[str] | None = None,
     date_from: str | None = None,
     date_to: str | None = None,
     doc_scope: str | None = None,
-    category_scope: str | None = None,
     mode: Literal["hybrid", "vector", "keyword"] = "hybrid",
     sort_by: Literal["relevance", "recency"] = "relevance",
-    recency_half_life_years: float | None = None,
     format: Literal["markdown", "json"] = "markdown",
 ) -> str:
     backend = get_backend()
     k = max(1, min(k, MAX_K))
-    filter_sql, filter_params = _build_sql_filter(
-        categories, doc_types, date_from, date_to,
-        doc_scope=doc_scope, category_scope=category_scope,
-    )
+    filter_sql, filter_params = _build_sql_filter(types, date_from, date_to, doc_scope)
 
     internal_k = max(k * 5, 50)
     fts_hits: list[tuple[int, float]] = []
@@ -383,8 +323,8 @@ def search(
     else:
         fused = [(cid, -score) for cid, score in vec_hits]
 
-    # Over-fetch so recency boost can re-order the frontier before we cut to k.
-    frontier = max(k * 2, 20) if recency_half_life_years else k
+    # Over-fetch so the recency boost can re-order the frontier before we cut.
+    frontier = max(k * 2, 20) if sort_by == "relevance" else k * 3
     records: list[dict] = []
     for chunk_id, score in fused[:frontier]:
         hit = _load_hit(backend.db, chunk_id)
@@ -394,14 +334,11 @@ def search(
         hit["snippet"] = _highlight_snippet(hit["text"], query)
         records.append(hit)
 
-    if recency_half_life_years and recency_half_life_years > 0:
-        _apply_recency_boost(records, half_life_years=recency_half_life_years)
+    if sort_by == "relevance":
+        _apply_recency_boost(records, half_life_years=RECENCY_HALF_LIFE_YEARS)
         records.sort(key=lambda r: r["score"], reverse=True)
-    if sort_by == "recency":
-        records.sort(
-            key=lambda r: r.get("first_published_date") or r.get("pub_date") or "",
-            reverse=True,
-        )
+    else:  # recency
+        records.sort(key=lambda r: r.get("date") or "", reverse=True)
     records = records[:k]
 
     payload = [_slim_hit(r) for r in records]
@@ -411,18 +348,13 @@ def search(
 
 
 def _apply_recency_boost(records: list[dict], *, half_life_years: float) -> None:
-    """Multiply each record's ``score`` by a recency factor in (0.5, 1.5].
-
-    Factor = 0.5 + exp(-age_years * ln2 / half_life_years). That puts a
-    today-published doc at 1.5× score, a half-life-aged doc at 1.0×, and
-    very old docs at ≈0.5×. Missing dates get the neutral 1.0×.
-    """
+    """Multiply each record's ``score`` by a recency factor in (0.5, 1.5]."""
     import datetime as _dt
     import math
     now_year = _dt.datetime.now(tz=_dt.timezone.utc).year
     decay = math.log(2) / half_life_years
     for r in records:
-        date = r.get("first_published_date") or r.get("pub_date")
+        date = r.get("date")
         year = None
         if date and len(date) >= 4 and date[:4].isdigit():
             year = int(date[:4])
@@ -433,9 +365,11 @@ def _apply_recency_boost(records: list[dict], *, half_life_years: float) -> None
 
 
 def _slim_hit(hit: dict) -> dict:
-    keys = ("doc_id", "human_code", "title", "human_title", "category", "doc_type",
-            "heading_path", "snippet", "canonical_url", "score", "chunk_id",
-            "first_published_date", "pub_date", "status")
+    keys = (
+        "doc_id", "title", "type", "date",
+        "heading_path", "anchor", "snippet",
+        "canonical_url", "score", "chunk_id",
+    )
     return {k: hit.get(k) for k in keys}
 
 
@@ -443,45 +377,32 @@ def search_titles(
     query: str,
     *,
     k: int = 20,
-    doc_types: list[str] | None = None,
     format: Literal["markdown", "json"] = "markdown",
 ) -> str:
     backend = get_backend()
     k = max(1, min(k, 100))
-    where = ""
-    params: list[Any] = [_fts_query(query)]
-    if doc_types:
-        placeholders = ",".join("?" * len(doc_types))
-        where = f"AND d.doc_type IN ({placeholders})"
-        params.extend(doc_types)
-    params.append(k)
-    sql = f"""
+    sql = """
         SELECT t.doc_id AS doc_id, bm25(title_fts) AS score,
-               d.human_code, d.title, d.human_title, d.category, d.doc_type, d.href, d.pub_date
+               d.type, d.title, d.date
         FROM title_fts t
         JOIN documents d ON d.doc_id = t.doc_id
-        WHERE title_fts MATCH ? {where}
+        WHERE title_fts MATCH ?
         ORDER BY score ASC LIMIT ?
     """
     try:
-        rows = backend.db.execute(sql, params).fetchall()
+        rows = backend.db.execute(sql, [_fts_query(query), k]).fetchall()
     except sqlite3.OperationalError:
         rows = []
-    hits = []
-    for row in rows:
-        hits.append({
-            "doc_id": row["doc_id"],
-            "human_code": row["human_code"],
-            "title": row["title"],
-            "human_title": row["human_title"],
-            "category": row["category"],
-            "doc_type": row["doc_type"],
-            "heading_path": "",
-            "snippet": row["human_title"] or row["title"],
-            "canonical_url": formatters.canonical_url(row["href"]),
-            "pub_date": row["pub_date"],
-            "score": row["score"],
-        })
+    hits = [{
+        "doc_id": row["doc_id"],
+        "title": row["title"],
+        "type": row["type"],
+        "date": row["date"],
+        "heading_path": "",
+        "snippet": row["title"],
+        "canonical_url": formatters.canonical_url(row["doc_id"]),
+        "score": row["score"],
+    } for row in rows]
     if format == "json":
         return formatters.as_json({"query": query, "hits": hits})
     return formatters.format_hits_markdown(hits)
@@ -500,28 +421,23 @@ def get_document(
 ) -> str:
     """Return a document or a slice of it.
 
-    Three retrieval modes, all through one tool:
+    Three retrieval modes, one tool:
 
-    * **Whole document** (no selector) — `format='outline'` for the TOC,
-      `format='markdown'` for the full body. `max_chars` caps either.
-    * **A specific section** (`anchor=` or `heading_path=`) — returns the
-      chunk(s) at that heading. With `include_children=True` the return
-      grows to cover all nested sub-headings until the next sibling or
-      higher-level heading.
-    * **An ordinal range** (`from_ord=N`) — walk forward from a cursor
-      position. Combine with `count` or `max_chars` to paginate through
-      a long document without reading it all at once. The JSON payload
-      carries `continuation_ord` when truncation happened.
-
-    Outline entries include `start_ord`, `chunk_count`, and `bytes` so the
-    caller can budget before asking for body text.
+    * **Whole document** (no selector) — ``format='outline'`` for the TOC,
+      ``format='markdown'`` for the full body. ``max_chars`` caps either.
+    * **A specific section** (``anchor=`` or ``heading_path=``) — returns
+      the chunk(s) at that heading. ``include_children=True`` rolls up
+      the entire subtree until the next sibling or higher-level heading.
+    * **An ordinal range** (``from_ord=N``) — walk forward from a cursor.
+      Combine with ``count`` or ``max_chars`` to paginate. The JSON
+      payload carries ``continuation_ord`` when truncation happened.
     """
     backend = get_backend()
     doc_row = backend.db.execute(SELECT_DOCUMENT, (doc_id,)).fetchone()
     if doc_row is None:
         return f"_Document not found: `{doc_id}`_"
     doc = dict(doc_row)
-    doc["canonical_url"] = formatters.canonical_url(doc_row["href"])
+    doc["canonical_url"] = formatters.canonical_url(doc_id)
 
     if format == "outline":
         outline = _outline_for_doc(backend.db, doc_id, anchor=anchor,
@@ -558,13 +474,6 @@ def _outline_for_doc(
     heading_path: str | None,
     from_ord: int | None,
 ) -> list[dict]:
-    """Outline = one row per distinct heading_path, ordered by first-appearance.
-
-    Returns `[{anchor, heading_path, depth, start_ord, chunk_count, bytes}, ...]`
-    where `bytes` is the compressed-on-disk size of the chunk text — caller
-    can multiply by ~3 for a rough uncompressed char estimate. When a
-    selector is supplied, the outline is narrowed to that subtree.
-    """
     rows = conn.execute(
         """
         SELECT heading_path, anchor, MIN(ord) AS start_ord,
@@ -591,7 +500,6 @@ def _outline_for_doc(
     if anchor is None and heading_path is None and from_ord is None:
         return entries
 
-    # Narrow to a subtree. Find the anchor entry, then keep descendants.
     start_idx: int | None = None
     for i, e in enumerate(entries):
         if anchor and e["anchor"] == anchor:
@@ -613,7 +521,6 @@ def _outline_for_doc(
         if start_path and (hp == start_path or hp.startswith(start_path + " › ")):
             out.append(e)
         elif not start_path:
-            # Starting at the intro — keep everything.
             out.append(e)
         else:
             break
@@ -631,7 +538,6 @@ def _select_chunks(
     count: int | None,
     max_chars: int | None,
 ) -> tuple[list[dict], int | None] | None:
-    """Return (chunks, continuation_ord). None means "not found"."""
     rows = conn.execute(SELECT_CHUNKS_FOR_DOC, (doc_id,)).fetchall()
     if not rows:
         return ([], None)
@@ -657,7 +563,6 @@ def _select_chunks(
         start_path = candidates[0]["heading_path"] or ""
 
     if (anchor or heading_path) and not include_children:
-        # Return only chunks at the exact heading path / anchor.
         if anchor:
             candidates = [r for r in candidates if r["anchor"] == anchor]
         elif heading_path:
@@ -672,8 +577,6 @@ def _select_chunks(
                 break
         candidates = subtree
 
-    # Apply count / max_chars limits. We decompress lazily: only enough to
-    # hit the budget.
     out: list[dict] = []
     total_chars = 0
     continuation_ord: int | None = None
@@ -709,7 +612,7 @@ def get_chunks(
     rows = backend.db.execute(
         f"""
         SELECT c.chunk_id, c.doc_id, c.ord, c.heading_path, c.anchor, c.text,
-               d.human_code, d.title, d.human_title, d.href
+               d.type, d.title, d.date
         FROM chunks c JOIN documents d ON d.doc_id = c.doc_id
         WHERE c.chunk_id IN ({placeholders})
         """,
@@ -720,22 +623,20 @@ def get_chunks(
         records.append({
             "chunk_id": row["chunk_id"],
             "doc_id": row["doc_id"],
+            "type": row["type"],
             "title": row["title"],
-            "human_title": row["human_title"],
-            "human_code": row["human_code"],
+            "date": row["date"],
             "heading_path": row["heading_path"] or "",
             "anchor": row["anchor"],
-            "canonical_url": formatters.canonical_url(row["href"]),
+            "canonical_url": formatters.canonical_url(row["doc_id"]),
             "text": _decompress(row["text"]),
         })
     if format == "json":
         return formatters.as_json({"chunks": records})
     lines = []
     for r in records:
-        label = r.get("human_code") or r["doc_id"]
-        title = r.get("human_title") or r.get("title") or label
         lines.append(
-            f"**{label}** — [{title}]({r['canonical_url']}) — "
+            f"**{r['title']}** ([{r['doc_id']}]({r['canonical_url']})) — "
             f"{r['heading_path']}\n\n{r['text']}\n\n---"
         )
     return "\n".join(lines)
@@ -745,50 +646,43 @@ def whats_new(
     *,
     since: str | None = None,
     limit: int = 50,
-    categories: list[str] | None = None,
+    types: list[str] | None = None,
     format: Literal["markdown", "json"] = "markdown",
 ) -> str:
     backend = get_backend()
-    # Historical publication date when the heuristic produced one, otherwise
-    # fall back to our ingest timestamp so newly-crawled docs still appear.
-    sort_expr = "COALESCE(first_published_date, downloaded_at)"
+    sort_expr = "COALESCE(date, downloaded_at)"
     clauses: list[str] = []
     params: list[Any] = []
     if since:
         clauses.append(f"{sort_expr} >= ?")
         params.append(since)
-    if categories:
-        placeholders = ",".join("?" * len(categories))
-        clauses.append(f"category IN ({placeholders})")
-        params.extend(categories)
+    if types:
+        ors: list[str] = []
+        for t in types:
+            if "*" in t:
+                ors.append("type LIKE ? ESCAPE '\\'")
+                params.append(_glob_to_like(t))
+            else:
+                ors.append("type = ?")
+                params.append(t)
+        clauses.append("(" + " OR ".join(ors) + ")")
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
     params.append(limit)
     sql = f"""
-        SELECT doc_id, human_code, title, human_title, category, doc_type, href,
-               pub_date, first_published_date, downloaded_at
+        SELECT doc_id, type, title, date, downloaded_at
         FROM documents {where}
         ORDER BY {sort_expr} DESC LIMIT ?
     """
     rows = backend.db.execute(sql, params).fetchall()
     hits = [{
         "doc_id": r["doc_id"],
-        "human_code": r["human_code"],
         "title": r["title"],
-        "human_title": r["human_title"],
-        "category": r["category"],
-        "doc_type": r["doc_type"],
+        "type": r["type"],
+        "date": r["date"],
         "heading_path": "",
-        "snippet": _whats_new_snippet(r),
-        "canonical_url": formatters.canonical_url(r["href"]),
-        "pub_date": r["pub_date"],
-        "first_published_date": r["first_published_date"],
+        "snippet": f"published {r['date']}" if r["date"] else f"ingested {r['downloaded_at']}",
+        "canonical_url": formatters.canonical_url(r["doc_id"]),
     } for r in rows]
     if format == "json":
         return formatters.as_json({"since": since, "hits": hits})
     return formatters.format_hits_markdown(hits)
-
-
-def _whats_new_snippet(row: sqlite3.Row) -> str:
-    if row["first_published_date"]:
-        return f"published {row['first_published_date']}"
-    return f"ingested {row['downloaded_at']}"

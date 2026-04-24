@@ -299,115 +299,71 @@ def release(
     typer.echo(f"release {tag} published with manifest + packs")
 
 
-@app.command("backfill-metadata")
-def backfill_metadata(
+@app.command("backfill")
+def backfill(
     db_path: Optional[Path] = typer.Option(
         None,
         help="Path to the ato.db to update. Defaults to the live install path.",
-    ),
-    fields: str = typer.Option(
-        "all",
-        help=(
-            "Comma-separated fields to refresh: "
-            "`human_code`, `first_published_date`, `status`, or `all`. "
-            "Runs the rule engine on every document where the target field "
-            "is currently NULL (or all documents when `--force`)."
-        ),
-    ),
-    force: bool = typer.Option(
-        False,
-        help="Recompute even when the target field is already populated.",
     ),
     limit: Optional[int] = typer.Option(
         None, help="Process at most N documents (for smoke tests)."
     ),
 ) -> None:
-    """Maintainer: re-derive metadata (human_code, year, status) from rules.
+    """Re-run the rule engine across every document in the live DB.
 
-    Reads each document's title + chunk headings + first chunk's text from
-    the live DB (no HTML re-fetch, no GPU), runs
-    ``ato_mcp.indexer.rules.derive_metadata``, and writes the output to
-    ``documents`` + ``title_fts``. Safe to run repeatedly — each pass picks
-    up rows that grew a value since the previous pass, so you can iterate
-    the rule set in ``rules.py`` and re-run this in minutes to grow
-    coverage without touching embeddings.
+    Reads each document's existing title + chunk headings + first chunk's
+    text (no HTML re-fetch, no GPU), runs
+    ``ato_mcp.indexer.rules.derive_metadata``, and writes ``title`` +
+    ``date`` back to ``documents`` + ``title_fts``. Iterating rules and
+    re-running this takes minutes, not hours.
     """
     from .indexer import rules as rules_mod
     from .store import db as store_db
-    from .store.queries import (
-        DELETE_TITLE_FTS_BY_DOC,
-        INSERT_TITLE_FTS,
-    )
 
     target = db_path or paths.db_path()
     if not target.exists():
         typer.echo(f"no DB at {target}", err=True)
         raise typer.Exit(code=1)
 
-    requested = {f.strip() for f in fields.split(",") if f.strip()}
-    valid = {"human_code", "human_title", "first_published_date", "status", "all"}
-    unknown = requested - valid
-    if unknown:
-        typer.echo(f"unknown fields: {sorted(unknown)}", err=True)
-        raise typer.Exit(code=1)
-    if "all" in requested:
-        requested = {"human_code", "human_title", "first_published_date", "status"}
-
     conn = store_db.connect(target, mode="rw")
     try:
-        where = []
-        if not force:
-            where = [f"{f} IS NULL" for f in requested]
-            where_sql = " OR ".join(where) if where else "1=1"
-        else:
-            where_sql = "1=1"
-        sql = (
-            "SELECT doc_id, title, category, pub_date, downloaded_at FROM documents "
-            f"WHERE {where_sql} ORDER BY doc_id"
-        )
+        sql = "SELECT doc_id, title, type, date, downloaded_at FROM documents ORDER BY doc_id"
         if limit is not None:
             sql += f" LIMIT {int(limit)}"
         rows = conn.execute(sql).fetchall()
         total = len(rows)
-        typer.echo(f"backfill-metadata: {total} candidate rows")
+        typer.echo(f"backfill: {total} rows")
 
-        # Build doc_id -> title_fts.rowid once so per-row FTS updates use
-        # the INTEGER primary key (O(1)) instead of scanning the UNINDEXED
-        # doc_id column (~25ms/row -> ~0.01ms/row).
+        # doc_id -> title_fts.rowid map so per-row FTS updates use the integer
+        # PK (O(1)) instead of scanning the UNINDEXED doc_id column.
         fts_rowid = {
             r["doc_id"]: r["rowid"]
             for r in conn.execute("SELECT rowid, doc_id FROM title_fts").fetchall()
         }
 
-        updated = {f: 0 for f in requested}
         import zstandard as zstd_mod
         dctx = zstd_mod.ZstdDecompressor()
 
+        title_updates = 0
+        date_updates = 0
         conn.execute("BEGIN")
         try:
             for i, row in enumerate(rows, start=1):
                 doc_id = row["doc_id"]
-                # Pull chunk heading_paths and the first chunk's decompressed
-                # text. Reading every chunk would be wasteful; the rule
-                # engine only cares about first ~3000 chars of body_head.
                 chunk_rows = conn.execute(
                     "SELECT ord, heading_path, text FROM chunks "
                     "WHERE doc_id = ? ORDER BY ord ASC LIMIT 3",
                     (doc_id,),
                 ).fetchall()
-                headings = []
+                headings: list[str] = []
                 body_head = ""
                 seen_headings: set[str] = set()
                 for cr in chunk_rows:
                     hp = (cr["heading_path"] or "").strip()
                     if hp and hp not in seen_headings:
                         seen_headings.add(hp)
-                        # Decompose the breadcrumb into atomic headings. ATO
-                        # pages use both " › " (hierarchy) and " — " (flat
-                        # concatenation in h1) as separators; splitting on
-                        # both exposes citations like "IT 1" or "CRP 2017/1"
-                        # that would otherwise be buried in a mega-heading.
-                        # URL-only artefacts are dropped.
+                        # Decompose on both " › " (hierarchy) and " — " (flat
+                        # concat in h1) so embedded citations surface.
                         for top in hp.split(" › "):
                             for seg in top.split(" — "):
                                 s = seg.strip()
@@ -419,63 +375,46 @@ def backfill_metadata(
                         body_head = dctx.decompress(cr["text"]).decode(
                             "utf-8", errors="replace"
                         )[:3000]
+
                 derived = rules_mod.derive_metadata(rules_mod.RuleInputs(
                     doc_id=doc_id,
                     title=row["title"],
                     headings=tuple(headings),
                     body_head=body_head,
-                    category=row["category"],
-                    pub_date=row["pub_date"],
+                    category=row["type"],
+                    pub_date=row["date"],
                 ))
 
-                updates: dict[str, str] = {}
-                if "human_code" in requested and derived.human_code:
-                    updates["human_code"] = derived.human_code
-                if "human_title" in requested and derived.human_title:
-                    updates["human_title"] = derived.human_title
-                if "first_published_date" in requested and derived.first_published_date:
-                    updates["first_published_date"] = derived.first_published_date
-                elif "first_published_date" in requested:
-                    # Date-of-last-resort: use downloaded_at truncated to date.
-                    # This keeps the column populated for docs with no
-                    # extractable publication signal at the cost of a slight
-                    # over-estimate (we know we saw it NO LATER than this).
+                new_title = derived.title or row["title"]
+                new_date = derived.date
+                # Last-resort date: downloaded_at truncated (upper bound).
+                if not new_date:
                     dl = row["downloaded_at"] or ""
                     if len(dl) >= 10 and dl[:10].count("-") == 2:
-                        updates["first_published_date"] = dl[:10]
-                if "status" in requested and derived.status:
-                    updates["status"] = derived.status
-                if not updates:
-                    continue
-                if not force:
-                    # Preserve any pre-existing non-NULL values.
-                    set_clause = ", ".join(
-                        f"{k} = COALESCE({k}, ?)" for k in updates
+                        new_date = dl[:10]
+
+                changes: list[str] = []
+                params: list = []
+                if new_title and new_title != row["title"]:
+                    changes.append("title = ?")
+                    params.append(new_title)
+                    title_updates += 1
+                if new_date and new_date != row["date"]:
+                    changes.append("date = ?")
+                    params.append(new_date)
+                    date_updates += 1
+                if changes:
+                    params.append(doc_id)
+                    conn.execute(
+                        f"UPDATE documents SET {', '.join(changes)} WHERE doc_id = ?",
+                        params,
                     )
-                else:
-                    set_clause = ", ".join(f"{k} = ?" for k in updates)
-                conn.execute(
-                    f"UPDATE documents SET {set_clause} WHERE doc_id = ?",
-                    (*updates.values(), doc_id),
-                )
-                # Refresh only the columns the FTS mirrors, and only when we
-                # actually wrote a new value for them. Use rowid so the FTS
-                # update is O(1) instead of O(n) per row.
-                rowid = fts_rowid.get(doc_id)
-                if rowid is not None:
-                    fts_updates: dict[str, str] = {}
-                    if "human_code" in updates:
-                        fts_updates["human_code"] = updates["human_code"]
-                    if "human_title" in updates:
-                        fts_updates["human_title"] = updates["human_title"]
-                    if fts_updates:
-                        fts_set = ", ".join(f"{k} = ?" for k in fts_updates)
+                    rowid = fts_rowid.get(doc_id)
+                    if rowid is not None and any(c.startswith("title =") for c in changes):
                         conn.execute(
-                            f"UPDATE title_fts SET {fts_set} WHERE rowid = ?",
-                            (*fts_updates.values(), rowid),
+                            "UPDATE title_fts SET title = ? WHERE rowid = ?",
+                            (new_title, rowid),
                         )
-                for f in updates:
-                    updated[f] += 1
                 if i % 20000 == 0:
                     typer.echo(f"  processed {i}/{total}")
             conn.execute("COMMIT")
@@ -483,28 +422,18 @@ def backfill_metadata(
             conn.execute("ROLLBACK")
             raise
 
-        # Residual counts after write.
-        residuals = {}
-        for f in requested:
-            residuals[f] = conn.execute(
-                f"SELECT COUNT(*) AS n FROM documents WHERE {f} IS NULL"
-            ).fetchone()["n"]
+        null_titles = conn.execute(
+            "SELECT COUNT(*) AS n FROM documents WHERE title IS NULL OR title = ''"
+        ).fetchone()["n"]
+        null_dates = conn.execute(
+            "SELECT COUNT(*) AS n FROM documents WHERE date IS NULL"
+        ).fetchone()["n"]
     finally:
         conn.close()
 
-    for f in requested:
-        typer.echo(
-            f"  {f}: updated={updated[f]}, still NULL={residuals[f]}"
-        )
-    typer.echo("backfill-metadata: done")
-
-
-@app.command("backfill-human-codes", hidden=True)
-def backfill_human_codes_alias(
-    db_path: Optional[Path] = typer.Option(None),
-) -> None:
-    """Deprecated alias for `backfill-metadata --fields human_code`."""
-    backfill_metadata(db_path=db_path, fields="human_code", force=False, limit=None)
+    typer.echo(f"  title: updated={title_updates}, still NULL={null_titles}")
+    typer.echo(f"  date:  updated={date_updates},  still NULL={null_dates}")
+    typer.echo("backfill: done")
 
 
 def _bundled_pubkey_path() -> Path | None:

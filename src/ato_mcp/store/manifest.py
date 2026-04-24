@@ -29,15 +29,9 @@ class DocRef(BaseModel):
     pack_sha8: str
     offset: int
     length: int
-    # Client-unused metadata. Kept on the model for build-side debugging but
-    # excluded from serialization so produced manifests stay lean — roughly
-    # halves the on-wire manifest size at ~160K docs. Old manifests with
-    # these fields present still load cleanly because Pydantic populates the
-    # attributes from the JSON and then model_dump() drops them on the way
-    # out. New slim manifests load in older clients too as long as those
-    # clients declared the fields Optional (this repo now does).
-    category: str = Field(default="", exclude=True)
-    doc_type: str | None = Field(default=None, exclude=True)
+    # Client-unused metadata. Kept on the model for build-side debugging
+    # but excluded from serialization so produced manifests stay lean.
+    type: str = Field(default="", exclude=True)
     title: str = Field(default="", exclude=True)
     has_content: bool = Field(default=True, exclude=True)
 
