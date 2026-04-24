@@ -162,10 +162,10 @@ _RE_PSLA = re.compile(r"^PS\s+LA\s+\d{4}/")
 _RE_SMSFRB = re.compile(r"^SMSFRB\s+\d{4}/")
 _RE_NEUTRAL = re.compile(r"^\[\d{4}\]\s+[A-Z]+\s+\d+")
 _RE_NAME_V_NAME = re.compile(
-    r"^[A-Z][\w'.&-]*(?:\s+(?:[A-Z][\w'.&-]*|and|of|the|for|on|in|an|Anor|ors?|No|nee))*"
+    r"^[A-Z][\w'.&-]*(?:\s+(?:\([^)]+\)|[A-Z][\w'.&-]*|and|of|the|for|on|in|an|Anor|ors?|No|nee))*"
     r"(?:,?\s+(?:Pty\s+)?(?:Ltd|Limited|Inc\.?|LLC|Corp|Co\.?|Plc))?"
     r"\s+(?:v\.?|vs\.?)\s+"
-    r"(?:the|a|an)?\s*[A-Za-z][\w'.&-]*",
+    r"(?:the|a|an)?\s*(?:\([^)]+\)\s*)?[A-Za-z][\w'.&-]*",
     re.IGNORECASE,
 )
 _RE_RE_X = re.compile(
@@ -232,7 +232,10 @@ def shape_of(heading: str) -> Shape:
     """
     if not heading or not heading.strip():
         return Shape.EMPTY
-    t = heading.strip()
+    # Collapse internal whitespace — ATO headings occasionally embed
+    # newlines mid-sentence ("COURT\nOF APPEAL OF NEW ZEALAND"), which
+    # would otherwise break anchored regexes.
+    t = " ".join(heading.split())
     t_lower = t.lower()
 
     # Citations — the most specific shapes.
@@ -569,6 +572,8 @@ def _extract_official_pub(ins: RuleInputs) -> DerivedMetadata:
 
 
 def _case_name_from(heading: str) -> str | None:
+    # Collapse internal whitespace — some scraped headings embed newlines
+    # mid-party-name (e.g. "COMMISSIONER\nOF INLAND REVENUE (NZ) v ...").
     t = " ".join(heading.split())
     # Reject fragments that look too long to be a case name.
     if not t or len(t) > 200:

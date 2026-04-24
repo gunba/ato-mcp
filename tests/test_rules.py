@@ -135,6 +135,22 @@ def test_case_body_cite_does_not_hijack_year():
     assert d.title == "PepsiCo Inc v Commissioner of Taxation"
 
 
+def test_case_name_with_parenthesised_qualifier():
+    """Party name with '(NZ)' and embedded newlines — decomposed heading
+    shape still matches NAME_V_NAME and yields a clean title."""
+    ins = RuleInputs(
+        doc_id="JUD/11ATR171/00001",
+        headings=(
+            "COURT\nOF APPEAL OF NEW ZEALAND",
+            "COMMISSIONER OF INLAND REVENUE (NZ) v\nHANNIGAN and LEVET",
+            "WOODHOUSE, Richardson and McMullin JJ",
+        ),
+        category="Cases",
+    )
+    d = derive_metadata(ins)
+    assert d.title == "COMMISSIONER OF INLAND REVENUE (NZ) v HANNIGAN and LEVET"
+
+
 # ---------------------------------------------------------------------------
 # ACT — legislation Act title
 

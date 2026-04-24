@@ -43,6 +43,10 @@ def search(
     ("Public_*"). ``doc_scope`` is a glob over the full ``doc_id`` path
     ("TXR/TR20243/*"). ``date_from`` / ``date_to`` filter on ``date``.
 
+    When ``types`` is omitted, ``Edited_private_advice`` is excluded by
+    default (private rulings are one-off, noisy for public tax-law
+    questions). Pass ``types=["Edited_private_advice"]`` to include them.
+
     ``sort_by='relevance'`` applies a 5-year-half-life recency boost by
     default — in tax law, later guidance typically supersedes earlier.
     ``sort_by='recency'`` sorts strictly by date descending.
@@ -64,12 +68,16 @@ def search(
 def search_titles(
     query: str,
     k: int = 20,
+    types: list[str] | None = None,
     format: Literal["markdown", "json"] = "markdown",
 ) -> str:
     """Fast title-only search. Use for citations (``TR 2024/3``, ``s 355-25``)
     or case names. Searches the ``title`` + per-doc headings, not bodies.
+
+    Like ``search``, defaults to excluding ``Edited_private_advice``.
+    Pass ``types=["Edited_private_advice"]`` to include EPAs.
     """
-    return T.search_titles(query, k=k, format=format)
+    return T.search_titles(query, k=k, types=types, format=format)
 
 
 @mcp.tool
@@ -172,6 +180,10 @@ def _build_instructions() -> str:
         "  3. `get_document(doc_id, format=\"outline\")` — cheap TOC.",
         "  4. `get_document(doc_id, heading_path=...)` — expand a section.",
         "  5. `whats_new(since=\"2026-01-01\")` — recent publications.",
+        "",
+        "Default scope: `Edited_private_advice` (ATO's individual-taxpayer",
+        "rulings) is excluded from search / search_titles / whats_new when",
+        "`types` is omitted. Opt in with `types=[\"Edited_private_advice\"]`.",
         "",
         "Every result carries a `canonical_url` suitable for citing back to the user.",
     ]

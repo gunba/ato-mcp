@@ -127,6 +127,13 @@ def build(args: BuildArgs) -> Manifest:
             if doc_id in resume_done:
                 continue
             category = meta_mod.category_from_path(rec.get("payload_path"))
+            if category == "Unknown":
+                # Payload path didn't resolve (missing or outside the
+                # expected bucket tree) — fall back to the docid-prefix map
+                # so EV/... stays "Edited_private_advice", JUD/... stays
+                # "Cases" etc. Avoids a bucket of "Unknown" docs whose type
+                # is still knowable from the URL.
+                category = meta_mod.category_for_docid(canonical_id)
             status = rec.get("status")
             has_content = status == "success"
 

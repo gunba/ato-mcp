@@ -88,6 +88,19 @@ SELECT doc_id, title, '' FROM documents;
 INSERT INTO meta(key, value) VALUES ('schema_version', '5')
 ON CONFLICT(key) DO UPDATE SET value = excluded.value;
 
+-- 7. Delete empty-shell documents (has no chunks). v4 inserted these for
+--    failed scrapes; v5 build skips them. Clears ~15k rows of noise.
+INSERT INTO title_fts(title_fts, doc_id, title, headings)
+  SELECT 'delete', doc_id, title, headings FROM title_fts
+  WHERE doc_id IN (
+    SELECT d.doc_id FROM documents d
+    WHERE NOT EXISTS (SELECT 1 FROM chunks c WHERE c.doc_id = d.doc_id)
+  );
+DELETE FROM documents WHERE doc_id IN (
+  SELECT d.doc_id FROM documents d
+  WHERE NOT EXISTS (SELECT 1 FROM chunks c WHERE c.doc_id = d.doc_id)
+);
+
 COMMIT;
 
 VACUUM;

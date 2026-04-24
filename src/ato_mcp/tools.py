@@ -135,6 +135,15 @@ def _glob_to_like(pattern: str) -> str:
     return pattern.translate(_GLOB_ESCAPE).replace("*", "%")
 
 
+# Types excluded from search / search_titles / whats_new by default.
+# Agents still reach them by passing the type name explicitly in ``types``.
+# Edited private advice is one-off, individual-taxpayer rulings the ATO
+# publishes in a redacted form — informative if you know you want EPA
+# ("EV 1051375298526"), rarely useful when the agent is answering a
+# public tax-law question.
+DEFAULT_EXCLUDED_TYPES = ("Edited_private_advice",)
+
+
 def _build_sql_filter(
     types: list[str] | None,
     date_from: str | None,
@@ -143,13 +152,22 @@ def _build_sql_filter(
 ) -> tuple[str, list[Any]]:
     """Build a WHERE fragment for the documents table.
 
-    ``types`` accepts exact matches or shell globs (``Public_*``) — both
-    compose with OR within the list. ``doc_scope`` is a glob over the
-    ``doc_id`` path.
+    ``types`` semantics:
+      - ``None`` → exclude the ``DEFAULT_EXCLUDED_TYPES`` buckets (EPA etc.).
+      - a list → positive filter. Entries containing ``*`` are globs;
+        other entries are exact matches. Pass the excluded type explicitly
+        (e.g. ``types=["Edited_private_advice"]``) to opt back in.
+
+    ``doc_scope`` is a glob over the ``doc_id`` path.
     """
     clauses: list[str] = []
     params: list[Any] = []
-    if types:
+    if types is None:
+        if DEFAULT_EXCLUDED_TYPES:
+            placeholders = ",".join("?" * len(DEFAULT_EXCLUDED_TYPES))
+            clauses.append(f"d.type NOT IN ({placeholders})")
+            params.extend(DEFAULT_EXCLUDED_TYPES)
+    else:
         ors: list[str] = []
         for t in types:
             if "*" in t:
@@ -386,20 +404,24 @@ def search_titles(
     query: str,
     *,
     k: int = 20,
+    types: list[str] | None = None,
     format: Literal["markdown", "json"] = "markdown",
 ) -> str:
     backend = get_backend()
     k = max(1, min(k, 100))
-    sql = """
+    where, params = _build_sql_filter(types, None, None, None)
+    # _build_sql_filter prefixes ``d.``; strip it since title_fts joins ``d``.
+    sql = f"""
         SELECT t.doc_id AS doc_id, bm25(title_fts) AS score,
                d.type, d.title, d.date
         FROM title_fts t
         JOIN documents d ON d.doc_id = t.doc_id
         WHERE title_fts MATCH ?
+        {'AND ' + where if where else ''}
         ORDER BY score ASC LIMIT ?
     """
     try:
-        rows = backend.db.execute(sql, [_fts_query(query), k]).fetchall()
+        rows = backend.db.execute(sql, [_fts_query(query), *params, k]).fetchall()
     except sqlite3.OperationalError:
         rows = []
     hits = [{
@@ -665,7 +687,12 @@ def whats_new(
     if since:
         clauses.append(f"{sort_expr} >= ?")
         params.append(since)
-    if types:
+    if types is None:
+        if DEFAULT_EXCLUDED_TYPES:
+            placeholders = ",".join("?" * len(DEFAULT_EXCLUDED_TYPES))
+            clauses.append(f"type NOT IN ({placeholders})")
+            params.extend(DEFAULT_EXCLUDED_TYPES)
+    else:
         ors: list[str] = []
         for t in types:
             if "*" in t:

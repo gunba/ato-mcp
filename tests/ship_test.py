@@ -330,8 +330,53 @@ def wf8_markdown() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Coverage probes
+# Default-exclude EPA behaviour + empty-shell cleanup
 # ---------------------------------------------------------------------------
+
+
+def wf9_default_excludes_epa() -> None:
+    section("WORKFLOW 9 — search defaults exclude EPA; opt-in works")
+
+    # Default call: no EPA should slip in. Use a query that EPAs would
+    # otherwise flood (auth numbers / common private-ruling phrasing).
+    call("search", query="ruling on private binding")
+    data = _json_search(query="ruling on private binding", k=10, mode="keyword")
+    epa_count = sum(1 for h in data["hits"] if h.get("type") == "Edited_private_advice")
+    print(f"  EPA hits with default types: {epa_count} / {len(data['hits'])}")
+    require(epa_count == 0, "default search excludes Edited_private_advice")
+
+    # Explicit opt-in: EPA should appear when requested.
+    call("search", query="private binding ruling", types=["Edited_private_advice"])
+    opt_in = _json_search(
+        query="private binding ruling",
+        types=["Edited_private_advice"],
+        k=5, mode="keyword",
+    )
+    require(len(opt_in["hits"]) > 0, "explicit types=['Edited_private_advice'] returns EPA")
+    require(all(h.get("type") == "Edited_private_advice" for h in opt_in["hits"]),
+            "opt-in query returns only EPA hits")
+
+    # search_titles should also default-exclude.
+    call("search_titles", query="ruling")
+    titles = _json_titles(query="ruling", k=20)
+    t_epa = sum(1 for h in titles["hits"] if h.get("type") == "Edited_private_advice")
+    require(t_epa == 0, "search_titles default excludes EPA")
+
+
+def wf10_no_empty_shells() -> None:
+    section("WORKFLOW 10 — empty shells and Unknown category are gone")
+    backend = tools.get_backend()
+    unknown = backend.db.execute(
+        "SELECT COUNT(*) AS n FROM documents WHERE type = 'Unknown'"
+    ).fetchone()["n"]
+    empty = backend.db.execute(
+        "SELECT COUNT(*) AS n FROM documents d "
+        "WHERE NOT EXISTS (SELECT 1 FROM chunks c WHERE c.doc_id = d.doc_id)"
+    ).fetchone()["n"]
+    print(f"  Unknown-type docs: {unknown}")
+    print(f"  Empty-shell docs:  {empty}")
+    require(unknown == 0, "no Unknown-type documents remain")
+    require(empty == 0, "no empty shells remain")
 
 
 def coverage_probes() -> None:
@@ -375,6 +420,8 @@ def main() -> None:
     wf6_pagination()
     wf7_get_chunks()
     wf8_markdown()
+    wf9_default_excludes_epa()
+    wf10_no_empty_shells()
     coverage_probes()
 
     section("RESULT")
