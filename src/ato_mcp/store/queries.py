@@ -18,8 +18,6 @@ INSERT_CHUNK_FTS = """
 INSERT INTO chunks_fts (rowid, text, heading_path) VALUES (?, ?, ?)
 """
 
-DELETE_CHUNK_FTS = "INSERT INTO chunks_fts (chunks_fts, rowid) VALUES ('delete', ?)"
-
 INSERT_TITLE_FTS = """
 INSERT INTO title_fts (doc_id, title, headings) VALUES (?, ?, ?)
 """
@@ -30,7 +28,6 @@ INSERT INTO title_fts (title_fts, doc_id, title, headings)
 """
 
 INSERT_VEC = "INSERT INTO chunks_vec(chunk_id, embedding) VALUES (?, vec_int8(?))"
-DELETE_VEC = "DELETE FROM chunks_vec WHERE chunk_id = ?"
 
 SELECT_CHUNKS_FOR_DOC = """
 SELECT chunk_id, ord, heading_path, anchor, text
@@ -38,11 +35,3 @@ FROM chunks WHERE doc_id = ? ORDER BY ord ASC
 """
 
 SELECT_DOCUMENT = "SELECT * FROM documents WHERE doc_id = ?"
-
-COUNT_DOCUMENTS = "SELECT COUNT(*) AS n FROM documents"
-COUNT_CHUNKS = "SELECT COUNT(*) AS n FROM chunks"
-
-LIST_TYPES = """
-SELECT type, COUNT(*) AS n
-FROM documents GROUP BY type ORDER BY n DESC
-"""

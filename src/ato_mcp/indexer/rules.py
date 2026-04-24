@@ -435,14 +435,10 @@ _RE_MAILTO_BODY = re.compile(r"MailTo:\?Subject=[^&]*&Body=([^)\s\"]+)")
 _RE_CASE_HEADER_NAME = re.compile(r"^\*##\s+(?P<name>[^*\n]+?)\s*\*")
 
 
-def _clean_citation_with_variant(raw: str) -> tuple[str, str | None, str | None]:
+def _clean_citation(raw: str) -> str:
     """Normalise a citation heading to the ATO display form.
 
-    Example: ``'LCR 2019/2EC'`` -> ``('LCR 2019/2EC', 'EC', None)``.
-    The ``(Withdrawn)`` marker is stripped. Suffix letters (A=Addendum,
-    EC=Erratum Compendium / Consolidated, ER=Erratum, DC=Draft Compendium,
-    W=Withdrawn notice) are preserved in the returned display form AND
-    surfaced separately as the ``variant`` for programmatic use.
+    Example: ``'LCR 2019/2EC (Withdrawn)'`` -> ``'LCR 2019/2EC'``.
     """
     cleaned = _RE_WITHDRAWN.sub("", raw).strip()
     cleaned = re.sub(r"\s+", " ", cleaned)
@@ -456,9 +452,8 @@ def _clean_citation_with_variant(raw: str) -> tuple[str, str | None, str | None]
         draft = m.group(3)
         num = m.group(4)
         suffix = m.group(5) or ""
-        display = f"{series} {year}/{draft}{num}{suffix}"
-        return display, (suffix or None), None
-    return cleaned, None, None
+        return f"{series} {year}/{draft}{num}{suffix}"
+    return cleaned
 
 
 def _year_from_token(token: str) -> int | None:
@@ -557,7 +552,7 @@ def _extract_official_pub(ins: RuleInputs) -> DerivedMetadata:
         # Classifier routed us here but no citation shape matched — fall
         # back to docid.
         return _extract_other(ins)
-    cleaned, _variant, _ = _clean_citation_with_variant(citation_heading)
+    cleaned = _clean_citation(citation_heading)
     year = _year_from_token(cleaned)
     precise = _precise_date(ins.body_head[:600])
     # If the raw heading carried a ``(Withdrawn)`` marker, keep it — agents
@@ -877,32 +872,28 @@ _DOCID_PSLA_DRAFT_RE = re.compile(r"^PSD(?P<year>\d{4})D?(?P<num>\d+)$")
 _DOCID_ATOID_RE = re.compile(r"^(?:ATOID|AID)(?P<year>\d{4})(?P<num>\d+)$")
 
 
-def _extract_from_docid(ins: RuleInputs) -> tuple[str | None, int | None, str | None]:
+def _extract_from_docid(ins: RuleInputs) -> tuple[str | None, int | None]:
     body = ins.inner_body
     m = _DOCID_YEAR4_RE.match(body)
     if m:
         series = m.group(1)
         y = int(m["year"])
         draft = m["draft"] or ""
-        return f"{series} {m['year']}/{draft}{m['num']}", y, ("draft" if draft else None)
+        return f"{series} {m['year']}/{draft}{m['num']}", y
     m = _DOCID_PSLA_RE.match(body)
     if m:
-        y = int(m["year"])
-        return f"PS LA {m['year']}/{m['num']}", y, None
+        return f"PS LA {m['year']}/{m['num']}", int(m["year"])
     m = _DOCID_PSLA_DRAFT_RE.match(body)
     if m:
-        y = int(m["year"])
-        return f"PS LA {m['year']}/D{m['num']}", y, "draft"
+        return f"PS LA {m['year']}/D{m['num']}", int(m["year"])
     m = _DOCID_ATOID_RE.match(body)
     if m:
-        y = int(m["year"])
-        return f"ATO ID {m['year']}/{m['num']}", y, None
+        return f"ATO ID {m['year']}/{m['num']}", int(m["year"])
     m = _DOCID_YEAR2_RE.match(body)
     if m:
         series = m.group(1)
-        y = 1900 + int(m["year"])
-        return f"{series} {m['year']}/{m['num']}", y, None
-    return None, None, None
+        return f"{series} {m['year']}/{m['num']}", 1900 + int(m["year"])
+    return None, None
 
 
 _RE_DATE_OF_ADVICE = re.compile(
@@ -932,7 +923,7 @@ def _extract_epa(ins: RuleInputs) -> DerivedMetadata:
 
 def _extract_other(ins: RuleInputs) -> DerivedMetadata:
     """Fallback — try docid, pub_date, body date; leave NULL if nothing fires."""
-    code, year, _status = _extract_from_docid(ins)
+    code, year = _extract_from_docid(ins)
     if ins.pub_date and len(ins.pub_date) >= 4 and ins.pub_date[:4].isdigit() and year is None:
         year = int(ins.pub_date[:4])
     precise = _precise_date(ins.body_head[:600])
@@ -985,7 +976,7 @@ def derive_metadata(inputs: RuleInputs) -> DerivedMetadata:
     template = classify(inputs)
     result = _EXTRACTORS[template](inputs)
     if result.title is None:
-        fallback_code, fb_year, _ = _extract_from_docid(inputs)
+        fallback_code, fb_year = _extract_from_docid(inputs)
         if fallback_code:
             result = replace(result, title=fallback_code)
             if result.date is None and fb_year:
@@ -1045,5 +1036,5 @@ def template_of(inputs: RuleInputs) -> Template:
 
 # Backwards-compat shim so the old v1 call site keeps working.
 def human_code_for_doc_id(doc_id: str) -> str | None:
-    code, _year, _status = _extract_from_docid(RuleInputs(doc_id=doc_id))
+    code, _year = _extract_from_docid(RuleInputs(doc_id=doc_id))
     return code

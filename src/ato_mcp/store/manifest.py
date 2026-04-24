@@ -33,7 +33,6 @@ class DocRef(BaseModel):
     # but excluded from serialization so produced manifests stay lean.
     type: str = Field(default="", exclude=True)
     title: str = Field(default="", exclude=True)
-    has_content: bool = Field(default=True, exclude=True)
 
 
 class PackInfo(BaseModel):
