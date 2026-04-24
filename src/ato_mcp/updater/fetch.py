@@ -124,41 +124,42 @@ def fetch_ranges(
 ) -> dict[tuple[int, int], bytes]:
     """Fetch multiple byte ranges from a single URL.
 
-    For github.com release URLs on a private repo, we cannot issue a direct
-    Range request — gh CLI doesn't support partial downloads. In that case we
-    download the full asset once (cached next to `dest` based on asset name)
-    and slice locally. For any other URL (or public github), we use httpx
-    Range requests directly.
+    We download the whole pack file once into the updater staging cache,
+    then slice byte ranges out of it locally. This avoids issuing tens of
+    thousands of range requests (one per document record) — which blew
+    memory to tens of GB due to httpx response buffering on the first
+    revision — and makes resumed updates essentially free because the
+    cache is keyed on the asset name.
+
+    For github.com release URLs we use ``gh release download`` so private
+    repos work under the user's existing ``gh auth``; for everything else
+    we fall back to a streaming httpx download.
     """
     spec_list = list(ranges)
     out: dict[tuple[int, int], bytes] = {}
+
+    from ..util import paths as _paths
+    cache_dir = _paths.staging_dir()
     m = _gh_release_match(url)
+
     if m and shutil.which("gh"):
-        # Download the full asset into the updater staging cache once.
-        from ..util import paths as _paths
-        cache = _paths.staging_dir() / f"pack-cache-{m['asset']}"
+        cache = cache_dir / f"pack-cache-{m['asset']}"
         if not cache.exists() or cache.stat().st_size == 0:
             _gh_download(
                 owner=m["owner"], repo=m["repo"], tag=m["tag"], asset=m["asset"],
                 dest=cache,
             )
-        with open(cache, "rb") as fh:
-            for rng in spec_list:
-                fh.seek(rng.start)
-                out[(rng.start, rng.length)] = fh.read(rng.length)
-        return out
+    else:
+        # Derive a stable cache name from the last URL path segment.
+        asset = url.rsplit("/", 1)[-1] or "pack.bin.zst"
+        cache = cache_dir / f"pack-cache-{asset}"
+        if not cache.exists() or cache.stat().st_size == 0:
+            _httpx_stream_download(client, url, cache)
 
-    for rng in spec_list:
-        headers = {"Range": f"bytes={rng.start}-{rng.end}"}
-        response = client.get(url, headers=headers, follow_redirects=True)
-        if response.status_code not in (200, 206):
-            response.raise_for_status()
-        data = response.content
-        if len(data) != rng.length and response.status_code == 206:
-            raise ValueError(
-                f"range response length mismatch: expected {rng.length} got {len(data)}"
-            )
-        out[(rng.start, rng.length)] = data[: rng.length]
+    with open(cache, "rb") as fh:
+        for rng in spec_list:
+            fh.seek(rng.start)
+            out[(rng.start, rng.length)] = fh.read(rng.length)
     return out
 
 

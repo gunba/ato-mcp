@@ -15,6 +15,7 @@ scratch/
 models/
 release/
 release_full/
+release-v*/
 ato_pages/
 *.onnx
 *.onnx_data

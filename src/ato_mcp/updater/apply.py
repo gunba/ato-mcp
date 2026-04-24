@@ -46,7 +46,7 @@ from ..store.queries import (
 )
 from ..util import paths
 from ..util.log import get_logger
-from .fetch import RangeSpec, fetch_ranges, fetch_url, make_client, verify_sha256
+from .fetch import fetch_url, make_client, verify_sha256
 from .lock import exclusive_lock
 
 LOGGER = get_logger(__name__)
@@ -145,16 +145,18 @@ def _apply_locked(
     added, changed, removed = diff_manifests(old_manifest, new_manifest)
     LOGGER.info("delta: +%d ~%d -%d", len(added), len(changed), len(removed))
 
-    bytes_downloaded = _prefetch_pack_bytes_into_cache(
-        client=client,
-        new_manifest=new_manifest,
-        refs=added + changed,
-    )
-
     # Snapshot for rollback.
     backup = paths.backups_dir() / "ato.db.prev"
     if paths.db_path().exists():
         shutil.copy2(paths.db_path(), backup)
+
+    # Group affected refs by pack so we can stream one pack at a time —
+    # avoids holding all 145k record blobs in RAM for a fresh install.
+    pack_to_refs: dict[str, list[DocRef]] = defaultdict(list)
+    for ref in added + changed:
+        pack_to_refs[ref.pack_sha8].append(ref)
+    pack_index = new_manifest.pack_index()
+    bytes_downloaded = 0
 
     conn = store_db.connect(paths.db_path(), mode="rw")
     try:
@@ -163,10 +165,26 @@ def _apply_locked(
             _delete_doc(conn, doc_id)
         for ref in changed:
             _delete_doc(conn, ref.doc_id)
-        # Re-insert everything in added + changed.
-        for ref in added + changed:
-            record = _load_record(new_manifest, ref)
-            _insert_record(conn, record, ref)
+
+        # Ingest one pack at a time. Download → process → release.
+        processed = 0
+        total = len(added) + len(changed)
+        for pack_sha8, refs in pack_to_refs.items():
+            info = pack_index.get(pack_sha8)
+            if info is None:
+                raise ValueError(f"manifest missing pack info for {pack_sha8}")
+            url = _absolute_url(new_manifest, info.url)
+            cache = _download_pack(client, url)
+            bytes_downloaded += cache.stat().st_size
+            with open(cache, "rb") as fh:
+                for ref in refs:
+                    fh.seek(ref.offset)
+                    blob = fh.read(ref.length)
+                    record = read_record_from_bytes(blob)
+                    _insert_record(conn, record, ref)
+                    processed += 1
+                    if processed % 5000 == 0:
+                        LOGGER.info("ingest: %d/%d", processed, total)
 
         store_db.set_meta(conn, "index_version", new_manifest.index_version)
         store_db.set_meta(conn, "embedding_model_id", new_manifest.model.id)
@@ -185,18 +203,13 @@ def _apply_locked(
     final = paths.installed_manifest_path()
     save_manifest(new_manifest, final)
 
-    # Success — drop the staged pack caches + temp manifest. We kept them
-    # earlier so a crashed apply could resume on next invocation; once the
-    # installed manifest has been written atomically there's no reason to
-    # keep ~800 MB of compressed pack blobs around. The in-memory cache
-    # mirrored the same bytes and is dropped too.
+    # Success — drop the staged pack caches + temp manifest.
     import contextlib
     for stale in paths.staging_dir().glob("pack-cache-*"):
         with contextlib.suppress(OSError):
             stale.unlink()
     with contextlib.suppress(OSError):
         new_manifest_tmp.unlink()
-    _RECORD_CACHE.clear()
 
     return UpdateStats(
         added=len(added),
@@ -204,6 +217,32 @@ def _apply_locked(
         removed=len(removed),
         bytes_downloaded=bytes_downloaded,
     )
+
+
+def _download_pack(client: httpx.Client, url: str) -> Path:
+    """Download a pack file to the staging cache once; return the local path.
+
+    Uses gh CLI for private-release URLs, httpx streaming otherwise.
+    Subsequent calls with the same URL are a no-op (cache hit).
+    """
+    import shutil as _shutil
+    from .fetch import _gh_download, _gh_release_match, _httpx_stream_download
+
+    cache_dir = paths.staging_dir()
+    m = _gh_release_match(url)
+    if m and _shutil.which("gh"):
+        cache = cache_dir / f"pack-cache-{m['asset']}"
+        if not cache.exists() or cache.stat().st_size == 0:
+            _gh_download(
+                owner=m["owner"], repo=m["repo"], tag=m["tag"], asset=m["asset"],
+                dest=cache,
+            )
+    else:
+        asset = url.rsplit("/", 1)[-1] or "pack.bin.zst"
+        cache = cache_dir / f"pack-cache-{asset}"
+        if not cache.exists() or cache.stat().st_size == 0:
+            _httpx_stream_download(client, url, cache)
+    return cache
 
 
 def _ensure_model(client: httpx.Client, manifest: Manifest, staging: Path) -> None:
@@ -262,48 +301,6 @@ def _ensure_model(client: httpx.Client, manifest: Manifest, staging: Path) -> No
     installed_marker.write_text(model_info.sha256 or "")
     tmp.unlink(missing_ok=True)
     shutil.rmtree(extract_dir, ignore_errors=True)
-
-
-def _prefetch_pack_bytes_into_cache(
-    *,
-    client: httpx.Client,
-    new_manifest: Manifest,
-    refs: list[DocRef],
-) -> int:
-    """For every affected pack, download just the required byte ranges into
-    a staging cache keyed by ``(pack_sha8, offset, length)``. The inserts below
-    read from this cache. Returns total bytes downloaded.
-    """
-    grouped: dict[str, list[DocRef]] = defaultdict(list)
-    for ref in refs:
-        grouped[ref.pack_sha8].append(ref)
-    cache: dict[tuple[str, int, int], bytes] = {}
-    pack_index = new_manifest.pack_index()
-    total = 0
-    for pack_sha8, doc_refs in grouped.items():
-        info = pack_index.get(pack_sha8)
-        if info is None:
-            raise ValueError(f"manifest missing pack info for {pack_sha8}")
-        url = _absolute_url(new_manifest, info.url)
-        spec_list = [RangeSpec(start=r.offset, length=r.length) for r in doc_refs]
-        ranges = fetch_ranges(client, url, spec_list)
-        for r in doc_refs:
-            blob = ranges[(r.offset, r.length)]
-            cache[(pack_sha8, r.offset, r.length)] = blob
-            total += len(blob)
-    # Stash in staging dir by key so _load_record can read them.
-    _RECORD_CACHE.update(cache)
-    return total
-
-
-_RECORD_CACHE: dict[tuple[str, int, int], bytes] = {}
-
-
-def _load_record(manifest: Manifest, ref: DocRef) -> dict:
-    key = (ref.pack_sha8, ref.offset, ref.length)
-    if key not in _RECORD_CACHE:
-        raise RuntimeError(f"record cache miss for {ref.doc_id}")
-    return read_record_from_bytes(_RECORD_CACHE[key])
 
 
 def _absolute_url(manifest: Manifest, rel: str) -> str:

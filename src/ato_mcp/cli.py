@@ -45,6 +45,8 @@ def init(
     """First-run: download manifest + model + required packs."""
     from .updater.apply import apply_update
 
+    _maybe_migrate_v4_to_v5()
+
     manifest_url = manifest_url or f"{paths.releases_url().rstrip('/')}/manifest.json"
     sig_url = manifest_url + ".minisig"
     pubkey = _bundled_pubkey_path()
@@ -63,8 +65,14 @@ def init(
 def update(
     manifest_url: Optional[str] = typer.Option(None),
 ) -> None:
-    """Apply an incremental delta from a new release."""
+    """Apply an incremental delta from a new release.
+
+    If the live DB is still on schema v4 (pre-v5), migrates it in place
+    first so the delta applies against the current schema.
+    """
     from .updater.apply import apply_update
+
+    _maybe_migrate_v4_to_v5()
 
     manifest_url = manifest_url or f"{paths.releases_url().rstrip('/')}/manifest.json"
     sig_url = manifest_url + ".minisig"
@@ -78,6 +86,58 @@ def update(
         f"update complete: +{stats.added} ~{stats.changed} -{stats.removed} "
         f"({stats.bytes_downloaded / 1_000_000:.2f} MB downloaded)"
     )
+
+
+@app.command()
+def migrate(
+    db_path: Optional[Path] = typer.Option(
+        None, help="Path to ato.db. Defaults to the live install path."
+    ),
+) -> None:
+    """Upgrade an ato.db from schema v4 to v5 in place.
+
+    Safe to run on an already-v5 DB — it's a no-op. For pre-v4 DBs
+    (``canonical_id``/``docid_code`` present) this fails: those need a
+    full rebuild from ``ato_pages/``.
+    """
+    import sqlite3
+    from .store.migrate import migrate_v4_to_v5, needs_v4_to_v5
+
+    target = db_path or paths.db_path()
+    if not target.exists():
+        typer.echo(f"no DB at {target}", err=True)
+        raise typer.Exit(code=1)
+    probe = sqlite3.connect(str(target))
+    probe.row_factory = sqlite3.Row
+    try:
+        if not needs_v4_to_v5(probe):
+            typer.echo(f"{target}: already v5 — nothing to do")
+            return
+    finally:
+        probe.close()
+    typer.echo(f"{target}: migrating v4 → v5 ...")
+    migrate_v4_to_v5(target)
+    typer.echo("migrate: done")
+
+
+def _maybe_migrate_v4_to_v5() -> None:
+    """Auto-migrate the live DB if it's still on v4 before an update fires."""
+    import sqlite3
+    from .store.migrate import migrate_v4_to_v5, needs_v4_to_v5
+
+    live = paths.db_path()
+    if not live.exists():
+        return
+    probe = sqlite3.connect(str(live))
+    probe.row_factory = sqlite3.Row
+    try:
+        if not needs_v4_to_v5(probe):
+            return
+    finally:
+        probe.close()
+    typer.echo(f"detected pre-v5 DB at {live}; migrating in place ...")
+    migrate_v4_to_v5(live)
+    typer.echo("migrate: done (continuing with update)")
 
 
 @app.command()
