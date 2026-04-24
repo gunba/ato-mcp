@@ -364,19 +364,32 @@ def wf9_default_excludes_epa() -> None:
 
 
 def wf10_no_empty_shells() -> None:
-    section("WORKFLOW 10 — empty shells and Unknown category are gone")
+    section("WORKFLOW 10 — empty shells are tracked, not lost")
     backend = tools.get_backend()
     unknown = backend.db.execute(
         "SELECT COUNT(*) AS n FROM documents WHERE type = 'Unknown'"
     ).fetchone()["n"]
-    empty = backend.db.execute(
+    empty_docs = backend.db.execute(
         "SELECT COUNT(*) AS n FROM documents d "
         "WHERE NOT EXISTS (SELECT 1 FROM chunks c WHERE c.doc_id = d.doc_id)"
     ).fetchone()["n"]
+    shells = backend.db.execute(
+        "SELECT COUNT(*) AS n FROM empty_shells"
+    ).fetchone()["n"]
     print(f"  Unknown-type docs: {unknown}")
-    print(f"  Empty-shell docs:  {empty}")
-    require(unknown == 0, "no Unknown-type documents remain")
-    require(empty == 0, "no empty shells remain")
+    print(f"  Empty-doc rows:    {empty_docs}")
+    print(f"  empty_shells log:  {shells}")
+    require(unknown == 0, "no Unknown-type documents remain in documents")
+    require(empty_docs == 0, "no empty shells pollute documents")
+    require(shells > 0, "empty_shells table records the skipped docs")
+
+    # Check the log is useful: it should span many doc-type prefixes.
+    prefixes = backend.db.execute(
+        "SELECT COUNT(DISTINCT substr(doc_id, 1, instr(doc_id||'/', '/')-1)) AS n "
+        "FROM empty_shells"
+    ).fetchone()["n"]
+    print(f"  shell prefixes covered: {prefixes}")
+    require(prefixes >= 10, "shell log covers a reasonable spread of prefixes")
 
 
 def coverage_probes() -> None:

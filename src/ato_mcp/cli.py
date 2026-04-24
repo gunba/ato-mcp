@@ -441,5 +441,108 @@ def _bundled_pubkey_path() -> Path | None:
     return candidate if candidate.exists() else None
 
 
+# ---------------------------------------------------------------------------
+# Empty-shell inspection.
+
+
+shells_app = typer.Typer(
+    no_args_is_help=True,
+    help="Inspect the empty_shells log (docs the scraper fetched but which "
+         "yielded no extractable content).",
+)
+app.add_typer(shells_app, name="empty-shells")
+
+
+@shells_app.command("count")
+def shells_count(
+    db_path: Optional[Path] = typer.Option(
+        None, help="Path to ato.db. Defaults to the live install path."
+    ),
+) -> None:
+    """Print total + top-20 doc_id-prefix breakdown."""
+    from .store import db as store_db
+    target = db_path or paths.db_path()
+    conn = store_db.connect(target, mode="ro")
+    try:
+        total = conn.execute("SELECT COUNT(*) AS n FROM empty_shells").fetchone()["n"]
+        typer.echo(f"total shells: {total:,}")
+        rows = conn.execute(
+            """
+            SELECT substr(doc_id, 1, instr(doc_id||'/', '/')-1) AS prefix,
+                   COUNT(*) AS n
+            FROM empty_shells GROUP BY prefix ORDER BY n DESC LIMIT 20
+            """
+        ).fetchall()
+        for r in rows:
+            typer.echo(f"  {r['prefix']:<8} {r['n']:>7,}")
+    finally:
+        conn.close()
+
+
+@shells_app.command("list")
+def shells_list(
+    limit: int = typer.Option(20, help="How many shells to show."),
+    prefix: Optional[str] = typer.Option(
+        None, help="Filter by doc_id prefix (e.g. 'EV', 'JUD')."
+    ),
+    db_path: Optional[Path] = typer.Option(None),
+) -> None:
+    """Show the N oldest-unchecked shells (re-probe candidates)."""
+    from .store import db as store_db
+    target = db_path or paths.db_path()
+    conn = store_db.connect(target, mode="ro")
+    try:
+        sql = (
+            "SELECT doc_id, first_seen_at, last_checked_at, check_count, source "
+            "FROM empty_shells"
+        )
+        params: list = []
+        if prefix:
+            sql += " WHERE doc_id LIKE ?"
+            params.append(f"{prefix.rstrip('/')}/%")
+        sql += " ORDER BY last_checked_at ASC LIMIT ?"
+        params.append(limit)
+        rows = conn.execute(sql, params).fetchall()
+        for r in rows:
+            typer.echo(
+                f"{r['doc_id']:<50}  first={r['first_seen_at']}  "
+                f"last={r['last_checked_at']}  n={r['check_count']}  "
+                f"src={r['source'] or ''}"
+            )
+    finally:
+        conn.close()
+
+
+@shells_app.command("export")
+def shells_export(
+    out: Path = typer.Argument(..., help="Destination CSV path."),
+    db_path: Optional[Path] = typer.Option(None),
+) -> None:
+    """Dump the whole table to CSV (doc_id, canonical_url, first_seen_at, last_checked_at, check_count, source)."""
+    import csv
+    from .store import db as store_db
+    from .formatters import canonical_url
+    target = db_path or paths.db_path()
+    conn = store_db.connect(target, mode="ro")
+    try:
+        rows = conn.execute(
+            "SELECT doc_id, first_seen_at, last_checked_at, check_count, source "
+            "FROM empty_shells ORDER BY doc_id"
+        ).fetchall()
+        with out.open("w", newline="", encoding="utf-8") as fh:
+            w = csv.writer(fh)
+            w.writerow(["doc_id", "canonical_url", "first_seen_at",
+                        "last_checked_at", "check_count", "source"])
+            for r in rows:
+                w.writerow([
+                    r["doc_id"], canonical_url(r["doc_id"]),
+                    r["first_seen_at"], r["last_checked_at"],
+                    r["check_count"], r["source"] or "",
+                ])
+        typer.echo(f"wrote {len(rows):,} rows to {out}")
+    finally:
+        conn.close()
+
+
 if __name__ == "__main__":
     app()

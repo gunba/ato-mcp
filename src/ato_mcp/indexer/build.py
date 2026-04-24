@@ -32,6 +32,7 @@ from ..store.queries import (
     INSERT_CHUNK,
     INSERT_CHUNK_FTS,
     INSERT_DOCUMENT,
+    INSERT_EMPTY_SHELL,
     INSERT_TITLE_FTS,
     INSERT_VEC,
 )
@@ -160,6 +161,19 @@ def build(args: BuildArgs) -> Manifest:
             # shouldn't generate empty chunks.
             if has_content and not markdown.strip():
                 has_content = False
+
+            # Empty shell: scraper succeeded but extracted no body. Log it
+            # to empty_shells so a later retry run can re-probe the URL,
+            # then skip inserting into ``documents``.
+            if not has_content:
+                now = datetime.now(timezone.utc).isoformat()
+                conn.execute(INSERT_EMPTY_SHELL, (doc_id, now, now, "scrape"))
+                processed += 1
+                since_checkpoint += 1
+                if since_checkpoint >= CHECKPOINT_EVERY:
+                    _checkpoint(conn, pack_builder, doc_refs)
+                    since_checkpoint = 0
+                continue
 
             if not title:
                 title = (rec.get("title") or canonical_id).strip() or canonical_id

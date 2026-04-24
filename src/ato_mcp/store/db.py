@@ -76,13 +76,16 @@ def init_db(path: Path | None = None) -> sqlite3.Connection:
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
-    """Reject pre-v5 databases.
+    """Reject pre-v5 databases; additively patch v5 DBs missing later tables.
 
     v5 collapsed the schema (human_code/human_title/category/doc_type/
     pub_date/first_published_date/effective_date/status/has_content/href
     all dropped or merged into ``type``/``title``/``date``). In-place
     column migrations aren't worth supporting — pre-v5 DBs should be
     migrated with ``scripts/migrate_v4_to_v5.py`` or rebuilt from source.
+
+    Additive tables introduced after v5.0 (``empty_shells``) are created
+    here if absent so older v5 DBs pick them up on open.
     """
     cols = {row["name"] for row in conn.execute("PRAGMA table_info(documents)").fetchall()}
     if not cols:
@@ -99,6 +102,20 @@ def _migrate(conn: sqlite3.Connection) -> None:
             "This database is pre-v4. Rebuild from ato_pages/ with\n"
             "  ato-mcp build-index ..."
         )
+    # Additive: empty_shells table landed after the initial v5 schema.
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS empty_shells (
+            doc_id          TEXT PRIMARY KEY,
+            first_seen_at   TEXT NOT NULL,
+            last_checked_at TEXT NOT NULL,
+            check_count     INTEGER NOT NULL DEFAULT 1,
+            source          TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_shells_last_checked
+          ON empty_shells(last_checked_at);
+        """
+    )
 
 
 def get_meta(conn: sqlite3.Connection, key: str) -> str | None:
