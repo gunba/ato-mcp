@@ -21,7 +21,7 @@ or keyword-only release build.
 cd ~/Desktop/Projects/ato-mcp
 
 python -m venv .venv
-.venv/bin/pip install -e '.[dev,verify]'
+.venv/bin/pip install -e '.[dev]'
 
 ATO_MCP_MODE=catch_up \
 ATO_MCP_REPO_DIR="$PWD" \
@@ -41,6 +41,8 @@ scripts/maintainer-sync.sh
 The script requires `nvidia-smi`/CUDA to be available through the local
 Python ONNX Runtime install. If CUDA is unavailable, fix the environment
 instead of publishing a degraded corpus.
+
+Manifest signing with `--sign-key` requires the `minisign` CLI on `PATH`.
 
 ## Optional GPU Workflow
 

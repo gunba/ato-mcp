@@ -84,11 +84,7 @@ def fetch_manifest(
     if sig_url and pubkey_path and pubkey_path.exists():
         sig_dest = dest.with_suffix(dest.suffix + ".minisig")
         fetch_url(client, sig_url, sig_dest)
-        try:
-            verify_signature(dest, sig_dest, pubkey_path)
-        except RuntimeError as exc:
-            # signature tooling missing; allow but warn
-            LOGGER.warning("skipping signature check: %s", exc)
+        verify_signature(dest, sig_dest, pubkey_path)
     return load_manifest(dest)
 
 

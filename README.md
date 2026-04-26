@@ -159,7 +159,7 @@ Local GPU release build:
 
 ```bash
 python -m venv .venv
-.venv/bin/pip install -e '.[dev,verify]'
+.venv/bin/pip install -e '.[dev]'
 
 LD_LIBRARY_PATH="$(find .venv/lib*/python3.*/site-packages/nvidia/ -maxdepth 2 -name lib -type d | tr '\n' ':')$LD_LIBRARY_PATH" \
   .venv/bin/ato-mcp build-index \

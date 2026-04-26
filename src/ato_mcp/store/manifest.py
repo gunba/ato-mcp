@@ -6,6 +6,8 @@ it lives in. Clients diff content_hash to produce the delta work list.
 from __future__ import annotations
 
 import hashlib
+import shutil
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -80,26 +82,24 @@ def sha256_file(path: Path, chunk_size: int = 1 << 20) -> str:
 def verify_signature(manifest_path: Path, sig_path: Path, pubkey_path: Path) -> bool:
     """Verify the manifest.minisig signature.
 
-    Returns True on success. Verification support is **optional** — install
-    the ``verify`` extra (``pip install 'ato-mcp[verify]'``) to enable it. When
-    the backend library is unavailable we raise :class:`RuntimeError`; the
-    caller (``updater.apply``) treats that as "no signature check available"
-    and continues only when the user has explicitly opted out of signing.
+    Returns True on success. Signature verification uses the ``minisign`` CLI
+    so it exercises the same verifier maintainers use outside Python.
     """
-    try:
-        import minisign  # type: ignore[import-not-found]
-    except ImportError as exc:  # pragma: no cover - install-dependent
+    cli = shutil.which("minisign")
+    if cli is None:
         raise RuntimeError(
-            "signature verification requested but `minisign` is not installed. "
-            "Install with `pip install 'ato-mcp[verify]'`."
-        ) from exc
+            "signature verification requested but the `minisign` CLI is not installed"
+        )
 
-    pubkey = minisign.PublicKey.from_file(str(pubkey_path))
-    sig = minisign.Signature.from_file(str(sig_path))
-    try:
-        pubkey.verify_file(str(manifest_path), sig)
-    except Exception as exc:  # noqa: BLE001
-        raise ValueError(f"manifest signature verification failed: {exc}") from exc
+    result = subprocess.run(
+        [cli, "-V", "-m", str(manifest_path), "-x", str(sig_path), "-p", str(pubkey_path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        raise ValueError(f"manifest signature verification failed: {detail}")
     return True
 
 

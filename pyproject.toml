@@ -50,12 +50,6 @@ dev = [
     "pytest-asyncio>=0.23",
     "ruff>=0.5",
 ]
-# Signature verification is opt-in. Install via `pip install 'ato-mcp[verify]'`
-# to enable manifest checking; the update path logs a warning and proceeds
-# without it when the extra is missing.
-verify = [
-    "minisign>=0.12",
-]
 
 [project.scripts]
 ato-mcp = "ato_mcp.cli:app"

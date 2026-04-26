@@ -5,8 +5,7 @@ run under the maintainer's existing GitHub CLI authentication. This keeps
 the package dependency-free from API client libraries.
 
 Signing is optional. Pass ``--sign-key`` to produce a ``manifest.json.minisig``
-alongside the manifest. If ``minisign`` (the CLI tool) is installed we use it;
-otherwise we fall back to the python ``minisign`` package if available.
+alongside the manifest. Signing requires the ``minisign`` CLI.
 """
 from __future__ import annotations
 
@@ -130,26 +129,17 @@ def _gh_default_repo() -> str:
 def sign_manifest(manifest_path: Path, sign_key: Path) -> Path:
     """Produce ``manifest.json.minisig`` next to ``manifest_path``.
 
-    Tries the ``minisign`` CLI first (supports secret-key files produced by
-    ``minisign -G``); falls back to the python ``minisign`` package.
+    Uses the ``minisign`` CLI, which supports secret-key files produced by
+    ``minisign -G``.
     """
     sig_path = manifest_path.with_suffix(manifest_path.suffix + ".minisig")
     cli = shutil.which("minisign")
-    if cli:
-        subprocess.run(
-            [cli, "-S", "-s", str(sign_key), "-m", str(manifest_path), "-x", str(sig_path)],
-            check=True,
-        )
-        return sig_path
-    try:
-        import minisign  # type: ignore[import-not-found]
-    except ImportError as exc:
-        raise ReleaseError(
-            "no minisign CLI and the `minisign` python package is not installed"
-        ) from exc
-    sk = minisign.SecretKey.from_file(str(sign_key))
-    sig = sk.sign_file(str(manifest_path))
-    sig_path.write_bytes(bytes(sig))
+    if cli is None:
+        raise ReleaseError("manifest signing requires the `minisign` CLI")
+    subprocess.run(
+        [cli, "-S", "-s", str(sign_key), "-m", str(manifest_path), "-x", str(sig_path)],
+        check=True,
+    )
     return sig_path
 
 
