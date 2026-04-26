@@ -7,7 +7,7 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 ExecStart=%h/.local/bin/ato-mcp update
-# If your install put the binary elsewhere (pipx, uv tool, etc.) adjust above.
+# If your install put the Rust binary elsewhere, adjust above.
 Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7

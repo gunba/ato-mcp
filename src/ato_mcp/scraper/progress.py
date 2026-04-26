@@ -24,7 +24,7 @@ def _coerce_bool(value: str) -> bool:
 
 
 def set_progress_enabled(enabled: bool) -> None:
-	"""Override the cached progress flag (primarily for testing)."""
+	"""Override the progress flag (primarily for testing)."""
 	global _PROGRESS_ENABLED
 	_PROGRESS_ENABLED = bool(enabled)
 

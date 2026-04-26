@@ -9,7 +9,6 @@ import re
 import sqlite3
 import threading
 from dataclasses import dataclass
-from functools import lru_cache
 from typing import Any, Literal
 
 import zstandard as zstd
@@ -142,6 +141,8 @@ def _glob_to_like(pattern: str) -> str:
 # ("EV 1051375298526"), rarely useful when the agent is answering a
 # public tax-law question.
 DEFAULT_EXCLUDED_TYPES = ("Edited_private_advice",)
+DEFAULT_OLD_CONTENT_CUTOFF = "2000-01-01"
+DEFAULT_OLD_CONTENT_EXCEPTION_TYPES = ("Legislation_and_supporting_material",)
 
 
 def _build_sql_filter(
@@ -149,6 +150,7 @@ def _build_sql_filter(
     date_from: str | None,
     date_to: str | None,
     doc_scope: str | None,
+    include_old: bool = False,
 ) -> tuple[str, list[Any]]:
     """Build a WHERE fragment for the documents table.
 
@@ -186,6 +188,13 @@ def _build_sql_filter(
     if doc_scope:
         clauses.append("d.doc_id LIKE ? ESCAPE '\\'")
         params.append(_glob_to_like(doc_scope))
+    if not include_old and not date_from:
+        placeholders = ",".join("?" * len(DEFAULT_OLD_CONTENT_EXCEPTION_TYPES))
+        clauses.append(
+            f"(d.date IS NULL OR d.date >= ? OR d.type IN ({placeholders}))"
+        )
+        params.append(DEFAULT_OLD_CONTENT_CUTOFF)
+        params.extend(DEFAULT_OLD_CONTENT_EXCEPTION_TYPES)
     return (" AND ".join(clauses), params) if clauses else ("", params)
 
 
@@ -233,8 +242,7 @@ def _fts_query(query: str) -> str:
     return " ".join(f'"{t}"' for t in tokens)
 
 
-@lru_cache(maxsize=128)
-def _encode_query_cached(query: str) -> bytes:
+def _encode_query(query: str) -> bytes:
     backend = get_backend()
     if backend.model is None:
         return b""
@@ -251,7 +259,7 @@ def _vec_search(
     filter_sql: str,
     filter_params: list[Any],
 ) -> list[tuple[int, float]]:
-    q_vec = _encode_query_cached(query)
+    q_vec = _encode_query(query)
     if not q_vec:
         return []
     where = f"AND {filter_sql}" if filter_sql else ""
@@ -323,13 +331,16 @@ def search(
     date_from: str | None = None,
     date_to: str | None = None,
     doc_scope: str | None = None,
+    include_old: bool = False,
     mode: Literal["hybrid", "vector", "keyword"] = "hybrid",
     sort_by: Literal["relevance", "recency"] = "relevance",
     format: Literal["markdown", "json"] = "markdown",
 ) -> str:
     backend = get_backend()
     k = max(1, min(k, MAX_K))
-    filter_sql, filter_params = _build_sql_filter(types, date_from, date_to, doc_scope)
+    filter_sql, filter_params = _build_sql_filter(
+        types, date_from, date_to, doc_scope, include_old=include_old
+    )
 
     internal_k = max(k * 5, 50)
     fts_hits: list[tuple[int, float]] = []
@@ -406,10 +417,11 @@ def search_titles(
     k: int = 20,
     types: list[str] | None = None,
     format: Literal["markdown", "json"] = "markdown",
+    include_old: bool = False,
 ) -> str:
     backend = get_backend()
     k = max(1, min(k, 100))
-    where, params = _build_sql_filter(types, None, None, None)
+    where, params = _build_sql_filter(types, None, None, None, include_old=include_old)
     # _build_sql_filter prefixes ``d.``; strip it since title_fts joins ``d``.
     sql = f"""
         SELECT t.doc_id AS doc_id, bm25(title_fts) AS score,

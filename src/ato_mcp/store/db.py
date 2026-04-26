@@ -41,7 +41,7 @@ def connect(
 ) -> sqlite3.Connection:
     """Open an ato.db connection with sqlite-vec loaded.
 
-    mode=ro gives a read-only handle (safe for serve). mmap raises page cache hits.
+    mode=ro gives a read-only handle (safe for serve). mmap reduces disk reads.
     """
     if path is None:
         path = paths.db_path()

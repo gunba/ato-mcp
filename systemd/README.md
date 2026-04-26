@@ -20,7 +20,7 @@ Keep the user manager alive between logins:
 loginctl enable-linger "$USER"
 ```
 
-## Maintainer install (daily incremental + weekly catch-up + publish)
+## Maintainer install (weekly catch-up + publish)
 
 Only install these on the machine you publish releases from. They
 scrape the ATO, rebuild the search index, and push a new GitHub release.
@@ -29,7 +29,6 @@ scrape the ATO, rebuild the search index, and push a new GitHub release.
 cp ato-mcp-maintainer-*.service ato-mcp-maintainer-*.timer \
    ~/.config/systemd/user/
 systemctl --user daemon-reload
-systemctl --user enable --now ato-mcp-maintainer-daily.timer
 systemctl --user enable --now ato-mcp-maintainer-weekly.timer
 ```
 
@@ -40,7 +39,7 @@ path, ato_pages path, or model path differs from the defaults.
 
 ```bash
 systemctl --user start ato-mcp-update.service
-systemctl --user start ato-mcp-maintainer-daily.service
+systemctl --user start ato-mcp-maintainer-weekly.service
 ```
 
 ## Checking results
@@ -48,5 +47,5 @@ systemctl --user start ato-mcp-maintainer-daily.service
 ```bash
 systemctl --user status ato-mcp-update.timer
 journalctl --user -u ato-mcp-update.service -n 50 --no-pager
-journalctl --user -u ato-mcp-maintainer-daily.service -n 100 --no-pager
+journalctl --user -u ato-mcp-maintainer-weekly.service -n 100 --no-pager
 ```

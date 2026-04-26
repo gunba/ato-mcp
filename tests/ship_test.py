@@ -17,7 +17,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from ato_mcp import tools  # noqa: E402
-from ato_mcp import formatters  # noqa: E402
 
 
 def section(title: str) -> None:

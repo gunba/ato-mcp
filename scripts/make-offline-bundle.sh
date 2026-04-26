@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build a single pre-populated data directory as a tar.zst, so a locked-down
-# machine (no git, no gh) can install ato-mcp by pipx-installing the wheel and
-# extracting this tarball over $XDG_DATA_HOME/ato-mcp/.
+# machine can install ato-mcp by placing the Rust binary on PATH and extracting
+# this tarball over $XDG_DATA_HOME/ato-mcp/.
 #
 # Usage (from repo root):
 #   scripts/make-offline-bundle.sh                    # defaults below

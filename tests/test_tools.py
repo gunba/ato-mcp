@@ -118,8 +118,14 @@ def test_types_filter_glob(seeded_db: Path) -> None:
     assert all(h["type"].startswith("Public_") for h in public["hits"])
 
 
-def test_search_titles_returns_by_title(seeded_db: Path) -> None:
+def test_search_titles_excludes_old_non_legislation_by_default(seeded_db: Path) -> None:
     out = tools.search_titles("capital works", format="json")
+    data = json.loads(out)
+    assert not any(h["doc_id"] == DOC_DIV for h in data["hits"])
+
+
+def test_search_titles_can_include_old_content(seeded_db: Path) -> None:
+    out = tools.search_titles("capital works", include_old=True, format="json")
     data = json.loads(out)
     assert any(h["doc_id"] == DOC_DIV for h in data["hits"])
 
@@ -174,6 +180,15 @@ def test_search_exposes_date(seeded_db: Path) -> None:
     assert data["hits"]
     for h in data["hits"]:
         assert "date" in h
+
+
+def test_search_can_include_old_non_legislation(seeded_db: Path) -> None:
+    default = json.loads(tools.search("capital works", mode="keyword", k=8, format="json"))
+    assert not any(h["doc_id"] == DOC_DIV for h in default["hits"])
+    included = json.loads(
+        tools.search("capital works", mode="keyword", k=8, include_old=True, format="json")
+    )
+    assert any(h["doc_id"] == DOC_DIV for h in included["hits"])
 
 
 def test_whats_new_orders_by_date(seeded_db: Path) -> None:

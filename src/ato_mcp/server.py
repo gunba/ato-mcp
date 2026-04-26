@@ -29,6 +29,7 @@ def search(
     date_from: str | None = None,
     date_to: str | None = None,
     doc_scope: str | None = None,
+    include_old: bool = False,
     mode: Literal["hybrid", "vector", "keyword"] = "hybrid",
     sort_by: Literal["relevance", "recency"] = "relevance",
     format: Literal["markdown", "json"] = "markdown",
@@ -46,6 +47,9 @@ def search(
     When ``types`` is omitted, ``Edited_private_advice`` is excluded by
     default (private rulings are one-off, noisy for public tax-law
     questions). Pass ``types=["Edited_private_advice"]`` to include them.
+    Content dated before 2000 is also excluded by default except
+    legislation; pass ``include_old=True`` when older authorities are
+    required.
 
     ``sort_by='relevance'`` applies a 5-year-half-life recency boost by
     default — in tax law, later guidance typically supersedes earlier.
@@ -58,6 +62,7 @@ def search(
         date_from=date_from,
         date_to=date_to,
         doc_scope=doc_scope,
+        include_old=include_old,
         mode=mode,
         sort_by=sort_by,
         format=format,
@@ -69,15 +74,18 @@ def search_titles(
     query: str,
     k: int = 20,
     types: list[str] | None = None,
+    include_old: bool = False,
     format: Literal["markdown", "json"] = "markdown",
 ) -> str:
     """Fast title-only search. Use for citations (``TR 2024/3``, ``s 355-25``)
     or case names. Searches the ``title`` + per-doc headings, not bodies.
 
     Like ``search``, defaults to excluding ``Edited_private_advice``.
-    Pass ``types=["Edited_private_advice"]`` to include EPAs.
+    Pass ``types=["Edited_private_advice"]`` to include EPAs. Pass
+    ``include_old=True`` to include non-legislation documents dated before
+    2000.
     """
-    return T.search_titles(query, k=k, types=types, format=format)
+    return T.search_titles(query, k=k, types=types, include_old=include_old, format=format)
 
 
 @mcp.tool
@@ -184,6 +192,8 @@ def _build_instructions() -> str:
         "Default scope: `Edited_private_advice` (ATO's individual-taxpayer",
         "rulings) is excluded from search / search_titles / whats_new when",
         "`types` is omitted. Opt in with `types=[\"Edited_private_advice\"]`.",
+        f"Search also excludes non-legislation documents dated before "
+        f"{T.DEFAULT_OLD_CONTENT_CUTOFF} unless `include_old=True`.",
         "",
         "Every result carries a `canonical_url` suitable for citing back to the user.",
     ]

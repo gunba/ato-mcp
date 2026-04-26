@@ -123,7 +123,6 @@ def build(args: BuildArgs) -> Manifest:
     try:
         for rec in index_records:
             canonical_id = rec["canonical_id"]
-            href = rec.get("href") or canonical_id
             doc_id = meta_mod.doc_id_for(canonical_id)
             if doc_id in resume_done:
                 continue

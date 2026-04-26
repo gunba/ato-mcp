@@ -1,128 +1,74 @@
 # ato-mcp
 
-Local [MCP](https://modelcontextprotocol.io/) server giving AI clients (Claude Code, Claude Desktop, Cursor, any other MCP client) search and fetch access to the **full Australian Taxation Office (ATO) legal corpus** — legislation, cases, public rulings, private advice, PCGs, TAs, ATO IDs, PS LAs, decision impact statements, and more.
+Standalone MCP server for local search and retrieval over the Australian
+Taxation Office legal corpus.
 
-Runs entirely on your machine. No API keys. No hosted backend. A ~300 MB embedding model and a pre-built SQLite index are downloaded from GitHub Releases on first run. Updates are per-document deltas so weekly refreshes transfer single-digit MB.
+The installed server is a Rust binary. End users do not need Python, pip,
+pipx, uv, a compiler, `gh`, or an API key. The corpus is shipped as GitHub
+release assets and installed into the user's local data directory.
 
----
-
-## What you get
-
-Ten MCP tools exposed over stdio:
+## Tools
 
 | Tool | Purpose |
 |---|---|
-| `search` | Hybrid search (BM25 + vector) across ~86k documents. Filter by category, doc type, date. |
-| `search_titles` | Fast title-only search. Use for citation lookups like `s355-25` or `TR 2024/3`. |
-| `resolve` | Parse a citation (`TR 2024/3`, `CR 2025/62`, `ATO ID 2001/332`) and return exact matches. |
-| `get_document` | Full document content (markdown) or a compact outline. |
-| `get_section` | A single section by anchor or heading path. Cheap, precise. |
-| `get_chunks` | Batched chunk fetch for reranker / context-building flows. |
-| `list_categories` | 13 categories with document counts. |
-| `list_doc_types` | 30+ ATO document types with counts. |
-| `whats_new` | Recently updated documents. |
-| `stats` | Index version, document/chunk counts, last update. |
+| `search` | BM25 search over the GPU-built corpus. Defaults exclude Edited Private Advice and very old non-legislation content. |
+| `search_titles` | Fast citation/title lookup, for example `TR 2024/3` or `Income Tax Assessment Act 1997 s 8-1`. |
+| `get_document` | Fetch an outline, a full document, a section, or an ordinal range. |
+| `get_chunks` | Fetch exact chunks returned by `search`. |
+| `whats_new` | Recent documents by corpus date. |
+| `stats` | Index version, counts, and default search policy. |
 
-Every hit includes a `canonical_url` pointing to the authoritative ATO page.
-
-### Example agent interaction
-
-```
-> What does the ATO say about R&D tax incentive eligibility for software?
-
-[agent calls search("R&D tax incentive eligibility software")]
-  → top hits: TR 2013/3, PCG 2025/D6, CR 2025/73
-[agent calls get_section("tr_2013_3", heading_path="Ruling › Eligibility")]
-  → returns the exact section
-[agent cites https://www.ato.gov.au/law/view/document?docid=TXR/TR20133/NAT/ATO/00001]
-```
-
----
+Every result includes the ATO `canonical_url`.
 
 ## Install
 
-**Requirements:** Python 3.11+ (3.14 tested), `pipx`, `gh` CLI (for
-authenticated access to the private release artifacts), ~1 GB disk
-(model + index), one-time 700 MB download.
+Download the binary for your platform from the latest release:
+
+- Linux x64: `ato-mcp-x86_64-unknown-linux-gnu.tar.gz`
+- macOS Apple Silicon: `ato-mcp-aarch64-apple-darwin.tar.gz`
+- Windows x64: `ato-mcp-x86_64-pc-windows-msvc.zip`
+
+Linux example:
 
 ```bash
-gh auth login                                    # if you haven't already
-gh auth setup-git                                # lets pipx clone private repos
-pipx install git+https://github.com/gunba/ato-mcp.git
-ato-mcp init                                     # downloads model + index (~700 MB)
+mkdir -p ~/.local/bin
+tar -xzf ato-mcp-x86_64-unknown-linux-gnu.tar.gz -C ~/.local/bin ato-mcp
+ato-mcp init
+ato-mcp doctor
+ato-mcp stats
 ```
 
-On Windows, substitute `%LOCALAPPDATA%\ato-mcp\` for the data directory.
+Windows: unzip `ato-mcp.exe` into a directory on `%PATH%`, then run:
 
-### Offline install (no git, no gh)
-
-On locked-down machines where `git` and the `gh` CLI are blocked, use the
-browser-only path. Each release ships two extra assets:
-
-- `ato_mcp-<version>-py3-none-any.whl` — the CLI, a ~100 KB pure-Python wheel
-- `ato-mcp-offline-<tag>.tar.zst.part01.bin`, `.part02.bin`, ... — a
-  pre-populated data directory (~2.5 GB total), split into <2 GB parts
-  to fit GitHub's release-asset cap
-
-On the locked machine:
-
-```bash
-# Download all assets via the browser from
-# https://github.com/gunba/ato-mcp/releases/latest, then:
-
-pipx install ~/Downloads/ato_mcp-*.whl
-mkdir -p ~/.local/share/ato-mcp                   # $XDG_DATA_HOME/ato-mcp/
-# The offline bundle is split into .part01.bin, .part02.bin, ... because
-# GitHub caps release assets at 2 GiB. `cat` reassembles them in order:
-cat ~/Downloads/ato-mcp-offline-*.tar.zst.part*.bin | \
-  tar -I zstd -x -C ~/.local/share/ato-mcp
-ato-mcp doctor                                    # verifies the bundle
-claude mcp add --scope user ato -- ato-mcp serve
+```powershell
+ato-mcp.exe init
+ato-mcp.exe doctor
+ato-mcp.exe stats
 ```
 
-If `zstd` isn't installed, grab it via your distro's package manager
-(`sudo apt install zstd`, `sudo dnf install zstd`, `brew install zstd`,
-etc.) — it's tiny and has no network dependencies once the package is
-cached locally.
+`init` downloads `manifest.json`, the embedding model bundle, and the
+document packs from the configured release URL. By default that is:
 
-The bundle extracts to the same layout `ato-mcp init` would produce, so
-`ato-mcp stats`, `doctor`, and the MCP server all work identically.
-Future `ato-mcp update` calls still require network access to fetch
-manifest deltas — on a fully offline machine, just download a newer
-bundle and re-extract.
+```text
+https://github.com/gunba/ato-mcp/releases/latest/download
+```
 
-### Wire up Claude Code
+Override with `ATO_MCP_RELEASES_URL` for staging or an internal corporate
+mirror. The Rust client intentionally does not read GitHub token
+environment variables and does not shell out to `gh`. If release assets are
+private, publish them to an authenticated mirror or install from an offline
+bundle.
+
+## Wire Into MCP Clients
+
+Claude Code:
 
 ```bash
 claude mcp add --scope user ato -- ato-mcp serve
-```
-
-Use `--scope project` if you want it in `.claude/settings.json` for a
-specific repo instead of user-wide.
-
-Confirm it's registered:
-
-```bash
 claude mcp list
-claude mcp get ato
 ```
 
-Then inside Claude Code:
-
-```
-/mcp
-```
-
-You should see `ato` listed. Test with a search:
-
-```
-Ask ato: search "capital gains tax small business concessions"
-```
-
-### Wire up Claude Desktop
-
-Add to `~/Library/Application Support/Claude/claude_desktop_config.json`
-(macOS) or `%APPDATA%\Claude\claude_desktop_config.json` (Windows):
+Claude Desktop:
 
 ```json
 {
@@ -135,261 +81,120 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`
 }
 ```
 
-Restart Claude Desktop.
+Cursor, Continue, and other stdio MCP clients use the same command:
 
-### Wire up Cursor, Continue, etc.
+```text
+ato-mcp serve
+```
 
-Any MCP stdio client works — point it at the `ato-mcp serve` command. See
-the [MCP client docs](https://modelcontextprotocol.io/clients) for
-client-specific config.
+## Search Defaults
 
----
+Default search is tuned for current public tax-law work:
 
-## Keep it up to date
+- `Edited_private_advice` is excluded unless `types` explicitly includes it.
+- Non-legislation documents dated before `2000-01-01` are excluded unless
+  `include_old=true`.
+- Legislation is not excluded by the old-content rule because current Acts
+  often have old commencement dates.
 
-Weekly:
+Examples:
+
+```bash
+ato-mcp search "R&D tax incentive eligibility" --k 5
+ato-mcp search-titles "TR 2024 3"
+ato-mcp search "royalties withholding old cases" --include-old --types Cases
+```
+
+## Updates
+
+Run weekly, or whenever you want the latest published corpus:
 
 ```bash
 ato-mcp update
+ato-mcp doctor
 ```
 
-Typical transfer: 2–5 MB. The updater downloads only the byte ranges for
-changed documents, applies them to the local SQLite in one transaction,
-and atomically swaps the installed manifest. Crash-safe: the live DB is
-either the pre-update or post-update state, never mixed. On a bad update,
-roll back:
+The update path diffs the installed manifest against the new manifest,
+downloads only changed pack assets, mutates SQLite in one transaction, and
+writes `installed_manifest.json` last. If an update fails, the previous
+database snapshot is retained:
 
 ```bash
 ato-mcp doctor --rollback
 ```
 
-### Automatic updates (systemd user timer)
+## Data Directory
 
-The repo ships ready-made systemd units. Install the end-user daily
-refresh once and forget it:
+Override the install location with `ATO_MCP_DATA_DIR`.
 
-```bash
-mkdir -p ~/.config/systemd/user
-curl -fsSLO --output-dir ~/.config/systemd/user \
-  https://raw.githubusercontent.com/gunba/ato-mcp/main/systemd/ato-mcp-update.service \
-  https://raw.githubusercontent.com/gunba/ato-mcp/main/systemd/ato-mcp-update.timer
-systemctl --user daemon-reload
-systemctl --user enable --now ato-mcp-update.timer
-loginctl enable-linger "$USER"
+```text
+Linux:   ~/.local/share/ato-mcp
+macOS:   ~/Library/Application Support/ato-mcp
+Windows: %APPDATA%\ato-mcp or the platform data directory
 ```
 
-See [systemd/README.md](systemd/README.md) for maintainer-side timers
-that also drive the release pipeline.
+Layout:
 
-### Verify install
-
-```bash
-ato-mcp stats
-ato-mcp doctor
-```
-
-`stats` shows index version + counts; `doctor` verifies the DB opens.
-
----
-
-## For AI agents (Claude Code, Cursor, etc.) setting this up
-
-If you are an AI agent tasked with installing this server for the user, run these steps end to end:
-
-```bash
-# 1. Install the CLI (prefer pipx; fall back to `uv tool install` or `pip install --user`).
-pipx install git+https://github.com/gunba/ato-mcp.git
-
-# 2. Download the prebuilt index + embedding model (~700 MB one-time).
-ato-mcp init
-
-# 3. Register the server with the host MCP client. For Claude Code:
-claude mcp add ato -- ato-mcp serve
-
-# 4. Sanity check.
-ato-mcp stats
-```
-
-If the host is Claude Desktop or a config-file-based client, edit the
-client's MCP servers JSON as shown above instead of step 3.
-
-If `init` fails because signatures are missing (our repo is private /
-unsigned), set `ATO_MCP_INSECURE=1` before running it — we skip
-verification when no public key is bundled and no `.minisig` is
-published. (This is the default in v0.1.)
-
-If the machine is offline, copy a pre-populated
-`$XDG_DATA_HOME/ato-mcp/` from another install and run
-`ato-mcp doctor` to verify.
-
----
-
-## Data location
-
-All persistent state lives under the data directory:
-
-```
-$XDG_DATA_HOME/ato-mcp/                  (Linux default: ~/.local/share/ato-mcp/)
+```text
+ato-mcp/
 ├── live/
-│   ├── ato.db                           # SQLite: documents + chunks + FTS + vectors
+│   ├── ato.db
 │   ├── model.onnx -> model_quantized.onnx
-│   ├── model_quantized.onnx             # 309 MB
+│   ├── model_quantized.onnx
 │   ├── model_quantized.onnx_data
-│   ├── tokenizer.json
-│   └── packs/pack-<sha8>.bin.zst        # immutable, content-addressable
-├── installed_manifest.json              # last verified manifest
-├── backups/ato.db.prev                  # 1 generation retained for rollback
-├── staging/                             # transient during update
+│   └── tokenizer.json
+├── installed_manifest.json
+├── backups/ato.db.prev
+├── staging/
 └── LOCK
 ```
 
-Override the location with `ATO_MCP_DATA_DIR=/path/to/dir`. Windows
-defaults to `%LOCALAPPDATA%\ato-mcp\`.
+## Maintainer Workflow
 
----
+The Rust binary is the end-user product. Python remains maintainer tooling
+for scraping, metadata extraction, GPU-backed embedding generation, pack
+building, and release publication.
 
-## Architecture at a glance
-
-```
-┌──────────────────┐   stdio    ┌────────────────────────────┐
-│  Claude Code /   │◀──────────▶│  ato-mcp serve             │
-│  Desktop / etc.  │   MCP      │  (FastMCP, 10 tools)       │
-└──────────────────┘            └──────────────┬─────────────┘
-                                               │
-                                      ┌────────▼────────┐
-                                      │  ato.db         │  single SQLite file:
-                                      │  ├─ documents   │  86k rows
-                                      │  ├─ chunks      │  ~700k zstd blobs
-                                      │  ├─ chunks_fts  │  FTS5 (BM25)
-                                      │  ├─ chunks_vec  │  sqlite-vec int8×256
-                                      │  └─ title_fts   │  FTS5 over titles
-                                      └─────────────────┘
-                                               ▲
-                                      EmbeddingGemma 300M
-                                      ONNX int8, Matryoshka 256
-```
-
-### Hybrid search
-
-Each `search` call:
-1. FTS5 top-100 by BM25.
-2. sqlite-vec top-100 by cosine against the EmbeddingGemma query embedding.
-3. Reciprocal Rank Fusion (k=60) merges the two lists.
-4. Optional recency boost on `pub_date`.
-5. Deduplicate by document, return the top k.
-
-### Updates
-
-Release artifacts:
-
-```
-manifest.json                           # signed; lists every doc + pack
-packs/pack-<sha8>.bin.zst                # immutable content-addressable packs
-model/embeddinggemma-<sha8>.onnx.zst     # rarely changes
-```
-
-`ato-mcp update`:
-1. Fetch + verify new manifest.
-2. Diff `content_hash` per `doc_id` against the installed manifest.
-3. Group changed doc_ids by pack; issue HTTP/2 range requests for just
-   the needed bytes.
-4. In one SQLite transaction: delete removed + changed docs, insert new
-   versions. FTS5 and sqlite-vec rows propagate in the same transaction.
-5. Write `installed_manifest.json` last. A crash before this step leaves
-   the transaction-complete DB ready for the next `update` to re-apply
-   idempotently.
-
----
-
-## Maintainer workflow (updating the release)
-
-Only needed if you are publishing new index releases. End users never run
-these. See [MAINTENANCE.md](MAINTENANCE.md) for the full runbook (health
-checks, reconcile script, dependency bumps, release tags).
-
-Scraping defaults are polite: **1 worker, 1 s between requests (~1 req/s)**.
-Increase only if you have reason.
-
-### Cadence
-
-The ATO doesn't expose a `lastmod` timestamp anywhere, and
-`sitemap.xml` doesn't cover `/law/view/`. Scheduling is layered:
-
-| Frequency | Command | What it catches |
-|---|---|---|
-| Daily | `ato-mcp refresh-source --mode incremental` | Rolling "What's New" feed (2-3 week window). Amendments + recent adds. |
-| Weekly | `ato-mcp catch-up --output-dir ./ato_pages` | Metadata-only tree diff. Adds/removes anywhere in the corpus. ~1-3 h at 1 req/s. |
-| Monthly | `ato-mcp refresh-source --mode full` | Defensive full re-crawl + re-download. Guards against drift. |
-
-The tree crawl is **metadata-only** — it hits the browse-content JSON API
-(~one call per folder), never document HTML — so a weekly run is cheap
-compared to re-downloading every payload.
-
-### Release steps
+Local GPU release build:
 
 ```bash
-# 1. Scrape fresh data.
-ato-mcp catch-up --output-dir ./ato_pages               # fast path
-#   or
-ato-mcp refresh-source --mode full --output-dir ./ato_pages   # full rebuild
+python -m venv .venv
+.venv/bin/pip install -e '.[dev,verify]'
 
-# 2. Build the index. GPU recommended for full rebuilds.
-LD_LIBRARY_PATH=$(find .venv/lib*/python3.*/site-packages/nvidia/ -maxdepth 2 -name "lib" -type d | tr '\n' ':') \
-ato-mcp build-index \
-  --pages-dir ./ato_pages \
-  --out-dir   ./release \
-  --db-path   ./release/ato.db \
-  --model-path     ./models/embeddinggemma/onnx/model_quantized.onnx \
+LD_LIBRARY_PATH="$(find .venv/lib*/python3.*/site-packages/nvidia/ -maxdepth 2 -name lib -type d | tr '\n' ':')$LD_LIBRARY_PATH" \
+  .venv/bin/ato-mcp build-index \
+  --pages-dir /home/jordan/Desktop/Projects/ato_pages \
+  --out-dir ./release \
+  --db-path ./release/ato.db \
+  --model-path ./models/embeddinggemma/onnx/model_quantized.onnx \
   --tokenizer-path ./models/embeddinggemma/tokenizer.json \
-  --previous-manifest ./release-prev/manifest.json \
   --gpu
 
-# 3. Publish to a GitHub release.
-ato-mcp release \
+.venv/bin/ato-mcp release \
   --out-dir ./release \
-  --tag index-2026.04.18 \
+  --tag v0.3.0 \
   --repo gunba/ato-mcp \
   --model-dir ./models/embeddinggemma \
-  --sign-key ~/.minisign/ato-mcp.key   # optional
+  --overwrite
 ```
 
-Release artifacts are uploaded via `gh release upload`. Manifest URLs are
-rewritten to absolute `https://github.com/.../releases/download/<tag>/<file>`
-so clients can resolve them.
+The maintainer build must use GPU-backed embeddings. The optional
+`corpus release (gpu)` workflow targets a self-hosted runner labelled
+`gpu` and fails if `nvidia-smi` or ONNX Runtime's `CUDAExecutionProvider`
+is unavailable. It is not scheduled by default, so it does not spend hosted
+GPU minutes.
 
-### Hardware notes
+## Development
 
-Built and tested on an RTX 4070 Ti + 24-core CPU. Full 86k-doc build
-takes ~8 hours CPU-only, well under an hour on a mid-range modern GPU.
-Per-doc cost is dominated by HTML parsing + DB inserts once embeddings
-are parallelised.
+```bash
+cargo test --locked
+.venv/bin/pytest -q
+```
 
----
-
-## Status
-
-**v0.1 (initial release)** — 10 MCP tools, hybrid search, document-level
-delta updates, crash-safe apply, full maintainer pipeline. Known
-trade-offs:
-
-- Edited Private Advice payloads in the current scrape are empty shells
-  (source-side). Docs still index by title but carry `has_content=false`
-  and no chunks. Will improve once the scraper learns to follow the
-  JS-rendered EPA pages.
-- sqlite-vec is still brute-force; fine at 86k × 256-dim but plan to
-  switch on the forthcoming ANN index at >500k chunks.
-- Signature verification is opt-in (`pip install 'ato-mcp[verify]'`).
-  v0.2 will bundle a maintainer public key and sign every release.
-
-See [the plan](/home/jordan/.claude/plans/it-s-been-a-long-dreamy-hare.md)
-for the full design document.
-
----
+CI runs both the Rust binary checks and the Python maintainer test suite.
+Release binary assets are produced by `.github/workflows/release-binaries.yml`.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
-
-The EmbeddingGemma 300M weights are redistributed under the Gemma Terms
-of Use. ATO content is Crown copyright, reused here for factual research
-purposes consistent with the ATO's publication terms.
+MIT. ATO content remains subject to the ATO's publication terms. The
+EmbeddingGemma model is redistributed under the Gemma Terms of Use.

@@ -166,7 +166,7 @@ def _apply_locked(
         for ref in changed:
             _delete_doc(conn, ref.doc_id)
 
-        # Ingest one pack at a time. Download → process → release.
+        # Ingest one pack at a time. Download → process → remove.
         processed = 0
         total = len(added) + len(changed)
         for pack_sha8, refs in pack_to_refs.items():
@@ -174,9 +174,9 @@ def _apply_locked(
             if info is None:
                 raise ValueError(f"manifest missing pack info for {pack_sha8}")
             url = _absolute_url(new_manifest, info.url)
-            cache = _download_pack(client, url)
-            bytes_downloaded += cache.stat().st_size
-            with open(cache, "rb") as fh:
+            pack_path = _download_pack(client, url)
+            bytes_downloaded += pack_path.stat().st_size
+            with open(pack_path, "rb") as fh:
                 for ref in refs:
                     fh.seek(ref.offset)
                     blob = fh.read(ref.length)
@@ -203,9 +203,9 @@ def _apply_locked(
     final = paths.installed_manifest_path()
     save_manifest(new_manifest, final)
 
-    # Success — drop the staged pack caches + temp manifest.
+    # Success — drop staged pack downloads + temp manifest.
     import contextlib
-    for stale in paths.staging_dir().glob("pack-cache-*"):
+    for stale in paths.staging_dir().glob("pack-download-*"):
         with contextlib.suppress(OSError):
             stale.unlink()
     with contextlib.suppress(OSError):
@@ -220,29 +220,13 @@ def _apply_locked(
 
 
 def _download_pack(client: httpx.Client, url: str) -> Path:
-    """Download a pack file to the staging cache once; return the local path.
-
-    Uses gh CLI for private-release URLs, httpx streaming otherwise.
-    Subsequent calls with the same URL are a no-op (cache hit).
-    """
-    import shutil as _shutil
-    from .fetch import _gh_download, _gh_release_match, _httpx_stream_download
-
-    cache_dir = paths.staging_dir()
-    m = _gh_release_match(url)
-    if m and _shutil.which("gh"):
-        cache = cache_dir / f"pack-cache-{m['asset']}"
-        if not cache.exists() or cache.stat().st_size == 0:
-            _gh_download(
-                owner=m["owner"], repo=m["repo"], tag=m["tag"], asset=m["asset"],
-                dest=cache,
-            )
-    else:
-        asset = url.rsplit("/", 1)[-1] or "pack.bin.zst"
-        cache = cache_dir / f"pack-cache-{asset}"
-        if not cache.exists() or cache.stat().st_size == 0:
-            _httpx_stream_download(client, url, cache)
-    return cache
+    """Download a pack file to staging and return the local path."""
+    from .fetch import fetch_url
+    stage_dir = paths.staging_dir()
+    asset = url.rsplit("/", 1)[-1] or "pack.bin.zst"
+    dest = stage_dir / f"pack-download-{asset}"
+    fetch_url(client, url, dest)
+    return dest
 
 
 def _ensure_model(client: httpx.Client, manifest: Manifest, staging: Path) -> None:

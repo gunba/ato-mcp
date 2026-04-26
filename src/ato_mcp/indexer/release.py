@@ -1,8 +1,8 @@
 """Release helpers: sign the manifest and upload artifacts to GitHub Releases.
 
 We shell out to ``gh`` rather than use the GitHub API directly so uploads
-run under the maintainer's existing gh auth / GITHUB_TOKEN. This keeps the
-package dependency-free from API client libraries.
+run under the maintainer's existing GitHub CLI authentication. This keeps
+the package dependency-free from API client libraries.
 
 Signing is optional. Pass ``--sign-key`` to produce a ``manifest.json.minisig``
 alongside the manifest. If ``minisign`` (the CLI tool) is installed we use it;

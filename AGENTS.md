@@ -1,88 +1,40 @@
 # AGENTS.md
 
-Instructions for an automated coding/support agent (Claude Code, Cursor,
-Continue, etc.) tasked with installing or operating `ato-mcp` on the
-user's machine. Read this first; fall back to [README.md](README.md) for
-design detail.
+Instructions for agents installing or operating `ato-mcp` for a user.
+Read this first; use [README.md](README.md) for design detail.
 
-## On the main PC (has the source corpus + GPU)
+## Install
 
-If you're operating on the machine that holds `ato_pages/` and the
-embedding-build GPU, your runbook is
-[docs/main-pc-runbook.md](docs/main-pc-runbook.md). That covers the v4
-schema rebuild, the `human_code` parser you're expected to iterate on,
-and `human_title` refinement. The schema will refuse to open a pre-v4
-DB with a clear rebuild message — don't try to migrate in place.
+End users install the Rust binary from GitHub Releases. Do not install the
+Python package on user machines.
 
-## Prerequisite: GitHub auth (private repo)
-
-`ato-mcp` lives in a private GitHub repo. Both `pipx install git+https://…`
-and `ato-mcp init` need authenticated access:
-
-```bash
-gh auth login                # if not already logged in
-gh auth setup-git            # installs gh as a git credential helper
-```
-
-After `setup-git`, `git clone https://github.com/gunba/ato-mcp.git` works
-transparently for the user, and so does `pipx install git+...`. The
-`init` + `update` subcommands already shell out to `gh release download`
-for release assets, so they require `gh auth login` but do **not** need
-`setup-git`.
-
-## Install path
-
-Pick the first option that works:
-
-1. **`pipx` installed?** Run:
-   ```bash
-   pipx install git+https://github.com/gunba/ato-mcp.git
-   ```
-
-2. **`uv` installed?** Run:
-   ```bash
-   uv tool install --from git+https://github.com/gunba/ato-mcp.git ato-mcp
-   ```
-
-3. Else `pip install --user`:
-   ```bash
-   pip install --user git+https://github.com/gunba/ato-mcp.git
-   ```
-
-Verify: `ato-mcp --help` should print a subcommand list.
-
-## First-run data download
+1. Download the platform asset from the latest release:
+   - Linux x64: `ato-mcp-x86_64-unknown-linux-gnu.tar.gz`
+   - macOS Apple Silicon: `ato-mcp-aarch64-apple-darwin.tar.gz`
+   - Windows x64: `ato-mcp-x86_64-pc-windows-msvc.zip`
+2. Put `ato-mcp` / `ato-mcp.exe` on `PATH`.
+3. Run:
 
 ```bash
 ato-mcp init
+ato-mcp doctor
+ato-mcp stats
 ```
 
-This downloads the embedding model and prebuilt index (~700 MB) into
-`$XDG_DATA_HOME/ato-mcp/` (Linux/macOS) or `%LOCALAPPDATA%\ato-mcp\`
-(Windows). Override with `ATO_MCP_DATA_DIR`.
+The Rust client does not read GitHub token environment variables and does
+not shell out to `gh`. If release assets are private, use an approved
+mirror via `ATO_MCP_RELEASES_URL` or install from an offline bundle.
 
-If `init` fails with a signature error, the release probably has no
-`.minisig` yet (v0.1 ships unsigned). Re-run with signatures disabled:
+## Register With The MCP Host
 
-```bash
-ATO_MCP_INSECURE=1 ato-mcp init
-```
-
-## Register with the MCP host
-
-**Claude Code:**
+Claude Code:
 
 ```bash
 claude mcp add --scope user ato -- ato-mcp serve
-claude mcp list                 # confirm 'ato' is registered
+claude mcp list
 ```
 
-Inside Claude Code, run `/mcp` to see the tools.
-
-**Claude Desktop** — edit the client config and restart:
-
-- macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
-- Windows: `%APPDATA%\Claude\claude_desktop_config.json`
+Claude Desktop:
 
 ```json
 {
@@ -92,52 +44,68 @@ Inside Claude Code, run `/mcp` to see the tools.
 }
 ```
 
-**Cursor / Continue / other stdio MCP clients** — register a new MCP
-server with `command: ato-mcp`, `args: ["serve"]`. Consult the client's
-MCP docs for the exact file.
+Cursor, Continue, and other stdio MCP clients use the same command:
+
+```text
+ato-mcp serve
+```
 
 ## Verify
 
 ```bash
-ato-mcp stats       # should print non-zero documents + chunks
-ato-mcp doctor      # verifies the DB opens
+ato-mcp stats
+ato-mcp doctor
+ato-mcp search "research and development tax incentive eligibility" --k 5
 ```
 
-Then inside the host client, invoke the `ato.search` tool with a plain
-English query like `"research and development tax incentive eligibility"`
-and confirm you get back a table of hits with `canonical_url` links.
+Inside the MCP host, invoke `ato.search` and confirm results include
+`canonical_url` links.
 
-## Routine maintenance
+## Routine Maintenance
 
 Weekly:
 
 ```bash
-ato-mcp update      # typical: 2-5 MB transferred
+ato-mcp update
+ato-mcp doctor
 ```
 
-If something breaks after an update:
+Rollback:
 
 ```bash
 ato-mcp doctor --rollback
 ```
 
+## Search Policy
+
+Default search is intentionally current-guidance-first:
+
+- `Edited_private_advice` is excluded unless explicitly requested in
+  `types`.
+- Non-legislation documents dated before `2000-01-01` are excluded unless
+  `include_old=true`.
+- Legislation is exempt from the old-content rule.
+
+## Maintainer-Only Work
+
+Python is maintainer tooling only. Use it only on a machine that has the
+source corpus, model files, and a GPU-backed ONNX Runtime setup.
+
+Do not run `refresh-source`, `catch-up`, `build-index`, or `release` on a
+user install. Those commands require the maintainer checkout and model
+assets.
+
 ## Don'ts
 
-- **Don't** edit files under `$XDG_DATA_HOME/ato-mcp/live/` manually.
-  The updater expects specific content-hash invariants.
-- **Don't** run two `ato-mcp update` processes simultaneously — the
-  advisory lock rejects the second, but you'd still be burning bandwidth.
-- **Don't** use the `build-index` / `release` / `refresh-source`
-  subcommands on a user install. Those are for the maintainer only and
-  require GPU + a working ato_pages scrape.
+- Do not edit files under `$XDG_DATA_HOME/ato-mcp/live/` manually.
+- Do not run two `ato-mcp update` processes at the same time.
+- Do not paste or print local tokens. The Rust updater does not need them.
 
-## Troubleshooting hints
+## Troubleshooting
 
 | Symptom | Fix |
 |---|---|
-| `ato-mcp: command not found` | Ensure `~/.local/bin` (or `pipx`'s bin dir) is on `PATH`. `pipx ensurepath` and open a new shell. |
-| `init` hangs at 0% | The GitHub release may be empty. Check https://github.com/gunba/ato-mcp/releases |
-| `doctor` reports 0 documents | `init` didn't complete; rerun. |
-| `search` returns no hits | Confirm `stats` shows `chunks > 0`. If it shows 0, the index download was truncated — delete the data dir and re-init. |
-| Slow responses | First call per process loads the ONNX model; subsequent calls are fast. Check `stats.data_dir` is on a local disk, not a network share. |
-| "embedding model unavailable" in logs | The model file is missing or mismatched; rerun `ato-mcp init`. |
+| `ato-mcp: command not found` | Put the release binary on `PATH`. |
+| `init` cannot download release assets | Use a public release URL, an approved internal mirror, or an offline bundle. |
+| `doctor` reports zero documents | `init` did not complete; rerun after deleting the incomplete data dir. |
+| `search` returns no hits | Confirm `stats` shows `chunks > 0`; use `include_old=true` for older authorities. |

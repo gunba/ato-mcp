@@ -4,7 +4,6 @@ from __future__ import annotations
 import pytest
 
 from ato_mcp.indexer.rules import (
-    DerivedMetadata,
     RuleInputs,
     Template,
     classify,
