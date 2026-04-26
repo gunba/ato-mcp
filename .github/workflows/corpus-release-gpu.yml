@@ -23,12 +23,12 @@ jobs:
       ATO_MCP_MODE: catch_up
       ATO_MCP_RELEASE_TAG: index
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Require NVIDIA GPU
         run: |
           command -v nvidia-smi
           nvidia-smi
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - name: Install maintainer package
