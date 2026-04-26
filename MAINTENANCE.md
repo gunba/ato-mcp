@@ -72,8 +72,15 @@ After a local `build-index`:
 scripts/publish-release.sh v0.3.0 gunba/ato-mcp
 ```
 
-This uploads manifest, packs, model bundle, and offline data bundle. It
-does not build or upload Python wheels.
+This uploads manifest, packs, and the model bundle. It does not build or
+upload Python wheels, and it does not duplicate the corpus into an offline
+bundle by default.
+
+For an explicit air-gapped install package:
+
+```bash
+scripts/make-offline-bundle.sh release/ato-mcp-offline-v0.3.0.tar.zst
+```
 
 ## Health Checks
 

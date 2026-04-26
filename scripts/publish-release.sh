@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # One-shot corpus publication. Binary assets are built by
 # .github/workflows/release-binaries.yml; this script uploads the corpus
-# manifest, packs, model bundle, and optional offline data bundle.
+# manifest, packs, and model bundle. Offline bundles are built explicitly
+# with scripts/make-offline-bundle.sh for air-gapped installs; publishing
+# them by default duplicates the pack assets.
 #
 # Prereqs:
 #   - build-index has finished; release/ contains ato.db, packs/, manifest.json
@@ -27,19 +29,6 @@ echo "=> uploading manifest, packs, and model bundle"
   --repo      "$REPO" \
   --model-dir "$MODEL_DIR" \
   --overwrite
-
-echo "=> building offline data bundle"
-BUNDLE="$RELEASE_DIR/ato-mcp-offline-$TAG.tar.zst"
-"$REPO_DIR/scripts/make-offline-bundle.sh" "$BUNDLE"
-
-if compgen -G "${BUNDLE}.part*.bin" > /dev/null; then
-  BUNDLE_ASSETS=("${BUNDLE}".part*.bin)
-else
-  BUNDLE_ASSETS=("$BUNDLE")
-fi
-
-echo "=> uploading offline data bundle"
-gh release upload "$TAG" "${BUNDLE_ASSETS[@]}" --repo "$REPO" --clobber
 
 echo "=> promoting $TAG to latest"
 gh release edit "$TAG" --repo "$REPO" --latest --prerelease=false
