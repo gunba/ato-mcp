@@ -3,6 +3,9 @@
 Standalone MCP server for local search and retrieval over the Australian
 Taxation Office legal corpus.
 
+`ato-mcp` is retrieval infrastructure, not tax advice. Always verify cited
+ATO material and apply professional judgment before relying on an answer.
+
 The installed server is a Rust binary. End users do not need Python, pip,
 pipx, uv, a compiler, `gh`, or an API key. The corpus is shipped as GitHub
 release assets and installed into the user's local data directory.
@@ -55,9 +58,7 @@ https://github.com/gunba/ato-mcp/releases/latest/download
 
 Override with `ATO_MCP_RELEASES_URL` for staging or an internal corporate
 mirror. The Rust client intentionally does not read GitHub token
-environment variables and does not shell out to `gh`. If release assets are
-private, publish them to an authenticated mirror or install from an offline
-bundle.
+environment variables and does not shell out to `gh`.
 
 ## Wire Into MCP Clients
 
@@ -163,7 +164,7 @@ python -m venv .venv
 
 LD_LIBRARY_PATH="$(find .venv/lib*/python3.*/site-packages/nvidia/ -maxdepth 2 -name lib -type d | tr '\n' ':')$LD_LIBRARY_PATH" \
   .venv/bin/ato-mcp build-index \
-  --pages-dir /home/jordan/Desktop/Projects/ato_pages \
+  --pages-dir /path/to/ato_pages \
   --out-dir ./release \
   --db-path ./release/ato.db \
   --model-path ./models/embeddinggemma/onnx/model_quantized.onnx \

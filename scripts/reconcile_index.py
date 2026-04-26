@@ -9,8 +9,8 @@ index record.
 
 Usage:
     python scripts/reconcile_index.py \\
-        --pages-dir /home/jordan/Desktop/Projects/ato_pages \\
-        --links-file /home/jordan/Desktop/Projects/ato_snapshots/deduped_links.jsonl
+        --pages-dir /path/to/ato_pages \\
+        --links-file /path/to/ato_snapshots/deduped_links.jsonl
 """
 from __future__ import annotations
 

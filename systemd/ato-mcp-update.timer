@@ -1,10 +1,10 @@
 [Unit]
-Description=ato-mcp: daily index refresh (end-user)
+Description=ato-mcp: weekly index refresh (end-user)
 
 [Timer]
-# Every day at 08:17 local time, with up to 30 min randomized delay to avoid
-# a stampede across installs that all run `ato-mcp update` at the same minute.
-OnCalendar=*-*-* 08:17:00
+# Weekly at 08:17 local time, with randomized delay to avoid a stampede
+# across installs that all run `ato-mcp update` at the same minute.
+OnCalendar=Mon *-*-* 08:17:00
 RandomizedDelaySec=30min
 Persistent=true
 Unit=ato-mcp-update.service

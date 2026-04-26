@@ -8,12 +8,13 @@ the pipeline wires together against real HTML.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import numpy as np
 import pytest
 
-ATO_PAGES = Path("/home/jordan/Desktop/Projects/ato_pages")
+ATO_PAGES = Path(os.environ.get("ATO_MCP_TEST_PAGES_DIR", "ato_pages"))
 
 
 @pytest.fixture()

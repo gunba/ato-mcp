@@ -2,7 +2,7 @@
 
 Covers the main ATO series that the v1 rule set supports, plus unmatched
 formats (legacy un-yeared rulings, consolidated/addendum suffixes) that
-correctly return ``None`` for iteration later on the main PC.
+correctly return ``None`` for later rule-set expansion.
 """
 from __future__ import annotations
 

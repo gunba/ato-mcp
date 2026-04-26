@@ -4,7 +4,7 @@ This folder ships systemd **user** timers. They install under
 `~/.config/systemd/user/` and run as your user account — no sudo
 required.
 
-## End-user install (pulls the latest release daily)
+## End-user install (pulls the latest release weekly)
 
 ```bash
 mkdir -p ~/.config/systemd/user
@@ -32,8 +32,8 @@ systemctl --user daemon-reload
 systemctl --user enable --now ato-mcp-maintainer-weekly.timer
 ```
 
-Edit the `Environment=` lines in the `.service` files if your repo
-path, ato_pages path, or model path differs from the defaults.
+Edit the `Environment=` and `ExecStart=` lines in the maintainer service if
+your repo path, ato_pages path, or model path differs from the defaults.
 
 ## Triggering manually
 

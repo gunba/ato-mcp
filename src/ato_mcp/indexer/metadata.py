@@ -230,8 +230,7 @@ def human_code_for_doc_id(doc_id: str) -> str | None:
     Returns ``None`` for formats the rule set doesn't recognise (legacy
     un-yeared IT/TD, consolidated EC/addendum suffixes, malformed paths);
     callers must tolerate nulls by leaving ``documents.human_code`` unset.
-    Growing the rules is the main-PC iteration loop per
-    ``docs/main-pc-runbook.md`` §2.
+    Grow this rule set as new ATO document ID formats are found in the corpus.
     """
     segments = [s for s in doc_id.split("/") if s]
     if len(segments) < 2:
@@ -275,5 +274,4 @@ def content_hash(markdown: str, metadata: dict[str, Any]) -> str:
             h.update(b"=")
             h.update(str(value).encode("utf-8"))
     return "sha256:" + h.hexdigest()
-
 

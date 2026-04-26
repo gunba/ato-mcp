@@ -18,14 +18,14 @@ or keyword-only release build.
 ## Weekly Local Release
 
 ```bash
-cd ~/Desktop/Projects/ato-mcp
+cd /path/to/ato-mcp
 
 python -m venv .venv
 .venv/bin/pip install -e '.[dev]'
 
 ATO_MCP_MODE=catch_up \
 ATO_MCP_REPO_DIR="$PWD" \
-ATO_MCP_PAGES_DIR="$PWD/../ato_pages" \
+ATO_MCP_PAGES_DIR="/path/to/ato_pages" \
 ATO_MCP_MODEL_DIR="$PWD/models/embeddinggemma" \
 ATO_MCP_GH_REPO=gunba/ato-mcp \
 scripts/maintainer-sync.sh
