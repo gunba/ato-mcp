@@ -1130,12 +1130,14 @@ fn format_outline(doc: &DocumentRow, entries: &[OutlineEntry]) -> String {
     out.push_str("| Ord | Chunks | Heading |\n|---:|---:|---|\n");
     for e in entries {
         let indent = "&nbsp;".repeat(e.depth.saturating_sub(1) * 2);
+        let display = if e.heading_path.is_empty() {
+            "(intro)".to_string()
+        } else {
+            escape_md(&e.heading_path)
+        };
         out.push_str(&format!(
             "| {} | {} | {}{} |\n",
-            e.start_ord,
-            e.chunk_count,
-            indent,
-            escape_md(&e.heading_path)
+            e.start_ord, e.chunk_count, indent, display
         ));
     }
     out

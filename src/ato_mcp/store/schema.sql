@@ -32,6 +32,13 @@ CREATE INDEX IF NOT EXISTS idx_doc_type ON documents(type);
 CREATE INDEX IF NOT EXISTS idx_doc_date ON documents(date);
 
 -- Chunks: text is zstd-compressed UTF-8.
+--
+-- heading_path: nearest-heading trail joined with " › ". Front-matter
+-- echoes (the document title and its " — "-separated components) are
+-- stripped at chunk emission time by chunk.strip_title_prefix, so a TR's
+-- "Ruling" section reads as "Ruling" rather than
+-- "Taxation Ruling — TR 2024/3 — … › Taxation Ruling › TR 2024/3 › Ruling".
+-- Empty string == intro chunk, before any body heading.
 CREATE TABLE IF NOT EXISTS chunks (
     chunk_id      INTEGER PRIMARY KEY,
     doc_id        TEXT NOT NULL REFERENCES documents(doc_id) ON DELETE CASCADE,

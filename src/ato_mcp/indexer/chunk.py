@@ -18,9 +18,54 @@ from typing import Iterable
 
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*?)\s*(?:\{#([^}]+)\})?\s*$")
 _ANCHOR_INLINE_RE = re.compile(r"\{#([^}]+)\}")
+_URL_HEADING_RE = re.compile(r"^/law/view/document\?docid=", re.IGNORECASE)
+_WS_RE = re.compile(r"\s+")
 
 DEFAULT_MAX_TOKENS = 900
 DEFAULT_OVERLAP_TOKENS = 120
+TITLE_SEP = " — "
+PATH_SEP = " › "
+
+
+def _norm_heading(text: str) -> str:
+    return _WS_RE.sub(" ", text.strip()).lower()
+
+
+def strip_title_prefix(heading_path: str) -> str:
+    """Drop the document title's front-matter echo from a heading path.
+
+    The chunker historically pushed the composed root_title onto the heading
+    stack and then also pushed each of its constituent leading h1/h2/h3
+    headings, producing paths like::
+
+        Taxation Ruling — TR 2024/3 — Subject › Taxation Ruling › TR 2024/3 › Ruling
+
+    This helper computes the de-duplicated form (``"Ruling"``) by:
+
+    1. Dropping any leading ``/law/view/document?docid=…`` segment (some
+       ATO pages emit a navigation anchor as a heading).
+    2. Treating the first remaining segment as the root title and building
+       a normalised component set from its ``" — "`` split.
+    3. Dropping subsequent segments while they match a component
+       (case-insensitive, whitespace-collapsed).
+
+    Pure string transform — safe to apply at chunk emission time and as a
+    one-shot rewrite over an existing ``chunks.heading_path`` column.
+    """
+    if not heading_path:
+        return ""
+    parts = heading_path.split(PATH_SEP)
+    while parts and _URL_HEADING_RE.match(parts[0].strip()):
+        parts = parts[1:]
+    if not parts:
+        return ""
+    root = parts[0]
+    parts = parts[1:]
+    components = {_norm_heading(p) for p in root.split(TITLE_SEP) if p.strip()}
+    components.add(_norm_heading(root))
+    while parts and _norm_heading(parts[0]) in components:
+        parts = parts[1:]
+    return PATH_SEP.join(parts)
 
 
 @dataclass
@@ -146,7 +191,7 @@ def chunk_markdown(
         if not body:
             continue
 
-        heading_path = _path_trail(heading_stack)
+        heading_path = strip_title_prefix(_path_trail(heading_stack))
 
         if approx_tokens(body) <= max_tokens:
             chunks.append(Chunk(ord=ord_counter, heading_path=heading_path, anchor=anchor, text=body))
