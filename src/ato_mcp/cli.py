@@ -170,7 +170,29 @@ def doctor(
 @app.command()
 def stats() -> None:
     """Print index version and counts."""
-    typer.echo(tool_module.stats(format="markdown"))
+    from .store import db as store_db
+    from .store import manifest as manifest_module
+
+    live_db = paths.db_path()
+    if not live_db.exists():
+        typer.echo("no live DB found; run `ato-mcp init` first.", err=True)
+        raise typer.Exit(code=1)
+
+    installed_manifest = paths.installed_manifest_path()
+    if installed_manifest.exists():
+        m = manifest_module.load_manifest(installed_manifest)
+        typer.echo(f"index_version: {m.index_version}")
+        typer.echo(f"created_at:    {m.created_at}")
+        typer.echo(f"packs:         {len(m.packs)}")
+
+    conn = store_db.connect(live_db, mode="ro")
+    try:
+        row = conn.execute("SELECT COUNT(*) AS n FROM documents").fetchone()
+        typer.echo(f"documents: {row['n']}")
+        row = conn.execute("SELECT COUNT(*) AS n FROM chunks").fetchone()
+        typer.echo(f"chunks:    {row['n']}")
+    finally:
+        conn.close()
 
 
 @app.command("refresh-source")
