@@ -81,6 +81,77 @@ def test_strip_title_prefix_keeps_real_body_headings() -> None:
     assert strip_title_prefix(hp) == "Division 355 › Section 355-25"
 
 
+def test_chunk_pops_same_level_siblings() -> None:
+    # Two h2s in a row should be siblings, not nested. The chunker used to
+    # only cap stack depth, leaving "## A → ## B" as A › B.
+    md = """
+## Section A
+
+Body of A.
+
+## Section B
+
+Body of B.
+
+### Sub of B
+
+Body of sub.
+"""
+    chunks = chunk_markdown(md)
+    paths = [c.heading_path for c in chunks]
+    assert "Section A" in paths
+    assert "Section B" in paths
+    assert "Section B › Sub of B" in paths
+    # The buggy pre-fix path would have been "Section A › Section B".
+    assert not any(p.startswith("Section A › Section B") for p in paths)
+
+
+def test_chunk_handles_skipped_heading_levels() -> None:
+    md = """
+# Top
+
+intro.
+
+### Deep heading
+
+Body.
+"""
+    chunks = chunk_markdown(md)
+    # Going from h1 directly to h3 should not invent placeholder ancestors.
+    paths = [c.heading_path for c in chunks]
+    assert any("Top › Deep heading" == p for p in paths)
+
+
+def test_chunk_h5_siblings_no_false_nesting() -> None:
+    # Mirrors the ATO ITAA 1997 layout: a single h1 then a flat run of h5
+    # "Note" annotations.
+    md = """
+# Income Tax Assessment Act 1997
+
+intro paragraph.
+
+##### Note 1:
+
+note one body.
+
+##### Note 2:
+
+note two body.
+
+##### Note 3:
+
+note three body.
+"""
+    chunks = chunk_markdown(md, root_title="Income Tax Assessment Act 1997")
+    paths = [c.heading_path for c in chunks]
+    assert "Note 1:" in paths
+    assert "Note 2:" in paths
+    assert "Note 3:" in paths
+    # No false nesting like "Note 1: › Note 2:".
+    for p in paths:
+        assert " › Note " not in p, f"falsely nested: {p!r}"
+
+
 def test_chunk_emits_clean_heading_path() -> None:
     md = """
 # Taxation Ruling

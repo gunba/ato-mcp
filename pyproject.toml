@@ -50,6 +50,27 @@ dev = [
     "pytest-asyncio>=0.23",
     "ruff>=0.5",
 ]
+# Maintainer-only: GPU-backed corpus build. End users run the Rust binary
+# and never load this Python package, so pinning the heavier onnxruntime-gpu
+# wheel here doesn't reach them.
+#
+# onnxruntime and onnxruntime-gpu both ship a module named ``onnxruntime``
+# and clobber each other if installed in the same environment — pip can't
+# detect the conflict because the package names are different. Install
+# this group with ``pip uninstall -y onnxruntime`` first so the GPU build
+# wins:
+#
+#     pip install -e '.[dev]'
+#     pip uninstall -y onnxruntime
+#     pip install -e '.[gpu]'
+#
+# After install, ``ort.get_available_providers()`` should list
+# ``CUDAExecutionProvider``. If it doesn't, ``LD_LIBRARY_PATH`` is missing
+# the venv's ``nvidia/*/lib`` paths — see scripts/maintainer-sync.sh for
+# how to set it.
+gpu = [
+    "onnxruntime-gpu>=1.25,<2",
+]
 
 [project.scripts]
 ato-mcp = "ato_mcp.cli:app"

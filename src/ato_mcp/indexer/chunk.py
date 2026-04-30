@@ -162,9 +162,16 @@ def chunk_markdown(
         return []
 
     sections = _split_by_heading(markdown)
+    # heading_levels parallels heading_stack so same-level siblings can pop the
+    # previous entry instead of stacking under it. The old "truncate to
+    # root_offset + level - 1" logic only capped depth, leaving siblings (e.g.
+    # consecutive ``<h5>Note 1:</h5>`` / ``<h5>Note 2:</h5>`` blocks in
+    # ITAA legislation) falsely nested under each other.
     heading_stack: list[str] = []
+    heading_levels: list[int] = []
     if root_title:
         heading_stack.append(root_title)
+        heading_levels.append(0)
 
     chunks: list[Chunk] = []
     ord_counter = 0
@@ -173,15 +180,19 @@ def chunk_markdown(
         level = section["level"]
         heading = section["heading"]
         anchor = section["anchor"]
-        # Trim stack to parent level. level==0 means content before any heading.
         if level > 0:
-            # keep root_title (if present) + up to (level-1) prior headings
-            root_offset = 1 if root_title else 0
-            heading_stack = heading_stack[: root_offset + max(level - 1, 0)]
-            # Suppress echo: if this heading is the same text as the root_title,
-            # don't append it — otherwise heading_path reads "X › X › ...".
+            # Pop siblings and descendants of the new heading. This is what
+            # converts ``<h5>Note 1:</h5>`` followed by ``<h5>Note 2:</h5>``
+            # from a false 2-deep stack into siblings.
+            while heading_levels and heading_levels[-1] >= level:
+                heading_stack.pop()
+                heading_levels.pop()
+            # Echo suppression: a leading ``<h1>`` whose text matches the
+            # composed root_title is the document's own banner — don't push
+            # it onto the path. The body still emits with the current stack.
             if not (root_title and heading.strip().lower() == root_title.strip().lower()):
                 heading_stack.append(heading)
+                heading_levels.append(level)
 
         body = _body_text(section["body"])
         if not body and level == 0:
@@ -191,7 +202,9 @@ def chunk_markdown(
         if not body:
             continue
 
-        heading_path = strip_title_prefix(_path_trail(heading_stack))
+        heading_path = _path_trail(heading_stack)
+        if root_title:
+            heading_path = strip_title_prefix(heading_path)
 
         if approx_tokens(body) <= max_tokens:
             chunks.append(Chunk(ord=ord_counter, heading_path=heading_path, anchor=anchor, text=body))

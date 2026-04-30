@@ -22,6 +22,13 @@ cd /path/to/ato-mcp
 
 python -m venv .venv
 .venv/bin/pip install -e '.[dev]'
+# Swap CPU onnxruntime for the GPU build (end-users never load this Python
+# package — they ship with the Rust binary — so the heavier wheel is
+# isolated to the maintainer venv). Both packages provide the same
+# ``onnxruntime`` module name, so the CPU one must come off first or it
+# clobbers the GPU build.
+.venv/bin/pip uninstall -y onnxruntime
+.venv/bin/pip install -e '.[gpu]'
 
 ATO_MCP_MODE=catch_up \
 ATO_MCP_REPO_DIR="$PWD" \
