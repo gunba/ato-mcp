@@ -15,6 +15,7 @@ Maintainer commands:
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -32,6 +33,31 @@ app = typer.Typer(no_args_is_help=True, add_completion=False, help=__doc__)
 @app.command()
 def serve() -> None:
     """Run the MCP stdio server."""
+    from .updater.apply import apply_update
+
+    _maybe_migrate_v4_to_v5()
+    manifest_url = f"{paths.releases_url().rstrip('/')}/manifest.json"
+    sig_url = manifest_url + ".minisig"
+    pubkey = _bundled_pubkey_path()
+    try:
+        stats = apply_update(
+            manifest_url=manifest_url,
+            sig_url=sig_url if pubkey and pubkey.exists() else None,
+            pubkey_path=pubkey,
+        )
+        typer.echo(
+            f"ato-mcp serve: update complete +{stats.added} ~{stats.changed} "
+            f"-{stats.removed} ({stats.bytes_downloaded / 1_000_000:.2f} MB downloaded)",
+            err=True,
+        )
+    except Exception as exc:  # noqa: BLE001 — serve can fall back to an installed corpus
+        if not paths.db_path().exists():
+            raise
+        typer.echo(
+            f"ato-mcp serve: update failed; serving installed corpus: {exc}",
+            err=True,
+        )
+
     from .server import run
     run()
 
@@ -305,13 +331,27 @@ def build_index(
     pages_dir: Path = typer.Option(..., help="Directory produced by refresh-source (contains index.jsonl)."),
     out_dir: Path = typer.Option(Path("./release"), help="Where to write manifest.json + packs/."),
     db_path: Path = typer.Option(Path("./release/ato.db")),
-    model_path: Path = typer.Option(..., help="Path to embeddinggemma ONNX file."),
-    tokenizer_path: Path = typer.Option(..., help="Path to tokenizer.json."),
+    model_path: Optional[Path] = typer.Option(None, help="Path to embeddinggemma ONNX file."),
+    tokenizer_path: Optional[Path] = typer.Option(None, help="Path to tokenizer.json."),
     model_id: str = typer.Option("embeddinggemma-300m-int8-256d"),
     model_url: Optional[str] = typer.Option(None),
     previous_manifest: Optional[Path] = typer.Option(None, help="Previous manifest for incremental reuse."),
     limit: Optional[int] = typer.Option(None, help="Cap documents processed (for testing)."),
+    embedder: str = typer.Option(
+        "embeddinggemma",
+        help="Vectorizer: embeddinggemma or lexical-hash-rust.",
+    ),
     encode_batch_size: int = typer.Option(64, help="Embedding batch size. Bump for GPU."),
+    max_batch_tokens: int = typer.Option(8192, help="Approx padded tokens allowed in one inference call."),
+    workers: int = typer.Option(max(1, (os.cpu_count() or 2) - 1), help="HTML extraction workers."),
+    window_docs: int = typer.Option(20_000, help="Documents prepared per build window."),
+    checkpoint_every: int = typer.Option(1_000_000_000, help="Prepared records per transaction checkpoint."),
+    unsafe_fast_sqlite: bool = typer.Option(
+        False,
+        help="Use scratch-build SQLite pragmas that favor speed over crash recovery.",
+    ),
+    zstd_level: int = typer.Option(3, help="zstd level for chunk and pack compression."),
+    pack_target_mb: int = typer.Option(64, help="Approx uncompressed payload per pack."),
     gpu: bool = typer.Option(False, "--gpu/--cpu", help="Use CUDAExecutionProvider when available."),
 ) -> None:
     """Maintainer: build a fresh index + packs + manifest from ``ato_pages/``."""
@@ -319,8 +359,15 @@ def build_index(
     from .indexer.build import build as run_build
     from .store.manifest import sha256_file
 
-    model_sha = sha256_file(model_path)
-    model_size = model_path.stat().st_size
+    if embedder not in {"embeddinggemma", "lexical-hash-rust"}:
+        raise typer.BadParameter("embedder must be embeddinggemma or lexical-hash-rust")
+    if embedder == "embeddinggemma" and (model_path is None or tokenizer_path is None):
+        raise typer.BadParameter("--model-path and --tokenizer-path are required for embeddinggemma")
+    if embedder == "lexical-hash-rust" and model_id == "embeddinggemma-300m-int8-256d":
+        model_id = "lexical-hash-rust-v1-256d"
+
+    model_sha = sha256_file(model_path) if model_path is not None else ""
+    model_size = model_path.stat().st_size if model_path is not None else 0
     providers: tuple[str, ...] | None = None
     if gpu:
         providers = ("CUDAExecutionProvider", "CPUExecutionProvider")
@@ -336,8 +383,16 @@ def build_index(
         model_size=model_size,
         previous_manifest=previous_manifest,
         limit=limit,
+        embedder=embedder,  # type: ignore[arg-type]
         encode_batch_size=encode_batch_size,
+        max_batch_tokens=max_batch_tokens,
         providers=providers,
+        workers=workers,
+        window_docs=window_docs,
+        checkpoint_every=checkpoint_every,
+        unsafe_fast_sqlite=unsafe_fast_sqlite,
+        zstd_level=zstd_level,
+        pack_target_size=pack_target_mb * 1024 * 1024,
     )
     manifest = run_build(args)
     typer.echo(

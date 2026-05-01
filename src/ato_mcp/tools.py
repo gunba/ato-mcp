@@ -14,6 +14,7 @@ from typing import Any, Literal
 import zstandard as zstd
 
 from . import formatters
+from .embed.lexical import query_lexical_hash
 from .embed.model import EmbeddingModel, vec_to_bytes
 from .store import db as store_db
 from .store.queries import (
@@ -242,8 +243,11 @@ def _fts_query(query: str) -> str:
     return " ".join(f'"{t}"' for t in tokens)
 
 
-def _encode_query(query: str) -> bytes:
+def _encode_query(conn: sqlite3.Connection, query: str) -> bytes:
     backend = get_backend()
+    model_id = store_db.get_meta(conn, "embedding_model_id") or ""
+    if model_id.startswith("lexical-hash-rust"):
+        return query_lexical_hash(query)
     if backend.model is None:
         return b""
     encoded = backend.model.encode([query], is_query=True)
@@ -252,14 +256,14 @@ def _encode_query(query: str) -> bytes:
 
 def _vec_search(
     conn: sqlite3.Connection,
-    model: EmbeddingModel,
+    model: EmbeddingModel | None,
     query: str,
     *,
     limit: int,
     filter_sql: str,
     filter_params: list[Any],
 ) -> list[tuple[int, float]]:
-    q_vec = _encode_query(query)
+    q_vec = _encode_query(conn, query)
     if not q_vec:
         return []
     where = f"AND {filter_sql}" if filter_sql else ""
@@ -349,7 +353,7 @@ def search(
         fts_hits = _fts_search(
             backend.db, query, limit=internal_k, filter_sql=filter_sql, filter_params=filter_params
         )
-    if mode in ("hybrid", "vector") and backend.model is not None:
+    if mode in ("hybrid", "vector"):
         vec_hits = _vec_search(
             backend.db, backend.model, query, limit=internal_k,
             filter_sql=filter_sql, filter_params=filter_params,

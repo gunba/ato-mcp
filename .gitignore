@@ -18,6 +18,7 @@ models/
 release/
 release_full/
 release-v*/
+release-prod-fast*/
 ato_pages/
 *.onnx
 *.onnx_data

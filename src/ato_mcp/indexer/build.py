@@ -15,16 +15,21 @@ document's ``content_hash`` is unchanged, the existing pack slot is reused.
 from __future__ import annotations
 
 import json
+import logging
+import os
+import shutil
 import struct
 import time
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, Literal
 
 import numpy as np
 import zstandard as zstd
 
+from ..embed.lexical import rust_lexical_hash
 from ..embed.model import EmbeddingModel, vec_to_bytes
 from ..store import db as store_db
 from ..store.manifest import DocRef, Manifest, ModelInfo, PackInfo, load_manifest
@@ -41,7 +46,14 @@ from . import chunk as chunk_mod
 from . import extract as extract_mod
 from . import metadata as meta_mod
 from . import rules as rules_mod
-from .pack import TRAILER_MAGIC, PackBuilder, PackedDocRef, encode_embedding
+from .pack import (
+    PACK_TARGET_SIZE,
+    TRAILER_MAGIC,
+    PackBuilder,
+    PackWriter,
+    PackedDocRef,
+    encode_embedding,
+)
 
 LOGGER = get_logger(__name__)
 
@@ -52,6 +64,11 @@ BASE_URL = "https://www.ato.gov.au"
 # checkpoint become immutable on disk and are picked up on restart.
 CHECKPOINT_EVERY = 1000
 
+INSERT_CHUNK_WITH_ID = """
+INSERT INTO chunks (chunk_id, doc_id, ord, heading_path, anchor, text)
+VALUES (?, ?, ?, ?, ?, ?)
+"""
+
 
 @dataclass
 class BuildArgs:
@@ -59,18 +76,229 @@ class BuildArgs:
     out_dir: Path  # receives manifest.json + packs/
     db_path: Path  # new ato.db
     model_id: str
-    model_path: Path
-    tokenizer_path: Path
+    model_path: Path | None
+    tokenizer_path: Path | None
     model_url: str | None = None
     model_sha256: str | None = None
     model_size: int | None = None
     previous_manifest: Path | None = None
     limit: int | None = None  # optional cap for testing
+    embedder: Literal["embeddinggemma", "lexical-hash-rust"] = "embeddinggemma"
     encode_batch_size: int = 64
+    max_batch_tokens: int = 8192
     providers: tuple[str, ...] | None = None  # ORT execution providers override
+    workers: int = max(1, (os.cpu_count() or 2) - 1)
+    window_docs: int = 20_000
+    checkpoint_every: int = CHECKPOINT_EVERY
+    unsafe_fast_sqlite: bool = False
+    zstd_level: int = 3
+    pack_target_size: int = PACK_TARGET_SIZE
+
+
+@dataclass
+class PreparedChunk:
+    ord: int
+    heading_path: str
+    anchor: str | None
+    text: str
+
+
+@dataclass
+class PreparedDoc:
+    doc_id: str
+    category: str
+    title: str
+    date: str | None
+    downloaded_at: str
+    content_hash: str
+    headings_text: str
+    anchors: list[tuple[str, str]]
+    chunks: list[PreparedChunk]
+
+
+@dataclass
+class EmptyShell:
+    doc_id: str
+
+
+Prepared = PreparedDoc | EmptyShell | None
+
+
+@dataclass
+class FastPackBuilder(PackBuilder):
+    zstd_level: int = 3
+
+    def _new_writer(self) -> PackWriter:
+        tmp = Path(self.out_dir) / f".pack-writing-{len(self._packs):04d}.bin.zst.tmp"
+        writer = PackWriter(path=tmp, level=self.zstd_level)
+        writer.__enter__()
+        return writer
+
+
+@dataclass
+class WindowTimings:
+    prepare: float = 0.0
+    embed: float = 0.0
+    write: float = 0.0
+    manifest: float = 0.0
+
+
+def _build_fresh_windowed(args: BuildArgs) -> Manifest:
+    _reset_fresh_outputs(args.out_dir, args.db_path)
+    packs_dir = args.out_dir / "packs"
+    packs_dir.mkdir(parents=True, exist_ok=True)
+
+    conn = store_db.init_db(args.db_path)
+    if args.unsafe_fast_sqlite:
+        _apply_unsafe_fast_sqlite_pragmas(conn)
+
+    model_id = _effective_model_id(args)
+    store_db.set_meta(conn, "embedding_model_id", model_id)
+    store_db.set_meta(conn, "index_version", _today_version())
+
+    model: EmbeddingModel | None = None
+    if args.embedder == "embeddinggemma":
+        if args.model_path is None or args.tokenizer_path is None:
+            raise ValueError("--model-path and --tokenizer-path are required for embeddinggemma builds")
+        model = EmbeddingModel(
+            model_path=args.model_path,
+            tokenizer_path=args.tokenizer_path,
+            providers=args.providers,
+        )
+
+    pack_builder = FastPackBuilder(
+        out_dir=packs_dir,
+        target_size=args.pack_target_size,
+        zstd_level=args.zstd_level,
+    )
+    doc_refs: list[DocRef] = []
+    timings = WindowTimings()
+    seen = docs_count = empty_shells = chunks_count = tokens_seen = windows = 0
+    since_checkpoint = 0
+    t0 = time.monotonic()
+
+    index_records = _iter_index(args.pages_dir)
+    if args.limit is not None:
+        index_records = _take(index_records, args.limit)
+
+    conn.execute("BEGIN")
+    try:
+        for window in _windowed(index_records, args.window_docs):
+            windows += 1
+            seen += len(window)
+            phase = time.monotonic()
+            prepared = _prepare_window(args.pages_dir, window, args.workers)
+            timings.prepare += time.monotonic() - phase
+
+            docs = [item for item in prepared if isinstance(item, PreparedDoc)]
+            empties = [item for item in prepared if isinstance(item, EmptyShell)]
+            docs_count += len(docs)
+            empty_shells += len(empties)
+
+            texts: list[str] = []
+            doc_chunk_ranges: list[tuple[PreparedDoc, int, int]] = []
+            for doc in docs:
+                start = len(texts)
+                texts.extend(c.text for c in doc.chunks)
+                doc_chunk_ranges.append((doc, start, len(texts)))
+            chunks_count += len(texts)
+
+            phase = time.monotonic()
+            if texts and args.embedder == "embeddinggemma":
+                assert model is not None
+                encoded = _encode_length_bucketed(
+                    model,
+                    texts,
+                    batch_size=args.encode_batch_size,
+                    max_batch_tokens=args.max_batch_tokens,
+                )
+                vectors_i8 = encoded.vectors_int8
+                tokens_seen += encoded.tokens_seen
+            elif texts and args.embedder == "lexical-hash-rust":
+                vectors_i8 = rust_lexical_hash(texts, binary_dir=args.out_dir / ".build")
+                tokens_seen += _cheap_token_estimate(texts)
+            else:
+                vectors_i8 = np.empty((0, store_db.EMBEDDING_DIM), dtype=np.int8)
+            timings.embed += time.monotonic() - phase
+
+            phase = time.monotonic()
+            _write_window(
+                conn=conn,
+                pack_builder=pack_builder,
+                doc_refs=doc_refs,
+                doc_chunk_ranges=doc_chunk_ranges,
+                empties=empties,
+                vectors_i8=vectors_i8,
+                zstd_level=args.zstd_level,
+            )
+            timings.write += time.monotonic() - phase
+
+            since_checkpoint += len(prepared)
+            if since_checkpoint >= args.checkpoint_every:
+                _checkpoint(conn, pack_builder, doc_refs)
+                since_checkpoint = 0
+
+            elapsed = time.monotonic() - t0
+            LOGGER.info(
+                "window=%d seen=%d docs=%d empty_shells=%d chunks=%d elapsed=%.1fs docs/s=%.1f",
+                windows,
+                seen,
+                docs_count,
+                empty_shells,
+                chunks_count,
+                elapsed,
+                seen / elapsed if elapsed else 0.0,
+            )
+
+        _checkpoint(conn, pack_builder, doc_refs)
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+    phase = time.monotonic()
+    doc_refs_final = _load_doc_refs_from_db(conn, [packs_dir])
+    packs = _scan_packs_dir(packs_dir)
+    manifest = Manifest(
+        index_version=_today_version(),
+        created_at=datetime.now(timezone.utc).isoformat(),
+        model=ModelInfo(
+            id=model_id,
+            sha256=args.model_sha256 or "",
+            size=args.model_size or 0,
+            url=args.model_url or f"model/{model_id}.onnx.zst",
+        ),
+        documents=doc_refs_final,
+        packs=packs,
+    )
+    (args.out_dir / "manifest.json").write_bytes(manifest.to_bytes())
+    timings.manifest += time.monotonic() - phase
+
+    total = time.monotonic() - t0
+    LOGGER.info(
+        "Indexed %d docs, %d chunks, %d empty shells in %.1fs "
+        "(prepare=%.1fs embed=%.1fs write=%.1fs manifest=%.1fs tokens=%d)",
+        len(doc_refs_final),
+        chunks_count,
+        empty_shells,
+        total,
+        timings.prepare,
+        timings.embed,
+        timings.write,
+        timings.manifest,
+        tokens_seen,
+    )
+    return manifest
 
 
 def build(args: BuildArgs) -> Manifest:
+    if args.previous_manifest is None:
+        return _build_fresh_windowed(args)
+
+    if args.embedder != "embeddinggemma":
+        raise ValueError("incremental previous-manifest builds currently require --embedder embeddinggemma")
+    if args.model_path is None or args.tokenizer_path is None:
+        raise ValueError("--model-path and --tokenizer-path are required for embeddinggemma builds")
+
     args.out_dir.mkdir(parents=True, exist_ok=True)
     packs_dir = args.out_dir / "packs"
     packs_dir.mkdir(parents=True, exist_ok=True)
@@ -110,7 +338,7 @@ def build(args: BuildArgs) -> Manifest:
         tokenizer_path=args.tokenizer_path,
         providers=args.providers,
     )
-    pack_builder = PackBuilder(out_dir=packs_dir)
+    pack_builder = PackBuilder(out_dir=packs_dir, target_size=args.pack_target_size)
 
     doc_refs: list[DocRef] = []
     reused_pack_shas: set[str] = set()
@@ -353,6 +581,288 @@ def _backfill_pack_slots(
             "UPDATE documents SET pack_sha8 = ? WHERE doc_id = ?",
             (ref.pack_sha8, ref.doc_id),
         )
+
+
+def _reset_fresh_outputs(out_dir: Path, db_path: Path) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if db_path.exists():
+        db_path.unlink()
+    manifest = out_dir / "manifest.json"
+    if manifest.exists():
+        manifest.unlink()
+    packs_dir = out_dir / "packs"
+    if packs_dir.exists():
+        shutil.rmtree(packs_dir)
+    build_dir = out_dir / ".build"
+    if build_dir.exists():
+        shutil.rmtree(build_dir)
+
+
+def _effective_model_id(args: BuildArgs) -> str:
+    if args.embedder == "lexical-hash-rust" and args.model_id == "embeddinggemma-300m-int8-256d":
+        return "lexical-hash-rust-v1-256d"
+    return args.model_id
+
+
+def _apply_unsafe_fast_sqlite_pragmas(conn) -> None:
+    conn.execute("PRAGMA journal_mode = OFF")
+    conn.execute("PRAGMA synchronous = OFF")
+    conn.execute("PRAGMA locking_mode = EXCLUSIVE")
+    conn.execute("PRAGMA cache_size = -1048576")
+    conn.execute("PRAGMA temp_store = MEMORY")
+
+
+def _prepare_window(pages_dir: Path, records: list[dict], workers: int) -> list[Prepared]:
+    items = ((pages_dir, rec) for rec in records)
+    if workers <= 1:
+        return [_prepare_one(item) for item in items]
+    with ProcessPoolExecutor(max_workers=workers, initializer=_prepare_worker_init) as pool:
+        return list(pool.map(_prepare_one, items, chunksize=32))
+
+
+def _prepare_worker_init() -> None:
+    logging.getLogger("ato_mcp.indexer.metadata").setLevel(logging.ERROR)
+
+
+def _prepare_one(item: tuple[Path, dict]) -> Prepared:
+    pages_dir, rec = item
+    canonical_id = rec["canonical_id"]
+    doc_id = meta_mod.doc_id_for(canonical_id)
+    category = meta_mod.category_from_path(rec.get("payload_path"))
+    if category == "Unknown":
+        category = meta_mod.category_for_docid(canonical_id)
+
+    status = rec.get("status")
+    has_content = status == "success"
+    markdown = ""
+    headings: list[str] = []
+    anchors: list[tuple[str, str]] = []
+    title: str | None = None
+
+    if has_content and rec.get("payload_path"):
+        payload_path = pages_dir / rec["payload_path"]
+        if payload_path.exists():
+            html = payload_path.read_text(encoding="utf-8", errors="replace")
+            extracted = extract_mod.extract(html)
+            markdown = extracted.markdown
+            headings = extracted.headings
+            anchors = extracted.anchors
+            title = extracted.title
+        else:
+            has_content = False
+
+    if has_content and not markdown.strip():
+        has_content = False
+
+    if not has_content:
+        return EmptyShell(doc_id=doc_id)
+
+    if not title:
+        title = (rec.get("title") or canonical_id).strip() or canonical_id
+
+    pub_date = meta_mod.extract_pub_date(markdown) if markdown else None
+    derived = rules_mod.derive_metadata(
+        rules_mod.RuleInputs(
+            doc_id=doc_id,
+            title=title,
+            headings=tuple(headings),
+            body_head=markdown[:3000] if markdown else "",
+            category=category,
+            pub_date=pub_date,
+        )
+    )
+    derived_title = derived.title or title
+    downloaded_at = rec.get("downloaded_at") or datetime.now(timezone.utc).isoformat()
+    meta_fields = {
+        "title": derived_title,
+        "type": category,
+        "date": derived.date,
+    }
+    content_hash = meta_mod.content_hash(markdown, meta_fields)
+    chunks = [
+        PreparedChunk(c.ord, c.heading_path, c.anchor, c.text)
+        for c in chunk_mod.chunk_markdown(markdown, root_title=title)
+    ]
+    return PreparedDoc(
+        doc_id=doc_id,
+        category=category,
+        title=derived_title,
+        date=derived.date,
+        downloaded_at=downloaded_at,
+        content_hash=content_hash,
+        headings_text=" ".join(headings),
+        anchors=anchors,
+        chunks=chunks,
+    )
+
+
+def _encode_length_bucketed(
+    model: EmbeddingModel,
+    texts: list[str],
+    *,
+    batch_size: int,
+    max_batch_tokens: int,
+):
+    from ..embed.model import EncodedBatch
+
+    if not texts:
+        return EncodedBatch(
+            vectors_int8=np.empty((0, store_db.EMBEDDING_DIM), dtype=np.int8),
+            tokens_seen=0,
+        )
+
+    lengths = [min(1024, chunk_mod.approx_tokens(t) + 16) for t in texts]
+    order = sorted(range(len(texts)), key=lengths.__getitem__)
+    vectors = np.empty((len(texts), store_db.EMBEDDING_DIM), dtype=np.int8)
+    tokens_seen = 0
+
+    pos = 0
+    while pos < len(order):
+        first_idx = order[pos]
+        max_len = lengths[first_idx]
+        end = pos + 1
+        while end < len(order) and end - pos < batch_size:
+            next_idx = order[end]
+            next_max = max(max_len, lengths[next_idx])
+            if next_max * (end - pos + 1) > max_batch_tokens:
+                break
+            max_len = next_max
+            end += 1
+
+        batch_indices = order[pos:end]
+        batch = [texts[i] for i in batch_indices]
+        encoded = model.encode(batch, is_query=False, batch_size=len(batch))
+        vectors[batch_indices, :] = encoded.vectors_int8
+        tokens_seen += encoded.tokens_seen
+        pos = end
+
+    return EncodedBatch(vectors_int8=vectors, tokens_seen=tokens_seen)
+
+
+def _write_window(
+    *,
+    conn,
+    pack_builder: PackBuilder,
+    doc_refs: list[DocRef],
+    doc_chunk_ranges: list[tuple[PreparedDoc, int, int]],
+    empties: list[EmptyShell],
+    vectors_i8: np.ndarray,
+    zstd_level: int,
+) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    if empties:
+        conn.executemany(
+            INSERT_EMPTY_SHELL,
+            [(e.doc_id, now, now, "scrape") for e in empties],
+        )
+
+    if not doc_chunk_ranges:
+        return
+
+    conn.executemany(
+        INSERT_DOCUMENT,
+        [
+            (
+                doc.doc_id,
+                doc.category,
+                doc.title,
+                doc.date,
+                doc.downloaded_at,
+                doc.content_hash,
+                "PENDING",
+            )
+            for doc, _start, _end in doc_chunk_ranges
+        ],
+    )
+    conn.executemany(
+        INSERT_TITLE_FTS,
+        [(doc.doc_id, doc.title, doc.headings_text) for doc, _start, _end in doc_chunk_ranges],
+    )
+
+    next_chunk_id = _next_chunk_id(conn)
+    chunk_rows = []
+    chunk_fts_rows = []
+    vec_rows = []
+    zstd_compressor = zstd.ZstdCompressor(level=zstd_level)
+
+    for doc, start, end in doc_chunk_ranges:
+        vectors = vectors_i8[start:end]
+        record_chunks = []
+        for local_idx, chunk in enumerate(doc.chunks):
+            chunk_id = next_chunk_id
+            next_chunk_id += 1
+            compressed_text = zstd_compressor.compress(chunk.text.encode("utf-8"))
+            chunk_rows.append(
+                (
+                    chunk_id,
+                    doc.doc_id,
+                    chunk.ord,
+                    chunk.heading_path,
+                    chunk.anchor,
+                    compressed_text,
+                )
+            )
+            chunk_fts_rows.append((chunk_id, chunk.text, chunk.heading_path))
+            vec_bytes = vec_to_bytes(vectors[local_idx])
+            vec_rows.append((chunk_id, vec_bytes))
+            record_chunks.append(
+                {
+                    "ord": chunk.ord,
+                    "heading_path": chunk.heading_path,
+                    "anchor": chunk.anchor,
+                    "text": chunk.text,
+                    "embedding_b64": encode_embedding(vec_bytes),
+                }
+            )
+
+        record = {
+            "doc_id": doc.doc_id,
+            "type": doc.category,
+            "title": doc.title,
+            "date": doc.date,
+            "downloaded_at": doc.downloaded_at,
+            "content_hash": doc.content_hash,
+            "anchors": doc.anchors,
+            "chunks": record_chunks,
+        }
+        pack_builder.add(doc.doc_id, record)
+        doc_refs.append(
+            DocRef(
+                doc_id=doc.doc_id,
+                content_hash=doc.content_hash,
+                pack_sha8="PENDING",
+                offset=0,
+                length=0,
+                type=doc.category,
+                title=doc.title,
+                has_content=True,
+            )
+        )
+
+    if chunk_rows:
+        conn.executemany(INSERT_CHUNK_WITH_ID, chunk_rows)
+        conn.executemany(INSERT_CHUNK_FTS, chunk_fts_rows)
+        conn.executemany(INSERT_VEC, vec_rows)
+
+
+def _next_chunk_id(conn) -> int:
+    row = conn.execute("SELECT COALESCE(MAX(chunk_id), 0) + 1 AS next_id FROM chunks").fetchone()
+    return int(row["next_id"])
+
+
+def _cheap_token_estimate(texts: list[str]) -> int:
+    return sum(max(1, len(text) // 4) for text in texts)
+
+
+def _windowed(items: Iterator[dict], size: int) -> Iterator[list[dict]]:
+    window: list[dict] = []
+    for item in items:
+        window.append(item)
+        if len(window) >= size:
+            yield window
+            window = []
+    if window:
+        yield window
 
 
 def _insert_from_previous(

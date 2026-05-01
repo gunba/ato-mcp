@@ -233,6 +233,8 @@ def _ensure_model(client: httpx.Client, manifest: Manifest, staging: Path) -> No
     We verify the bundle's sha256, extract into the live directory atomically.
     """
     model_info = manifest.model
+    if model_info.id.startswith("lexical-hash-rust"):
+        return
     model_live = paths.model_path()
     live_dir = model_live.parent
     installed_marker = live_dir / ".model.sha256"

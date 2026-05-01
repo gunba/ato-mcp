@@ -88,6 +88,11 @@ Cursor, Continue, and other stdio MCP clients use the same command:
 ato-mcp serve
 ```
 
+`serve` checks the latest published manifest and applies any available corpus
+update before starting the MCP stdio loop. If the update check fails but a
+local corpus is already installed, it serves the installed corpus and writes the
+startup warning to stderr so JSON-RPC stdout stays clean.
+
 ## Search Defaults
 
 Default search is tuned for current public tax-law work:
@@ -108,7 +113,8 @@ ato-mcp search "royalties withholding old cases" --include-old --types Cases
 
 ## Updates
 
-Run weekly, or whenever you want the latest published corpus:
+`ato-mcp serve` updates on startup. You can still update explicitly whenever
+you want to prefetch the latest published corpus or verify the install:
 
 ```bash
 ato-mcp update
@@ -153,8 +159,8 @@ ato-mcp/
 ## Maintainer Workflow
 
 The Rust binary is the end-user product. Python remains maintainer tooling
-for scraping, metadata extraction, GPU-backed embedding generation, pack
-building, and release publication.
+for scraping, metadata extraction, vector generation, pack building, and
+release publication.
 
 Local GPU release build:
 
@@ -179,11 +185,26 @@ LD_LIBRARY_PATH="$(find .venv/lib*/python3.*/site-packages/nvidia/ -maxdepth 2 -
   --overwrite
 ```
 
-The maintainer build must use GPU-backed embeddings. The optional
-`corpus release (gpu)` workflow targets a self-hosted runner labelled
-`gpu` and fails if `nvidia-smi` or ONNX Runtime's `CUDAExecutionProvider`
-is unavailable. It is not scheduled by default, so it does not spend hosted
-GPU minutes.
+Fast lexical release build:
+
+```bash
+.venv/bin/ato-mcp build-index \
+  --pages-dir /path/to/ato_pages \
+  --out-dir ./release \
+  --db-path ./release/ato.db \
+  --embedder lexical-hash-rust \
+  --workers 8 \
+  --window-docs 20000 \
+  --pack-target-mb 64 \
+  --checkpoint-every 1000000000 \
+  --unsafe-fast-sqlite
+```
+
+GPU-backed EmbeddingGemma builds remain available when neural vectors are
+needed. The optional `corpus release (gpu)` workflow targets a self-hosted
+runner labelled `gpu` and fails if `nvidia-smi` or ONNX Runtime's
+`CUDAExecutionProvider` is unavailable. It is not scheduled by default, so it
+does not spend hosted GPU minutes.
 
 ## Development
 

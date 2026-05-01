@@ -141,7 +141,10 @@ enum DocumentFormat {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Serve => serve(),
+        Command::Serve => {
+            update_before_serve()?;
+            serve()
+        }
         Command::Init { manifest_url } => {
             let url = manifest_url.unwrap_or_else(default_manifest_url);
             let stats = apply_update(&url)?;
@@ -1377,6 +1380,30 @@ fn apply_update(manifest_url: &str) -> Result<UpdateStats> {
     result
 }
 
+fn update_before_serve() -> Result<()> {
+    let url = default_manifest_url();
+    match apply_update(&url) {
+        Ok(stats) => {
+            eprintln!(
+                "ato-mcp serve: update complete (+{} ~{} -{}, {:.2} MB downloaded)",
+                stats.added,
+                stats.changed,
+                stats.removed,
+                stats.bytes_downloaded as f64 / 1_000_000.0
+            );
+            Ok(())
+        }
+        Err(err) => {
+            if db_path()?.exists() {
+                eprintln!("ato-mcp serve: update failed; serving installed corpus: {err}");
+                Ok(())
+            } else {
+                Err(err).context("ato-mcp serve could not install the corpus before startup")
+            }
+        }
+    }
+}
+
 fn apply_update_locked(manifest_url: &str) -> Result<UpdateStats> {
     let staging = staging_dir()?;
     let manifest_context = UrlContext::from_manifest_url(manifest_url);
@@ -1646,6 +1673,9 @@ fn verify_sha256_file(path: &Path, expected: &str) -> Result<()> {
 }
 
 fn ensure_model(manifest: &Manifest, context: &UrlContext, staging: &Path) -> Result<()> {
+    if manifest.model.id.starts_with("lexical-hash-rust") {
+        return Ok(());
+    }
     let live_model = model_path()?;
     let tokenizer = tokenizer_path()?;
     let marker = live_dir()?.join(".model.sha256");

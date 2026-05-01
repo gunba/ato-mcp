@@ -43,7 +43,7 @@ from ..store.db import EMBEDDING_DIM
 
 TRAILER_MAGIC = b"ATOPK\x01"
 RECORD_LEN = struct.Struct("<I")  # uint32 little-endian
-PACK_TARGET_SIZE = 10 * 1024 * 1024  # 10 MB uncompressed record payload before zstd
+PACK_TARGET_SIZE = 64 * 1024 * 1024  # 64 MB uncompressed record payload before zstd
 
 
 def encode_embedding(raw_bytes: bytes) -> str:
