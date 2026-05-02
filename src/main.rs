@@ -396,6 +396,10 @@ fn open_read() -> Result<Connection> {
 
 fn open_write() -> Result<Connection> {
     let path = db_path()?;
+    open_write_at(&path)
+}
+
+fn open_write_at(path: &Path) -> Result<Connection> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -2057,10 +2061,14 @@ fn apply_update_locked(manifest_url: &str) -> Result<UpdateStats> {
 
     let db = db_path()?;
     let had_existing_db = db.exists();
-    let conn = open_write()?;
-    init_db(&conn)?;
     let (added, mut changed, removed) = diff_manifests(old_manifest.as_ref(), &new_manifest);
-    if semantic_backfill_required(&conn, &new_manifest)? {
+    let semantic_backfill = if had_existing_db {
+        let conn = open_read()?;
+        semantic_backfill_required(&conn, &new_manifest)?
+    } else {
+        false
+    };
+    if semantic_backfill {
         let added_ids = added
             .iter()
             .map(|doc| doc.doc_id.as_str())
@@ -2072,6 +2080,29 @@ fn apply_update_locked(manifest_url: &str) -> Result<UpdateStats> {
             .cloned()
             .collect();
     }
+
+    if !had_existing_db
+        || semantic_backfill
+        || whole_corpus_replacement(
+            old_manifest.as_ref(),
+            &new_manifest,
+            &added,
+            &changed,
+            &removed,
+        )
+    {
+        return rebuild_live_db_from_manifest(
+            &new_manifest,
+            &manifest_context,
+            manifest_bytes.len() as u64,
+            added.len(),
+            changed.len(),
+            removed.len(),
+        );
+    }
+
+    let conn = open_write()?;
+    init_db(&conn)?;
 
     let backup = backups_dir()?.join("ato.db.prev");
     if had_existing_db {
@@ -2088,36 +2119,18 @@ fn apply_update_locked(manifest_url: &str) -> Result<UpdateStats> {
             delete_doc(&tx, &doc.doc_id)?;
         }
 
-        let mut pack_to_refs: HashMap<String, Vec<DocRef>> = HashMap::new();
-        for doc in added.iter().chain(changed.iter()) {
-            pack_to_refs
-                .entry(doc.pack_sha8.clone())
-                .or_default()
-                .push(doc.clone());
-        }
-        let pack_index: HashMap<String, PackInfo> = new_manifest
-            .packs
+        let docs_to_insert = added
             .iter()
-            .map(|p| (p.sha8.clone(), p.clone()))
-            .collect();
-        for (sha8, refs) in pack_to_refs {
-            let info = pack_index
-                .get(&sha8)
-                .ok_or_else(|| anyhow!("manifest missing pack info for {sha8}"))?;
-            let pack_url = resolve_manifest_asset(&info.url, &manifest_context);
-            let pack_bytes = fetch_bytes(&pack_url, &manifest_context)
-                .with_context(|| format!("fetching pack {}", info.url))?;
-            if !info.sha256.is_empty() {
-                verify_sha256_bytes(&pack_bytes, &info.sha256)
-                    .with_context(|| format!("verifying {}", info.url))?;
-            }
-            bytes_downloaded += pack_bytes.len() as u64;
-            for doc_ref in refs {
-                let record =
-                    read_record_from_pack_bytes(&pack_bytes, doc_ref.offset, doc_ref.length)?;
-                insert_record(&tx, &record, &doc_ref)?;
-            }
-        }
+            .chain(changed.iter())
+            .cloned()
+            .collect::<Vec<_>>();
+        insert_docs_from_packs(
+            &tx,
+            &new_manifest,
+            &manifest_context,
+            &docs_to_insert,
+            &mut bytes_downloaded,
+        )?;
         set_meta(&tx, "index_version", &new_manifest.index_version)?;
         set_meta(&tx, "embedding_model_id", &new_manifest.model.id)?;
         set_meta(&tx, "last_update_at", &Utc::now().to_rfc3339())?;
@@ -2141,6 +2154,137 @@ fn apply_update_locked(manifest_url: &str) -> Result<UpdateStats> {
         removed: removed.len(),
         bytes_downloaded,
     })
+}
+
+fn whole_corpus_replacement(
+    old: Option<&Manifest>,
+    new_manifest: &Manifest,
+    added: &[DocRef],
+    changed: &[DocRef],
+    removed: &[String],
+) -> bool {
+    old.is_some()
+        && removed.is_empty()
+        && !new_manifest.documents.is_empty()
+        && added.len() + changed.len() == new_manifest.documents.len()
+}
+
+fn rebuild_live_db_from_manifest(
+    manifest: &Manifest,
+    context: &UrlContext,
+    manifest_bytes: u64,
+    added: usize,
+    changed: usize,
+    removed: usize,
+) -> Result<UpdateStats> {
+    let staging_root = staging_dir()?.join("corpus-rebuild");
+    if staging_root.exists() {
+        fs::remove_dir_all(&staging_root)?;
+    }
+    fs::create_dir_all(&staging_root)?;
+    let staged_db = staging_root.join("ato.db");
+    let conn = open_write_at(&staged_db)?;
+    init_db(&conn)?;
+
+    let mut bytes_downloaded = manifest_bytes;
+    let tx = conn.unchecked_transaction()?;
+    let apply_result = (|| -> Result<()> {
+        insert_docs_from_packs(
+            &tx,
+            manifest,
+            context,
+            &manifest.documents,
+            &mut bytes_downloaded,
+        )?;
+        set_meta(&tx, "index_version", &manifest.index_version)?;
+        set_meta(&tx, "embedding_model_id", &manifest.model.id)?;
+        set_meta(&tx, "last_update_at", &Utc::now().to_rfc3339())?;
+        verify_semantic_install(&tx, manifest)?;
+        Ok(())
+    })();
+    if let Err(err) = apply_result {
+        tx.rollback()?;
+        return Err(err);
+    }
+    tx.commit()?;
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+    drop(conn);
+
+    replace_live_db(&staged_db)?;
+    let manifest_json = serde_json::to_vec_pretty(manifest)?;
+    fs::write(installed_manifest_path()?, manifest_json)?;
+    let _ = fs::remove_dir_all(&staging_root);
+
+    Ok(UpdateStats {
+        added,
+        changed,
+        removed,
+        bytes_downloaded,
+    })
+}
+
+fn replace_live_db(staged_db: &Path) -> Result<()> {
+    let live = live_dir()?;
+    let db = db_path()?;
+    let backup = backups_dir()?.join("ato.db.prev");
+    if db.exists() {
+        fs::copy(&db, &backup)?;
+    }
+    for suffix in ["-wal", "-shm"] {
+        let path = live.join(format!("ato.db{suffix}"));
+        if path.exists() {
+            fs::remove_file(path)?;
+        }
+    }
+    if db.exists() {
+        fs::remove_file(&db)?;
+    }
+    fs::rename(staged_db, &db).or_else(|err| {
+        if backup.exists() {
+            let _ = fs::copy(&backup, &db);
+        }
+        Err(err)
+    })?;
+    Ok(())
+}
+
+fn insert_docs_from_packs(
+    conn: &Connection,
+    manifest: &Manifest,
+    context: &UrlContext,
+    docs: &[DocRef],
+    bytes_downloaded: &mut u64,
+) -> Result<()> {
+    let mut pack_to_refs: HashMap<String, Vec<DocRef>> = HashMap::new();
+    for doc in docs {
+        pack_to_refs
+            .entry(doc.pack_sha8.clone())
+            .or_default()
+            .push(doc.clone());
+    }
+    let pack_index: HashMap<String, PackInfo> = manifest
+        .packs
+        .iter()
+        .map(|p| (p.sha8.clone(), p.clone()))
+        .collect();
+    for (sha8, refs) in pack_to_refs {
+        let info = pack_index
+            .get(&sha8)
+            .ok_or_else(|| anyhow!("manifest missing pack info for {sha8}"))?;
+        let pack_url = resolve_manifest_asset(&info.url, context);
+        let pack_bytes = fetch_bytes(&pack_url, context)
+            .with_context(|| format!("fetching pack {}", info.url))?;
+        if !info.sha256.is_empty() {
+            verify_sha256_bytes(&pack_bytes, &info.sha256)
+                .with_context(|| format!("verifying {}", info.url))?;
+        }
+        *bytes_downloaded += pack_bytes.len() as u64;
+        for doc_ref in refs {
+            let record = read_record_from_pack_bytes(&pack_bytes, doc_ref.offset, doc_ref.length)?;
+            insert_record(conn, &record, &doc_ref)?;
+        }
+    }
+    Ok(())
 }
 
 fn semantic_backfill_required(conn: &Connection, manifest: &Manifest) -> Result<bool> {
