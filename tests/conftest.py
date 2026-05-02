@@ -14,8 +14,10 @@ def tmp_data_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 @pytest.fixture(autouse=True)
 def _clean_backend():
-    """Reset the process-wide Backend singleton between tests."""
+    """Reset process-wide singletons (Backend + SeenTracker) between tests."""
     from ato_mcp import tools
     tools._BACKEND = None
+    tools._SEEN = None
     yield
     tools._BACKEND = None
+    tools._SEEN = None

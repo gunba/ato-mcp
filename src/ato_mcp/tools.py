@@ -34,6 +34,9 @@ SNIPPET_CHARS = 280
 # date-bearing query. Picked from tax-law practitioner intuition: a doc
 # 5 years old is roughly half as likely to be current.
 RECENCY_HALF_LIFE_YEARS = 5.0
+# Cap on per-search ``previously_seen`` echo. Bounded so a long session
+# doesn't drown the agent in suppressed-result noise.
+MAX_SEEN_ECHO = 10
 
 
 @dataclass
@@ -86,6 +89,49 @@ def get_backend() -> Backend:
             if _BACKEND is None:
                 _BACKEND = Backend.open()
     return _BACKEND
+
+
+class SeenTracker:
+    """Per-process record of chunk_ids surfaced to the agent.
+
+    MCP stdio sessions are one-per-process, so module-level state is
+    naturally session-scoped. ``search`` filters chunks already in the
+    set and echoes their handles in ``previously_seen``; ``get_chunks``
+    and ``get_document`` register chunks the moment their bodies enter
+    the agent's context.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._chunks: set[int] = set()
+
+    def __contains__(self, chunk_id: int) -> bool:
+        with self._lock:
+            return chunk_id in self._chunks
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._chunks)
+
+    def add(self, chunk_ids) -> None:
+        ids = [int(c) for c in chunk_ids]
+        if not ids:
+            return
+        with self._lock:
+            self._chunks.update(ids)
+
+
+_SEEN: SeenTracker | None = None
+_SEEN_LOCK = threading.Lock()
+
+
+def get_seen() -> SeenTracker:
+    global _SEEN
+    if _SEEN is None:
+        with _SEEN_LOCK:
+            if _SEEN is None:
+                _SEEN = SeenTracker()
+    return _SEEN
 
 
 # ---------------------------------------------------------------------------
@@ -341,12 +387,15 @@ def search(
     format: Literal["markdown", "json"] = "markdown",
 ) -> str:
     backend = get_backend()
+    seen = get_seen()
     k = max(1, min(k, MAX_K))
     filter_sql, filter_params = _build_sql_filter(
         types, date_from, date_to, doc_scope, include_old=include_old
     )
 
-    internal_k = max(k * 5, 50)
+    # Bump internal_k by |seen| so the seen filter can hide that many
+    # without starving the frontier.
+    internal_k = max(k * 5, 50) + len(seen)
     fts_hits: list[tuple[int, float]] = []
     vec_hits: list[tuple[int, float]] = []
     if mode in ("hybrid", "keyword"):
@@ -365,10 +414,21 @@ def search(
     else:
         fused = [(cid, -score) for cid, score in vec_hits]
 
+    # Split fused ranking into fresh candidates and a capped echo of the
+    # most relevant chunks the agent has already seen this session.
+    fresh: list[tuple[int, float]] = []
+    seen_ids: list[int] = []
+    for chunk_id, score in fused:
+        if chunk_id in seen:
+            if len(seen_ids) < MAX_SEEN_ECHO:
+                seen_ids.append(chunk_id)
+        else:
+            fresh.append((chunk_id, score))
+
     # Over-fetch so the recency boost can re-order the frontier before we cut.
     frontier = max(k * 2, 20) if sort_by == "relevance" else k * 3
     records: list[dict] = []
-    for chunk_id, score in fused[:frontier]:
+    for chunk_id, score in fresh[:frontier]:
         hit = _load_hit(backend.db, chunk_id)
         if hit is None:
             continue
@@ -383,10 +443,18 @@ def search(
         records.sort(key=lambda r: r.get("date") or "", reverse=True)
     records = records[:k]
 
+    seen.add(r["chunk_id"] for r in records)
+    previously_seen = _load_seen_handles(backend.db, seen_ids)
+
     payload = [_slim_hit(r) for r in records]
     if format == "json":
-        return formatters.as_json({"query": query, "mode": mode, "hits": payload})
-    return formatters.format_hits_markdown(payload)
+        return formatters.as_json({
+            "query": query,
+            "mode": mode,
+            "hits": payload,
+            "previously_seen": previously_seen,
+        })
+    return formatters.format_hits_markdown(payload, previously_seen=previously_seen)
 
 
 def _apply_recency_boost(records: list[dict], *, half_life_years: float) -> None:
@@ -413,6 +481,39 @@ def _slim_hit(hit: dict) -> dict:
         "canonical_url", "score", "chunk_id",
     )
     return {k: hit.get(k) for k in keys}
+
+
+def _load_seen_handles(conn: sqlite3.Connection, chunk_ids: list[int]) -> list[dict]:
+    """Minimal handles for chunks the agent has already seen.
+
+    No body, no snippet — just enough metadata for the agent to recognise
+    them and re-fetch via ``get_chunks`` if needed. Order preserved from
+    ``chunk_ids`` so the most fused-relevant suppressed chunk is first.
+    """
+    if not chunk_ids:
+        return []
+    placeholders = ",".join("?" * len(chunk_ids))
+    rows = conn.execute(
+        f"""
+        SELECT c.chunk_id, c.doc_id, c.heading_path, d.title, d.type
+        FROM chunks c JOIN documents d ON d.doc_id = c.doc_id
+        WHERE c.chunk_id IN ({placeholders})
+        """,
+        list(chunk_ids),
+    ).fetchall()
+    by_id = {row["chunk_id"]: row for row in rows}
+    return [
+        {
+            "chunk_id": cid,
+            "doc_id": by_id[cid]["doc_id"],
+            "title": by_id[cid]["title"],
+            "type": by_id[cid]["type"],
+            "heading_path": by_id[cid]["heading_path"] or "",
+            "canonical_url": formatters.canonical_url(by_id[cid]["doc_id"]),
+        }
+        for cid in chunk_ids
+        if cid in by_id
+    ]
 
 
 def search_titles(
@@ -503,6 +604,10 @@ def get_document(
             f"(anchor={anchor!r}, heading_path={heading_path!r}, from_ord={from_ord})._"
         )
     selected, continuation_ord = chunks
+
+    # Materialised chunks now sit in the agent's context; mark them as
+    # seen so subsequent searches don't re-surface them.
+    get_seen().add(c["chunk_id"] for c in selected)
 
     if format == "json":
         return formatters.as_json({
@@ -678,6 +783,7 @@ def get_chunks(
             "canonical_url": formatters.canonical_url(row["doc_id"]),
             "text": _decompress(row["text"]),
         })
+    get_seen().add(r["chunk_id"] for r in records)
     if format == "json":
         return formatters.as_json({"chunks": records})
     lines = []

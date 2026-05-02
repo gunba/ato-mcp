@@ -19,20 +19,48 @@ def canonical_url(doc_id: str) -> str:
     return f"{BASE_URL}/law/view/document?docid={doc_id}"
 
 
-def format_hits_markdown(hits: list[dict]) -> str:
-    if not hits:
+def format_hits_markdown(
+    hits: list[dict],
+    *,
+    previously_seen: list[dict] | None = None,
+) -> str:
+    if not hits and not previously_seen:
         return "_No matches._"
-    lines = ["| # | Title | Type | Heading | Snippet |", "|---|---|---|---|---|"]
-    for i, hit in enumerate(hits, start=1):
-        title = hit.get("title") or hit["doc_id"]
-        typ = hit.get("type") or ""
-        heading = (hit.get("heading_path") or "").replace("|", "\\|")
-        snippet = (hit.get("snippet") or "").replace("|", "\\|").replace("\n", " ")
-        lines.append(
-            f"| {i} | [{title}]({hit['canonical_url']}) `{hit['doc_id']}` "
-            f"| {typ} | {heading} | {snippet} |"
-        )
-    return "\n".join(lines)
+    parts: list[str] = []
+    if hits:
+        lines = ["| # | Title | Type | Heading | Snippet |", "|---|---|---|---|---|"]
+        for i, hit in enumerate(hits, start=1):
+            title = hit.get("title") or hit["doc_id"]
+            typ = hit.get("type") or ""
+            heading = (hit.get("heading_path") or "").replace("|", "\\|")
+            snippet = (hit.get("snippet") or "").replace("|", "\\|").replace("\n", " ")
+            lines.append(
+                f"| {i} | [{title}]({hit['canonical_url']}) `{hit['doc_id']}` "
+                f"| {typ} | {heading} | {snippet} |"
+            )
+        parts.append("\n".join(lines))
+    else:
+        parts.append("_No fresh matches._")
+    if previously_seen:
+        ids_repr = ", ".join(str(s["chunk_id"]) for s in previously_seen)
+        tail = [
+            "",
+            "---",
+            "",
+            f"_{len(previously_seen)} previously surfaced result(s) hidden:_",
+            "",
+        ]
+        for s in previously_seen:
+            heading = (s.get("heading_path") or "").replace("|", "\\|") or "(intro)"
+            title = s.get("title") or s["doc_id"]
+            tail.append(
+                f"- `{s['chunk_id']}` — [{title}]({s['canonical_url']}) "
+                f"`{s['doc_id']}` — {heading}"
+            )
+        tail.append("")
+        tail.append(f"_Re-fetch with `get_chunks([{ids_repr}])`._")
+        parts.append("\n".join(tail))
+    return "\n".join(parts)
 
 
 def format_document_outline_markdown(

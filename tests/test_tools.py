@@ -224,3 +224,59 @@ def test_canonical_url_synthesised_from_doc_id() -> None:
     assert canonical_url("TXR/TR20243/NAT/ATO/00001") == (
         "https://www.ato.gov.au/law/view/document?docid=TXR/TR20243/NAT/ATO/00001"
     )
+
+
+def test_search_hides_chunks_seen_in_prior_search(seeded_db: Path) -> None:
+    first = json.loads(tools.search("eligibility", mode="keyword", k=8, format="json"))
+    first_ids = {h["chunk_id"] for h in first["hits"]}
+    assert first_ids, first
+    assert first["previously_seen"] == []
+
+    second = json.loads(tools.search("eligibility", mode="keyword", k=8, format="json"))
+    second_ids = {h["chunk_id"] for h in second["hits"]}
+    assert not (first_ids & second_ids), (first_ids, second_ids)
+    echo_ids = {s["chunk_id"] for s in second["previously_seen"]}
+    assert first_ids <= echo_ids
+
+
+def test_search_marks_returned_chunks_as_seen(seeded_db: Path) -> None:
+    out = json.loads(tools.search("eligibility", mode="keyword", k=8, format="json"))
+    returned = {h["chunk_id"] for h in out["hits"]}
+    seen = tools.get_seen()
+    assert returned <= {cid for cid in returned if cid in seen}
+
+
+def test_get_chunks_marks_seen(seeded_db: Path) -> None:
+    first = json.loads(tools.search("eligibility", mode="keyword", k=8, format="json"))
+    chunk_ids = [h["chunk_id"] for h in first["hits"]]
+    tools._SEEN = None  # reset, simulate a fresh session that only fetches by id
+    tools.get_chunks(chunk_ids, format="json")
+    second = json.loads(tools.search("eligibility", mode="keyword", k=8, format="json"))
+    second_ids = {h["chunk_id"] for h in second["hits"]}
+    assert not (set(chunk_ids) & second_ids)
+
+
+def test_get_document_section_marks_seen(seeded_db: Path) -> None:
+    tools.get_document(DOC_TR, heading_path="Ruling > Eligibility", format="json")
+    out = json.loads(tools.search("eligibility", mode="keyword", k=8, format="json"))
+    returned_doc_paths = {(h["doc_id"], h["heading_path"]) for h in out["hits"]}
+    assert (DOC_TR, "Ruling > Eligibility") not in returned_doc_paths
+
+
+def test_get_document_outline_does_not_mark_seen(seeded_db: Path) -> None:
+    tools.get_document(DOC_TR, format="outline")
+    out = json.loads(tools.search("eligibility", mode="keyword", k=8, format="json"))
+    # Outline never materialised any chunk text, so nothing is suppressed.
+    assert any(h["doc_id"] == DOC_TR for h in out["hits"])
+    assert out["previously_seen"] == []
+
+
+def test_search_previously_seen_capped(
+    seeded_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Surface ≥2 DOC_TR chunks so the second pass has multiple to suppress.
+    first = json.loads(tools.search("eligibility", mode="keyword", k=8, format="json"))
+    assert len({h["chunk_id"] for h in first["hits"]}) >= 2
+    monkeypatch.setattr(tools, "MAX_SEEN_ECHO", 1)
+    second = json.loads(tools.search("eligibility", mode="keyword", k=8, format="json"))
+    assert len(second["previously_seen"]) == 1
