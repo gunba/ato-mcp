@@ -192,8 +192,11 @@ def publish(args: ReleaseArgs) -> None:
 
     current = load_manifest(manifest)
     if current.model.id.startswith("embeddinggemma"):
+        explicit_model_url = args.model_url is not None
         model_url = args.model_url or current.model.url
-        if _is_placeholder_model_url(model_url):
+        if _is_placeholder_model_url(model_url) or (
+            _is_github_url(model_url) and not explicit_model_url
+        ):
             model_url = EMBEDDINGGEMMA_HF_URL
             sha256 = EMBEDDINGGEMMA_HF_FINGERPRINT
             size = EMBEDDINGGEMMA_HF_SIZE
