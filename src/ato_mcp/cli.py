@@ -1,13 +1,5 @@
 """``ato-mcp`` CLI entry point.
 
-End-user commands:
-    ato-mcp serve                 MCP stdio server (spawned by Claude Code).
-    ato-mcp init                  First-run: download manifest + model + packs.
-    ato-mcp update                Pull delta against current install.
-    ato-mcp doctor                Verify DB + file hashes.
-    ato-mcp doctor --rollback     Restore previous snapshot.
-    ato-mcp stats                 Current index version + counts.
-
 Maintainer commands:
     ato-mcp refresh-source ...    Scrape (incremental | full) into ato_pages/.
     ato-mcp build-index ...       Produce ato.db + packs + manifest.json.
@@ -21,101 +13,14 @@ from typing import Optional
 
 import typer
 
-from . import tools as tool_module
 from .util import paths
 from .util.log import get_logger
 
 LOGGER = get_logger("ato_mcp.cli")
 
 app = typer.Typer(no_args_is_help=True, add_completion=False, help=__doc__)
-# [CC-01] Two-tier surface: end-user (serve/init/update/doctor/stats) in wheel; maintainer (refresh-source/build-index/release) needs repo checkout.
+# [CC-01] Rust owns the installed MCP runtime. This Python CLI is maintainer tooling.
 # [CC-06] no_args_is_help=True + add_completion=False — small intentional CLI, no shell-completion magic.
-
-
-@app.command()
-def serve() -> None:
-    """Run the MCP stdio server."""
-    # [CC-02] Auto-apply pending update on startup; fall back to installed corpus on failure — a stale-but-working install always serves; only a missing DB is fatal.
-    from .updater.apply import apply_update
-
-    _maybe_migrate_v4_to_v5()
-    manifest_url = f"{paths.releases_url().rstrip('/')}/manifest.json"
-    sig_url = manifest_url + ".minisig"
-    pubkey = _bundled_pubkey_path()
-    try:
-        stats = apply_update(
-            manifest_url=manifest_url,
-            # [CC-03] Signature verified only when pubkey is bundled; opt-out is structural (don't bundle the key) — no flag to disable verification.
-            sig_url=sig_url if pubkey and pubkey.exists() else None,
-            pubkey_path=pubkey,
-        )
-        typer.echo(
-            f"ato-mcp serve: update complete +{stats.added} ~{stats.changed} "
-            f"-{stats.removed} ({stats.bytes_downloaded / 1_000_000:.2f} MB downloaded)",
-            err=True,
-        )
-    except Exception as exc:  # noqa: BLE001 — serve can fall back to an installed corpus
-        if not paths.db_path().exists():
-            raise
-        typer.echo(
-            f"ato-mcp serve: update failed; serving installed corpus: {exc}",
-            err=True,
-        )
-
-    from .server import run
-    run()
-
-
-@app.command()
-def init(
-    manifest_url: Optional[str] = typer.Option(
-        None, help="Manifest URL. Defaults to $ATO_MCP_RELEASES_URL/manifest.json."
-    ),
-) -> None:
-    """First-run: download manifest + model + required packs."""
-    from .updater.apply import apply_update
-
-    _maybe_migrate_v4_to_v5()
-
-    manifest_url = manifest_url or f"{paths.releases_url().rstrip('/')}/manifest.json"
-    sig_url = manifest_url + ".minisig"
-    pubkey = _bundled_pubkey_path()
-    stats = apply_update(
-        manifest_url=manifest_url,
-        sig_url=sig_url if pubkey and pubkey.exists() else None,
-        pubkey_path=pubkey,
-    )
-    typer.echo(
-        f"init complete: +{stats.added} ~{stats.changed} -{stats.removed} "
-        f"({stats.bytes_downloaded / 1_000_000:.1f} MB downloaded)"
-    )
-
-
-@app.command()
-def update(
-    manifest_url: Optional[str] = typer.Option(None),
-) -> None:
-    """Apply an incremental delta from a new release.
-
-    If the live DB is still on schema v4 (pre-v5), migrates it in place
-    first so the delta applies against the current schema.
-    """
-    from .updater.apply import apply_update
-
-    _maybe_migrate_v4_to_v5()
-
-    manifest_url = manifest_url or f"{paths.releases_url().rstrip('/')}/manifest.json"
-    sig_url = manifest_url + ".minisig"
-    pubkey = _bundled_pubkey_path()
-    stats = apply_update(
-        manifest_url=manifest_url,
-        sig_url=sig_url if pubkey and pubkey.exists() else None,
-        pubkey_path=pubkey,
-    )
-    typer.echo(
-        f"update complete: +{stats.added} ~{stats.changed} -{stats.removed} "
-        f"({stats.bytes_downloaded / 1_000_000:.2f} MB downloaded)"
-    )
 
 
 @app.command()
@@ -148,82 +53,6 @@ def migrate(
     typer.echo(f"{target}: migrating v4 → v5 ...")
     migrate_v4_to_v5(target)
     typer.echo("migrate: done")
-
-
-def _maybe_migrate_v4_to_v5() -> None:
-    """Auto-migrate the live DB if it's still on v4 before an update fires."""
-    # [CC-04] Runs on init/update/serve before apply_update; pre-v5 DBs are upgraded in place. Pre-v4 raises and demands a rebuild from ato_pages/ — schema too different for in-place patch.
-    import sqlite3
-    from .store.migrate import migrate_v4_to_v5, needs_v4_to_v5
-
-    live = paths.db_path()
-    if not live.exists():
-        return
-    probe = sqlite3.connect(str(live))
-    probe.row_factory = sqlite3.Row
-    try:
-        if not needs_v4_to_v5(probe):
-            return
-    finally:
-        probe.close()
-    typer.echo(f"detected pre-v5 DB at {live}; migrating in place ...")
-    migrate_v4_to_v5(live)
-    typer.echo("migrate: done (continuing with update)")
-
-
-@app.command()
-def doctor(
-    rollback: bool = typer.Option(False, help="Restore previous DB snapshot."),
-) -> None:
-    """Verify installed artifacts, optionally rolling back a bad update."""
-    from .updater.apply import rollback as do_rollback
-
-    if rollback:
-        do_rollback()
-        typer.echo("rollback complete.")
-        return
-
-    live_db = paths.db_path()
-    if not live_db.exists():
-        typer.echo("no live DB found; run `ato-mcp init` first.", err=True)
-        raise typer.Exit(code=1)
-    from .store import db as store_db
-    conn = store_db.connect(live_db, mode="ro")
-    try:
-        row = conn.execute("SELECT COUNT(*) AS n FROM documents").fetchone()
-        typer.echo(f"documents: {row['n']}")
-        row = conn.execute("SELECT COUNT(*) AS n FROM chunks").fetchone()
-        typer.echo(f"chunks: {row['n']}")
-    finally:
-        conn.close()
-
-
-@app.command()
-def stats() -> None:
-    """Print index version and counts."""
-    from .store import db as store_db
-    from .store import manifest as manifest_module
-
-    live_db = paths.db_path()
-    if not live_db.exists():
-        typer.echo("no live DB found; run `ato-mcp init` first.", err=True)
-        raise typer.Exit(code=1)
-
-    installed_manifest = paths.installed_manifest_path()
-    if installed_manifest.exists():
-        m = manifest_module.load_manifest(installed_manifest)
-        typer.echo(f"index_version: {m.index_version}")
-        typer.echo(f"created_at:    {m.created_at}")
-        typer.echo(f"packs:         {len(m.packs)}")
-
-    conn = store_db.connect(live_db, mode="ro")
-    try:
-        row = conn.execute("SELECT COUNT(*) AS n FROM documents").fetchone()
-        typer.echo(f"documents: {row['n']}")
-        row = conn.execute("SELECT COUNT(*) AS n FROM chunks").fetchone()
-        typer.echo(f"chunks:    {row['n']}")
-    finally:
-        conn.close()
 
 
 @app.command("refresh-source")
@@ -345,7 +174,7 @@ def build_index(
     limit: Optional[int] = typer.Option(None, help="Cap documents processed (for testing)."),
     embedder: str = typer.Option(
         "embeddinggemma",
-        help="Vectorizer: embeddinggemma or lexical-hash-rust.",
+        help="Vectorizer: embeddinggemma.",
     ),
     encode_batch_size: int = typer.Option(64, help="Embedding batch size. Bump for GPU."),
     max_batch_tokens: int = typer.Option(8192, help="Approx padded tokens allowed in one inference call."),
@@ -365,12 +194,10 @@ def build_index(
     from .indexer.build import build as run_build
     from .store.manifest import sha256_file
 
-    if embedder not in {"embeddinggemma", "lexical-hash-rust"}:
-        raise typer.BadParameter("embedder must be embeddinggemma or lexical-hash-rust")
-    if embedder == "embeddinggemma" and (model_path is None or tokenizer_path is None):
+    if embedder != "embeddinggemma":
+        raise typer.BadParameter("embedder must be embeddinggemma")
+    if model_path is None or tokenizer_path is None:
         raise typer.BadParameter("--model-path and --tokenizer-path are required for embeddinggemma")
-    if embedder == "lexical-hash-rust" and model_id == "embeddinggemma-300m-int8-256d":
-        model_id = "lexical-hash-rust-v1-256d"
 
     model_sha = sha256_file(model_path) if model_path is not None else ""
     model_size = model_path.stat().st_size if model_path is not None else 0
@@ -418,8 +245,13 @@ def release(
     sign_key: Optional[Path] = typer.Option(None, help="minisign secret-key file for signing the manifest."),
     overwrite: bool = typer.Option(False, help="Replace existing assets on the release (gh release upload --clobber)."),
     model_dir: Optional[Path] = typer.Option(
-        None, help="Directory holding the embedding ONNX + tokenizer; creates a bundled tar.zst."
+        None, help="Directory holding the embedding ONNX + tokenizer; creates a local bundle for external hosting."
     ),
+    model_url: Optional[str] = typer.Option(
+        None, help="Approved model mirror URL; defaults to pinned Hugging Face EmbeddingGemma files."
+    ),
+    model_sha256: Optional[str] = typer.Option(None, help="sha256 of an externally hosted model bundle."),
+    model_size: Optional[int] = typer.Option(None, help="Size in bytes of an externally hosted model bundle."),
 ) -> None:
     """Maintainer: upload the build artifacts to a GitHub release.
 
@@ -438,6 +270,9 @@ def release(
         sign_key=sign_key,
         overwrite=overwrite,
         model_dir=model_dir,
+        model_url=model_url,
+        model_sha256=model_sha256,
+        model_size=model_size,
     ))
     typer.echo(f"release {tag} published with manifest + packs")
 
@@ -579,11 +414,6 @@ def backfill(
     typer.echo("backfill: done")
 
 
-def _bundled_pubkey_path() -> Path | None:
-    candidate = Path(__file__).parent / "keys" / "maintainer.pub"
-    return candidate if candidate.exists() else None
-
-
 # ---------------------------------------------------------------------------
 # Empty-shell inspection.
 
@@ -664,7 +494,6 @@ def shells_export(
     """Dump the whole table to CSV (doc_id, canonical_url, first_seen_at, last_checked_at, check_count, source)."""
     import csv
     from .store import db as store_db
-    from .formatters import canonical_url
     target = db_path or paths.db_path()
     conn = store_db.connect(target, mode="ro")
     try:
@@ -678,7 +507,7 @@ def shells_export(
                         "last_checked_at", "check_count", "source"])
             for r in rows:
                 w.writerow([
-                    r["doc_id"], canonical_url(r["doc_id"]),
+                    r["doc_id"], f"https://www.ato.gov.au/law/view/document?docid={r['doc_id']}",
                     r["first_seen_at"], r["last_checked_at"],
                     r["check_count"], r["source"] or "",
                 ])

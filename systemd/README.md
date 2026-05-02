@@ -33,7 +33,8 @@ systemctl --user enable --now ato-mcp-maintainer-weekly.timer
 ```
 
 Edit the `Environment=` and `ExecStart=` lines in the maintainer service if
-your repo path, ato_pages path, or model path differs from the defaults.
+your repo path, ato_pages path, model path, or optional model mirror URL
+differs from the defaults.
 
 ## Triggering manually
 

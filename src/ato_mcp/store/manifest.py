@@ -25,7 +25,7 @@ class ModelInfo(BaseModel):
 
 
 class DocRef(BaseModel):
-    # The five fields the updater actually needs for diffing + fetching.
+    # The five fields the Rust installer needs for diffing + fetching.
     doc_id: str
     content_hash: str
     pack_sha8: str
@@ -108,7 +108,7 @@ def diff_manifests(
     old: Manifest | None, new: Manifest
 ) -> tuple[list[DocRef], list[DocRef], list[str]]:
     """Return (added, changed, removed_doc_ids)."""
-    # [SL-08] content_hash is the only diff signal — a chunk-only edit that doesn't bump content_hash is invisible to the updater (intentional simplification).
+    # [SL-08] content_hash is the only diff signal — a chunk-only edit that doesn't bump content_hash is invisible to delta installs (intentional simplification).
     old_ix: dict[str, DocRef] = old.doc_index() if old else {}
     new_ix = new.doc_index()
     added: list[DocRef] = []

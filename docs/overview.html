@@ -178,7 +178,7 @@
     <div class="pipe-step"><div class="stage">Classify</div><div class="what">Template → title, date</div><div class="note">indexer/rules.py</div></div>
     <div class="pipe-step"><div class="stage">Chunk</div><div class="what">Heading-anchored spans</div><div class="note">indexer/chunk.py</div></div>
     <div class="pipe-step"><div class="stage">Embed</div><div class="what">EmbeddingGemma int8</div><div class="note">256-dim, GPU</div></div>
-    <div class="pipe-step"><div class="stage">Serve</div><div class="what">FastMCP (stdio)</div><div class="note">5 tools</div></div>
+    <div class="pipe-step"><div class="stage">Serve</div><div class="what">Rust MCP stdio</div><div class="note">6 tools</div></div>
   </div>
 </section>
 
@@ -244,14 +244,14 @@
 
     <div class="table-card">
       <div class="tname">
-        <span class="name">chunks_vec</span>
-        <span class="kind">sqlite-vec · cosine int8</span>
+        <span class="name">chunk_embeddings</span>
+        <span class="kind">SQLite BLOB · int8 dot product</span>
       </div>
       <div class="col"><span class="cname"><span class="pk">chunk_id</span></span><span class="ctype">INT</span></div>
       <div class="col"><span class="cname">embedding</span><span class="ctype">int8[256]</span></div>
       <div class="note">
         EmbeddingGemma 300M quantised to int8 at 256 dimensions —
-        ~256 bytes / chunk; cosine via sqlite-vec, RRF-fused with BM25.
+        ~256 bytes / chunk; scored in Rust and RRF-fused with BM25.
       </div>
     </div>
 
@@ -330,7 +330,7 @@
 <section>
   <h2><span class="num">03</span>MCP tools · the LLM surface</h2>
   <p class="section-lede">
-    Five tools. Every hit carries a <code>canonical_url</code>. Every
+    Six tools. Every hit carries a <code>canonical_url</code>. Every
     tool defaults to markdown for rendering; pass <code>format="json"</code>
     for machine-parseable output.
   </p>
@@ -339,7 +339,7 @@
     <div class="tool-head">
       <span class="name">search</span>
       <span class="tag">Hybrid BM25 + Vector</span>
-      <div class="one-liner">Top-k chunks across the corpus, RRF-fused. 5-year recency half-life applies by default.</div>
+      <div class="one-liner">Top-k chunks across the corpus, RRF-fused from semantic and lexical candidates.</div>
     </div>
     <div class="tool-body">
 <div class="sig"><span class="k">search</span>(
@@ -356,7 +356,7 @@
       <ul>
         <li><strong>types</strong> accepts exact matches and globs in the same list — <code>["Public_*", "Cases"]</code> composes OR.</li>
         <li><strong>doc_scope</strong> is always a glob over the full <code>doc_id</code> path.</li>
-        <li><strong>sort_by='relevance'</strong> applies a 5-year-half-life recency boost (tax law ages). <strong>'recency'</strong> sorts strictly by date.</li>
+        <li><strong>sort_by='relevance'</strong> keeps fused semantic/lexical order. <strong>'recency'</strong> sorts the candidate frontier by date.</li>
         <li>Returns: <code>doc_id</code>, <code>title</code>, <code>type</code>, <code>date</code>, <code>heading_path</code>, <code>anchor</code>, <code>snippet</code>, <code>canonical_url</code>, <code>chunk_id</code>.</li>
       </ul>
     </div>
@@ -390,7 +390,7 @@
     <div class="tool-body">
 <div class="sig"><span class="k">get_document</span>(
   doc_id: <span class="t">str</span>,
-  format: <span class="l">"outline" | "markdown" | "json"</span> = <span class="l">"outline"</span>,
+  format: <span class="l">"outline" | "card" | "markdown" | "json"</span> = <span class="l">"outline"</span>,
   anchor: <span class="t">str | None</span> = <span class="l">None</span>,
   heading_path: <span class="t">str | None</span> = <span class="l">None</span>,
   from_ord: <span class="t">int | None</span> = <span class="l">None</span>,        <span class="c"># positional cursor</span>
@@ -399,7 +399,8 @@
   max_chars: <span class="t">int | None</span> = <span class="l">None</span>,
 ) -> <span class="t">str</span></div>
       <ul>
-        <li><strong>No selector + outline</strong> → TOC table with <code>start_ord</code>/<code>chunk_count</code>/<code>bytes</code>. Cheapest way to survey a doc.</li>
+        <li><strong>No selector + outline</strong> → TOC table with <code>start_ord</code>/<code>chunk_count</code>. Cheapest way to survey a doc.</li>
+        <li><strong>format='card'</strong> → compact document metadata plus hydration calls.</li>
         <li><strong>heading_path</strong> → grab a section by its breadcrumb; <code>include_children=True</code> rolls up the full subtree.</li>
         <li><strong>from_ord + count/max_chars</strong> → walk forward by position. Truncated JSON carries a <code>continuation_ord</code>.</li>
       </ul>
@@ -415,6 +416,9 @@
     <div class="tool-body">
 <div class="sig"><span class="k">get_chunks</span>(
   chunk_ids: <span class="t">list[int]</span>,
+  before: <span class="t">int</span> = <span class="l">0</span>,
+  after: <span class="t">int</span> = <span class="l">0</span>,
+  max_chars: <span class="t">int | None</span> = <span class="l">None</span>,
   format: <span class="l">"markdown" | "json"</span> = <span class="l">"markdown"</span>,
 ) -> <span class="t">str</span></div>
     </div>
@@ -429,6 +433,7 @@
     <div class="tool-body">
 <div class="sig"><span class="k">whats_new</span>(
   since: <span class="t">str | None</span> = <span class="l">None</span>,     <span class="c"># "2026-01-01"</span>
+  before: <span class="t">str | None</span> = <span class="l">None</span>,
   limit: <span class="t">int</span> = <span class="l">50</span>,
   types: <span class="t">list[str] | None</span> = <span class="l">None</span>,
   format: <span class="l">"markdown" | "json"</span> = <span class="l">"markdown"</span>,
@@ -477,7 +482,7 @@
       <div class="step"><div class="idx">1</div><div class="body">
         <div class="call"><span class="tn">search</span>(<span class="arg-k">query</span>=<span class="arg-v">"R&amp;D tax incentive eligibility software development"</span>,
   <span class="arg-k">types</span>=<span class="arg-v">["Public_rulings", "Practical_compliance_guidelines"]</span>, <span class="arg-k">k</span>=<span class="arg-v">8</span>)</div>
-        <div class="rationale">Hybrid search. 5-year half-life boost is automatic under <code>sort_by='relevance'</code>. Returns chunks from <code>TR 2024/3</code>, <code>PCG 2023/2</code>, plus supporting ATO IDs — each with a full title like <code>"TR 2024/3 — R&amp;D tax incentive eligibility"</code>.</div>
+        <div class="rationale">Hybrid search. Semantic and lexical candidates are fused by reciprocal rank. Returns chunks from <code>TR 2024/3</code>, <code>PCG 2023/2</code>, plus supporting ATO IDs — each with a full title like <code>"TR 2024/3 — R&amp;D tax incentive eligibility"</code>.</div>
       </div></div>
       <div class="step"><div class="idx">2</div><div class="body">
         <div class="call"><span class="tn">get_document</span>(<span class="arg-k">doc_id</span>=<span class="arg-v">"TXR/TR20243/NAT/ATO/00001"</span>, <span class="arg-k">format</span>=<span class="arg-v">"outline"</span>)</div>
@@ -573,7 +578,7 @@
   <h2><span class="num">06</span>Design principles</h2>
   <div class="templates">
     <div class="tpl"><div class="tname">Zero duplication</div><div class="desc">One identifier (<code>doc_id</code>), one label (<code>title</code>), one date. URLs synthesised, status inlined, type in the docid prefix.</div></div>
-    <div class="tpl"><div class="tname">Fewer, more powerful tools</div><div class="desc">5 tools; <code>get_document</code> covers outline + section + pagination through one signature.</div></div>
+    <div class="tpl"><div class="tname">Fewer, more powerful tools</div><div class="desc">6 tools; <code>get_document</code> covers card + outline + section + pagination through one signature.</div></div>
     <div class="tpl"><div class="tname">Scope globs, not tool variants</div><div class="desc"><code>types</code> and <code>doc_scope</code> both accept globs. One tool, many slices.</div></div>
     <div class="tpl"><div class="tname">Templates, not regex soup</div><div class="desc">Classify structural shape, then run a positional extractor. Robust to heading noise; easy to extend.</div></div>
     <div class="tpl"><div class="tname">Metadata is cheap</div><div class="desc">Anything non-semantic lives outside the embedding column. Rules iterate in minutes on CPU, not hours on GPU.</div></div>

@@ -1,8 +1,12 @@
-"""Release helpers: sign the manifest and upload artifacts to GitHub Releases.
+"""Release helpers: sign the manifest and upload corpus artifacts to GitHub Releases.
 
 We shell out to ``gh`` rather than use the GitHub API directly so uploads
 run under the maintainer's existing GitHub CLI authentication. This keeps
 the package dependency-free from API client libraries.
+
+EmbeddingGemma is not uploaded to GitHub. By default the manifest records a
+pinned Hugging Face model source plus fingerprint/size; maintainers can point
+at an approved mirror with ``--model-url``.
 
 Signing is optional. Pass ``--sign-key`` to produce a ``manifest.json.minisig``
 alongside the manifest. Signing requires the ``minisign`` CLI.
@@ -24,6 +28,15 @@ from ..util.log import get_logger
 
 LOGGER = get_logger(__name__)
 
+EMBEDDINGGEMMA_HF_URL = (
+    "hf://onnx-community/embeddinggemma-300m-ONNX@"
+    "5090578d9565bb06545b4552f76e6bc2c93e4a66"
+)
+EMBEDDINGGEMMA_HF_FINGERPRINT = (
+    "5d4d31914cdb65cd84d3248390946461efdd4ec4f99afd13d23218cd4060d706"
+)
+EMBEDDINGGEMMA_HF_SIZE = 329_781_810
+
 
 class ReleaseError(RuntimeError):
     pass
@@ -40,7 +53,10 @@ class ReleaseArgs:
     prerelease: bool = False
     sign_key: Path | None = None
     overwrite: bool = False      # replace existing assets on the release
-    model_dir: Path | None = None  # maintainer's ONNX + tokenizer dir
+    model_dir: Path | None = None  # maintainer's ONNX + tokenizer dir; bundle is not uploaded to GitHub
+    model_url: str | None = None   # external URL for the model bundle
+    model_sha256: str | None = None
+    model_size: int | None = None
     model_bundle_name: str = "embeddinggemma-bundle.tar.zst"
 
 
@@ -117,6 +133,18 @@ def _file_sha256(path: Path, chunk: int = 1 << 20) -> str:
     return h.hexdigest()
 
 
+def _is_placeholder_model_url(url: str) -> bool:
+    return not url or url.startswith("model/") or url.endswith(".onnx.zst")
+
+
+def _is_github_url(url: str) -> bool:
+    return "://github.com/" in url or "://raw.githubusercontent.com/" in url
+
+
+def _is_hf_url(url: str) -> bool:
+    return url.startswith("hf://")
+
+
 def _gh_default_repo() -> str:
     """Return ``owner/repo`` reported by ``gh repo view``."""
     res = subprocess.run(
@@ -162,29 +190,52 @@ def publish(args: ReleaseArgs) -> None:
 
     repo = args.repo or _gh_default_repo()
 
-    # Bundle the embedding model + tokenizer if a model_dir was supplied and
-    # we haven't already produced the bundle.
-    model_bundle_path: Path | None = None
-    if args.model_dir is not None:
-        model_bundle_path = args.out_dir / args.model_bundle_name
-        if not model_bundle_path.exists():
-            LOGGER.info("bundling embedding model from %s", args.model_dir)
-            sha256, size = bundle_model(args.model_dir, model_bundle_path)
+    current = load_manifest(manifest)
+    if current.model.id.startswith("embeddinggemma"):
+        model_url = args.model_url or current.model.url
+        if _is_placeholder_model_url(model_url):
+            model_url = EMBEDDINGGEMMA_HF_URL
+            sha256 = EMBEDDINGGEMMA_HF_FINGERPRINT
+            size = EMBEDDINGGEMMA_HF_SIZE
+        elif _is_hf_url(model_url):
+            sha256 = args.model_sha256 or current.model.sha256 or EMBEDDINGGEMMA_HF_FINGERPRINT
+            size = args.model_size or current.model.size or EMBEDDINGGEMMA_HF_SIZE
         else:
-            sha256 = _file_sha256(model_bundle_path)
-            size = model_bundle_path.stat().st_size
-        # Patch the manifest with the real bundle metadata.
-        current = load_manifest(manifest)
+            if _is_github_url(model_url):
+                raise ReleaseError("EmbeddingGemma model bundles must not be hosted on GitHub")
+
+            if args.model_dir is not None:
+                model_bundle_path = args.out_dir / args.model_bundle_name
+                if not model_bundle_path.exists():
+                    LOGGER.info("bundling embedding model from %s", args.model_dir)
+                    sha256, size = bundle_model(args.model_dir, model_bundle_path)
+                else:
+                    sha256 = _file_sha256(model_bundle_path)
+                    size = model_bundle_path.stat().st_size
+                LOGGER.info(
+                    "model bundle prepared at %s; upload it to %s before publishing",
+                    model_bundle_path,
+                    model_url,
+                )
+            else:
+                sha256 = args.model_sha256 or current.model.sha256
+                size = args.model_size or current.model.size
+
+        if _is_github_url(model_url):
+            raise ReleaseError("EmbeddingGemma model bundles must not be hosted on GitHub")
+
+        if not sha256 or not size:
+            raise ReleaseError(
+                "EmbeddingGemma releases require model sha256 and size"
+            )
         current.model.sha256 = sha256
         current.model.size = size
-        current.model.url = _release_asset_url(repo, args.tag, args.model_bundle_name)
+        current.model.url = model_url
         save_manifest(current, manifest)
 
     rewrite_manifest_urls(manifest, repo, args.tag)
 
     artifacts: list[Path] = [manifest, *pack_files]
-    if model_bundle_path is not None:
-        artifacts.append(model_bundle_path)
     if args.sign_key:
         sig = sign_manifest(manifest, args.sign_key)
         artifacts.insert(1, sig)

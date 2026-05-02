@@ -1,4 +1,4 @@
-"""Prepared SQL queries used across tools and updater."""
+"""Prepared SQL queries used by maintainer build and migration paths."""
 from __future__ import annotations
 
 INSERT_DOCUMENT = """

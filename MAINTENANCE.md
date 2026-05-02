@@ -42,8 +42,10 @@ scripts/maintainer-sync.sh
 
 1. Refresh `ato_pages` in the requested mode.
 2. Build `release/<tag>/ato.db`, packs, and `manifest.json`.
-3. Upload the corpus assets with `.venv/bin/ato-mcp release`.
-4. Mark the release latest.
+3. Write the pinned Hugging Face EmbeddingGemma source into the manifest,
+   unless `ATO_MCP_MODEL_URL` points at an approved mirror.
+4. Upload the corpus assets with `.venv/bin/ato-mcp release`.
+5. Mark the release latest.
 
 The script requires `nvidia-smi`/CUDA to be available through the local
 Python ONNX Runtime install. If CUDA is unavailable, fix the environment
@@ -81,8 +83,10 @@ After a local `build-index`:
 scripts/publish-release.sh v0.3.0 gunba/ato-mcp
 ```
 
-This uploads manifest, packs, and the model bundle. It does not build or
-upload Python wheels, and it does not duplicate the corpus into an offline
+Set `ATO_MCP_MODEL_URL` only when publishing against an approved model mirror.
+By default the manifest points at pinned Hugging Face EmbeddingGemma files.
+This uploads manifest and packs to GitHub Releases; it does not upload the
+model to GitHub, build Python wheels, or duplicate the corpus into an offline
 bundle by default.
 
 For an explicit air-gapped install package:
@@ -90,6 +94,10 @@ For an explicit air-gapped install package:
 ```bash
 scripts/make-offline-bundle.sh release/ato-mcp-offline-v0.3.0.tar.zst
 ```
+
+The offline bundle script runs the Rust installer against a local mirror of
+the manifest, packs, and model bundle, then packages the resulting data
+directory. Do not build offline bundles by copying `release/ato.db` directly.
 
 ## Health Checks
 

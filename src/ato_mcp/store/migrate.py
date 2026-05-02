@@ -1,4 +1,4 @@
-"""Schema migrations invoked by CLI + updater.
+"""Maintainer schema migrations.
 
 v4 → v5 is the only migration currently supported. Earlier versions
 (v1/v2/v3) need a full rebuild from ``ato_pages/``.
@@ -79,7 +79,7 @@ CREATE INDEX IF NOT EXISTS idx_shells_last_checked
 INSERT INTO meta(key, value) VALUES ('schema_version', '5')
 ON CONFLICT(key) DO UPDATE SET value = excluded.value;
 
--- Drop empty shells from documents. The old delta-based updater inserted
+-- Drop empty shells from documents. The old delta install path inserted
 -- scrape failures here; the v5 builder writes them to empty_shells
 -- instead.
 INSERT INTO title_fts(title_fts, doc_id, title, headings)

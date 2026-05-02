@@ -6,6 +6,7 @@
 #   ATO_MCP_PAGES_DIR  absolute path to ato_pages/ (default: $ATO_MCP_REPO_DIR/../ato_pages)
 #   ATO_MCP_MODEL_DIR  absolute path to a dir holding model_quantized.onnx,
 #                      model_quantized.onnx_data, tokenizer.json
+#   ATO_MCP_MODEL_URL  optional approved model mirror URL
 #   ATO_MCP_RELEASE_TAG  tag prefix (default: index)
 #   ATO_MCP_GH_REPO    owner/name (default: gunba/ato-mcp)
 #   ATO_MCP_MODE       incremental | catch_up | full (default: incremental)
@@ -23,6 +24,11 @@ set -euo pipefail
 REPO_DIR="${ATO_MCP_REPO_DIR:?set ATO_MCP_REPO_DIR}"
 PAGES_DIR="${ATO_MCP_PAGES_DIR:-$REPO_DIR/../ato_pages}"
 MODEL_DIR="${ATO_MCP_MODEL_DIR:?set ATO_MCP_MODEL_DIR}"
+MODEL_URL="${ATO_MCP_MODEL_URL:-}"
+MODEL_URL_ARG=()
+if [ -n "$MODEL_URL" ]; then
+    MODEL_URL_ARG=(--model-url "$MODEL_URL")
+fi
 GH_REPO="${ATO_MCP_GH_REPO:-gunba/ato-mcp}"
 MODE="${ATO_MCP_MODE:-incremental}"
 TAG_PREFIX="${ATO_MCP_RELEASE_TAG:-index}"
@@ -95,6 +101,7 @@ fi
     --tag "$TAG" \
     --repo "$GH_REPO" \
     --model-dir "$MODEL_DIR" \
+    "${MODEL_URL_ARG[@]}" \
     --overwrite
 
 # Promote to "latest" so /releases/latest/download resolves to this tag.

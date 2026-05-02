@@ -8,16 +8,17 @@ ATO material and apply professional judgment before relying on an answer.
 
 The installed server is a Rust binary. End users do not need Python, pip,
 pipx, uv, a compiler, `gh`, or an API key. The corpus is shipped as GitHub
-release assets and installed into the user's local data directory.
+release assets, while the EmbeddingGemma query encoder is downloaded from the
+external URL recorded in the release manifest.
 
 ## Tools
 
 | Tool | Purpose |
 |---|---|
-| `search` | BM25 search over the GPU-built corpus. Defaults exclude Edited Private Advice and very old non-legislation content. |
+| `search` | Hybrid semantic-plus-lexical search over the GPU-built corpus. Defaults exclude Edited Private Advice and very old non-legislation content. |
 | `search_titles` | Fast citation/title lookup, for example `TR 2024/3` or `Income Tax Assessment Act 1997 s 8-1`. |
 | `get_document` | Fetch an outline, a full document, a section, or an ordinal range. |
-| `get_chunks` | Fetch exact chunks returned by `search`. |
+| `get_chunks` | Fetch exact chunks returned by `search`, with optional neighbor context. |
 | `whats_new` | Recent documents by corpus date. |
 | `stats` | Index version, counts, and default search policy. |
 
@@ -49,8 +50,8 @@ ato-mcp.exe doctor
 ato-mcp.exe stats
 ```
 
-`init` downloads `manifest.json`, the embedding model bundle, and the
-document packs from the configured release URL. By default that is:
+`init` downloads `manifest.json` and document packs from the configured
+release URL. By default that is:
 
 ```text
 https://github.com/gunba/ato-mcp/releases/latest/download
@@ -58,7 +59,8 @@ https://github.com/gunba/ato-mcp/releases/latest/download
 
 Override with `ATO_MCP_RELEASES_URL` for staging or an internal corporate
 mirror. The Rust client intentionally does not read GitHub token
-environment variables and does not shell out to `gh`.
+environment variables and does not shell out to `gh`. The embedding model
+source is resolved from `manifest.model.url` and verified before use.
 
 ## Wire Into MCP Clients
 
@@ -97,6 +99,10 @@ startup warning to stderr so JSON-RPC stdout stays clean.
 
 Default search is tuned for current public tax-law work:
 
+- `search` defaults to `mode=hybrid`, combining EmbeddingGemma vector retrieval
+  with lexical ranking. `mode=vector` and explicit `mode=keyword` are available;
+  hybrid/vector fail rather than silently downgrading when semantic search is
+  unavailable.
 - `Edited_private_advice` is excluded unless `types` explicitly includes it.
 - Non-legislation documents dated before `2000-01-01` are excluded unless
   `include_old=true`.
@@ -108,6 +114,7 @@ Examples:
 ```bash
 ato-mcp search "R&D tax incentive eligibility" --k 5
 ato-mcp search-titles "TR 2024 3"
+ato-mcp search "section 8-1 repairs" --mode keyword
 ato-mcp search "royalties withholding old cases" --include-old --types Cases
 ```
 
@@ -185,23 +192,12 @@ LD_LIBRARY_PATH="$(find .venv/lib*/python3.*/site-packages/nvidia/ -maxdepth 2 -
   --overwrite
 ```
 
-Fast lexical release build:
-
-```bash
-.venv/bin/ato-mcp build-index \
-  --pages-dir /path/to/ato_pages \
-  --out-dir ./release \
-  --db-path ./release/ato.db \
-  --embedder lexical-hash-rust \
-  --workers 8 \
-  --window-docs 20000 \
-  --pack-target-mb 64 \
-  --checkpoint-every 1000000000 \
-  --unsafe-fast-sqlite
-```
-
-GPU-backed EmbeddingGemma builds remain available when neural vectors are
-needed. The optional `corpus release (gpu)` workflow targets a self-hosted
+Release builds use EmbeddingGemma vectors. The model is not uploaded to
+GitHub Releases; by default the manifest points at pinned Hugging Face
+EmbeddingGemma files, and the Rust client downloads and verifies them during
+`init`, `update`, or `serve`. Pass `--model-url` only for an approved mirror.
+Explicit `mode=keyword` is a query-time FTS mode, not an alternative corpus
+embedder. The optional `corpus release (gpu)` workflow targets a self-hosted
 runner labelled `gpu` and fails if `nvidia-smi` or ONNX Runtime's
 `CUDAExecutionProvider` is unavailable. It is not scheduled by default, so it
 does not spend hosted GPU minutes.
@@ -213,10 +209,24 @@ cargo test --locked
 .venv/bin/pytest -q
 ```
 
+Published corpus/install smoke test:
+
+```bash
+ATO_MCP_MANIFEST_URL=https://.../manifest.json scripts/smoke-rust-install.sh
+```
+
+Offline bundles are materialized through the Rust installer:
+
+```bash
+ATO_MCP_RELEASE_DIR=./release/index-2026.05.02 \
+ATO_MCP_MODEL_BUNDLE=/path/to/embeddinggemma-bundle.tar.zst \
+scripts/make-offline-bundle.sh ./release/ato-mcp-offline-bundle.tar.zst
+```
+
 CI runs both the Rust binary checks and the Python maintainer test suite.
 Release binary assets are produced by `.github/workflows/release-binaries.yml`.
 
 ## License
 
-MIT. ATO content remains subject to the ATO's publication terms. The
-EmbeddingGemma model is redistributed under the Gemma Terms of Use.
+MIT. ATO content remains subject to the ATO's publication terms.
+EmbeddingGemma remains subject to the Gemma Terms of Use.

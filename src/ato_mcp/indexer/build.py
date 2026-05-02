@@ -29,7 +29,6 @@ from typing import Iterator, Literal
 import numpy as np
 import zstandard as zstd
 
-from ..embed.lexical import rust_lexical_hash
 from ..embed.model import EmbeddingModel, vec_to_bytes
 from ..store import db as store_db
 from ..store.manifest import DocRef, Manifest, ModelInfo, PackInfo, load_manifest
@@ -84,7 +83,7 @@ class BuildArgs:
     model_size: int | None = None
     previous_manifest: Path | None = None
     limit: int | None = None  # optional cap for testing
-    embedder: Literal["embeddinggemma", "lexical-hash-rust"] = "embeddinggemma"
+    embedder: Literal["embeddinggemma"] = "embeddinggemma"
     encode_batch_size: int = 64
     max_batch_tokens: int = 8192
     providers: tuple[str, ...] | None = None  # ORT execution providers override
@@ -145,7 +144,9 @@ class WindowTimings:
 
 
 def _build_fresh_windowed(args: BuildArgs) -> Manifest:
-    # [IB-12] Fresh-build path (no previous_manifest): full re-embed; lexical-hash-rust is allowed here. Incremental build() is a separate path that requires embeddinggemma + reuses pack slots when content_hash unchanged.
+    # [IB-12] Fresh-build path (no previous_manifest): full re-embed. Incremental build() is a separate path that reuses pack slots when content_hash is unchanged.
+    if args.embedder != "embeddinggemma":
+        raise ValueError("build-index requires --embedder embeddinggemma")
     _reset_fresh_outputs(args.out_dir, args.db_path)
     packs_dir = args.out_dir / "packs"
     packs_dir.mkdir(parents=True, exist_ok=True)
@@ -206,7 +207,7 @@ def _build_fresh_windowed(args: BuildArgs) -> Manifest:
             chunks_count += len(texts)
 
             phase = time.monotonic()
-            if texts and args.embedder == "embeddinggemma":
+            if texts:
                 assert model is not None
                 encoded = _encode_length_bucketed(
                     model,
@@ -216,10 +217,6 @@ def _build_fresh_windowed(args: BuildArgs) -> Manifest:
                 )
                 vectors_i8 = encoded.vectors_int8
                 tokens_seen += encoded.tokens_seen
-            elif texts and args.embedder == "lexical-hash-rust":
-                # [IB-17] Fast CPU-only fallback embedder: rustc-compiled FNV-hash vectorizer producing same-shape int8 vectors so query-time path is identical to embeddinggemma.
-                vectors_i8 = rust_lexical_hash(texts, binary_dir=args.out_dir / ".build")
-                tokens_seen += _cheap_token_estimate(texts)
             else:
                 vectors_i8 = np.empty((0, store_db.EMBEDDING_DIM), dtype=np.int8)
             timings.embed += time.monotonic() - phase
@@ -604,8 +601,6 @@ def _reset_fresh_outputs(out_dir: Path, db_path: Path) -> None:
 
 
 def _effective_model_id(args: BuildArgs) -> str:
-    if args.embedder == "lexical-hash-rust" and args.model_id == "embeddinggemma-300m-int8-256d":
-        return "lexical-hash-rust-v1-256d"
     return args.model_id
 
 
@@ -854,10 +849,6 @@ def _write_window(
 def _next_chunk_id(conn) -> int:
     row = conn.execute("SELECT COALESCE(MAX(chunk_id), 0) + 1 AS next_id FROM chunks").fetchone()
     return int(row["next_id"])
-
-
-def _cheap_token_estimate(texts: list[str]) -> int:
-    return sum(max(1, len(text) // 4) for text in texts)
 
 
 def _windowed(items: Iterator[dict], size: int) -> Iterator[list[dict]]:

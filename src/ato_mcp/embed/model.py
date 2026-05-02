@@ -3,7 +3,7 @@
 The model is shipped as an ``int8``-quantized ONNX graph exported such that its
 output is the final (mean- or CLS-pooled) sentence embedding, truncated to
 ``EMBEDDING_DIM`` via Matryoshka representation learning. We l2-normalize the
-output and cast to int8 for storage in sqlite-vec.
+output and cast to int8 for storage in release packs.
 
 Query-time embedding is computed locally; we do not call any remote service.
 """
@@ -52,11 +52,13 @@ class EmbeddingModel:
         self.tokenizer_path = Path(tokenizer_path or paths.tokenizer_path())
         if not self.model_path.exists():
             raise FileNotFoundError(
-                f"Embedding model not found at {self.model_path}. Run `ato-mcp init`."
+                f"Embedding model not found at {self.model_path}. "
+                "Pass --model-path to the maintainer build."
             )
         if not self.tokenizer_path.exists():
             raise FileNotFoundError(
-                f"Tokenizer not found at {self.tokenizer_path}. Run `ato-mcp init`."
+                f"Tokenizer not found at {self.tokenizer_path}. "
+                "Pass --tokenizer-path to the maintainer build."
             )
 
         so = ort.SessionOptions()
