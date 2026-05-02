@@ -9,7 +9,11 @@ target/
 .venv/
 venv/
 .env
-.claude/
+.claude/*
+!.claude/rules/
+!.claude/rules/**
+!.claude/settings.json
+.codex/agent-proofs-AGENTS-snippet.md
 .DS_Store
 /tmp/
 scratch/
