@@ -40,6 +40,7 @@ from .whats_new import DedupedLinkIndex, WhatsNewFetcher, build_pending_record, 
 LOGGER = logging.getLogger(__name__)
 
 Mode = Literal["incremental", "full", "catch_up"]
+# [SS-01] Three modes: incremental (What's New feed, ~2-3 week window), full (whole crawl, hours), catch_up (diff missing canonical_ids — for use after long gaps where What's New rolled past).
 
 
 @dataclass
@@ -87,6 +88,7 @@ def refresh_source(
     parser_run_date: str | None = None,
     max_workers: int = 1,
     request_interval: float = 0.5,
+    # [SS-04] Default pacing: request_interval=0.5s, max_workers=1 — concurrency restrained because the rate lock would serialise anyway and faster risks ATO's rate guard.
     verbose_progress: bool = False,
     force: bool = True,
     root_query: str = "Mode=type&Action=initialise",
@@ -210,6 +212,7 @@ def _run_catch_up(
 
     Without ``path_prefix``, we refuse to run a scoped crawl and raise.
     """
+    # [SS-06] catch_up inherits each new doc's category from the reducer's representative_path so payloads land in payloads/<Category>/... matching the existing tree shape.
     existing = _load_existing_canonical_ids(output_dir / "index.jsonl")
     if root_query != "Mode=type&Action=initialise" and not path_prefix:
         raise ValueError(

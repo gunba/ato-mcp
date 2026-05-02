@@ -4,6 +4,8 @@ The goal of this project is to maintain an on-device (with database build pulled
 
 The user is not expected to have a GPU and may be using a low performance enterprise laptop.
 
+IMPORTANT: We should be looking to simplify the MCP surface and minimise extraneous context at all times.
+
 # Workflow
 
 Use `/r`, `/j`, `/b`, `/c`, and `/rj` from this repo root.

@@ -28,11 +28,14 @@ from .util.log import get_logger
 LOGGER = get_logger("ato_mcp.cli")
 
 app = typer.Typer(no_args_is_help=True, add_completion=False, help=__doc__)
+# [CC-01] Two-tier surface: end-user (serve/init/update/doctor/stats) in wheel; maintainer (refresh-source/build-index/release) needs repo checkout.
+# [CC-06] no_args_is_help=True + add_completion=False — small intentional CLI, no shell-completion magic.
 
 
 @app.command()
 def serve() -> None:
     """Run the MCP stdio server."""
+    # [CC-02] Auto-apply pending update on startup; fall back to installed corpus on failure — a stale-but-working install always serves; only a missing DB is fatal.
     from .updater.apply import apply_update
 
     _maybe_migrate_v4_to_v5()
@@ -42,6 +45,7 @@ def serve() -> None:
     try:
         stats = apply_update(
             manifest_url=manifest_url,
+            # [CC-03] Signature verified only when pubkey is bundled; opt-out is structural (don't bundle the key) — no flag to disable verification.
             sig_url=sig_url if pubkey and pubkey.exists() else None,
             pubkey_path=pubkey,
         )
@@ -148,6 +152,7 @@ def migrate(
 
 def _maybe_migrate_v4_to_v5() -> None:
     """Auto-migrate the live DB if it's still on v4 before an update fires."""
+    # [CC-04] Runs on init/update/serve before apply_update; pre-v5 DBs are upgraded in place. Pre-v4 raises and demands a rebuild from ato_pages/ — schema too different for in-place patch.
     import sqlite3
     from .store.migrate import migrate_v4_to_v5, needs_v4_to_v5
 
@@ -225,6 +230,7 @@ def stats() -> None:
 def refresh_source(
     mode: str = typer.Option("incremental", help="incremental | full | catch_up"),
     output_dir: Path = typer.Option(Path("./ato_pages"), help="Destination for payloads/."),
+    # [CC-05] refresh-source defaults to ./ato_pages; build-index requires --pages-dir pointing at a populated ato_pages/. Stages independently re-runnable — same pages dir can feed multiple builds.
     links_file: Optional[Path] = typer.Option(None, help="deduped_links.jsonl for incremental mode."),
     max_workers: int = typer.Option(1, help="Parallel request workers. Keep low to be polite."),
     request_interval: float = typer.Option(

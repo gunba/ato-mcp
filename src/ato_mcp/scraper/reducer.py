@@ -34,6 +34,7 @@ class FolderRecord:
 
 class SnapshotReducer:
 	"""Processes a snapshot to deduplicate links and flag redundant paths."""
+	# [SS-07] Dedupes canonical_ids across folders, picks a representative_path per id, flags redundant folder paths; titles in EXCLUDED_TITLES (and their descendants) filtered out before reduction.
 
 	def __init__(self, nodes_path: Path | str, excluded_titles: Optional[Iterable[str]] = None) -> None:
 		self.nodes_path = Path(nodes_path)

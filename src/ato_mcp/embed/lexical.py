@@ -41,6 +41,7 @@ def query_lexical_hash(query: str) -> bytes:
 
 def _ensure_rust_vectorizer(binary_dir: Path) -> Path:
     binary_dir.mkdir(parents=True, exist_ok=True)
+    # [EM-07] Cache key: sha256[:12] of the .rs source — editing the source forces a rebuild; binary lives in binary_dir.
     digest = hashlib.sha256(_SRC.read_bytes()).hexdigest()[:12]
     binary = binary_dir / f"rust_lexical_hash-{digest}"
     if binary.exists():
@@ -65,6 +66,7 @@ def _ensure_rust_vectorizer(binary_dir: Path) -> Path:
 
 
 def _lexical_hash_one(text: str) -> np.ndarray:
+    # [EM-08] Features: token + 4-grams (only when len>=8) + adjacent-token bigrams; FNV-1a hashed → EMBEDDING_DIM bins with sign from h & 0x100; L2-normalize + int8 quantize so the output flows through the same sqlite-vec path as the model.
     data = text.encode("utf-8", errors="ignore")
     acc = np.zeros(EMBEDDING_DIM, dtype=np.float32)
     tokens: list[bytes] = []

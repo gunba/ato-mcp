@@ -1,5 +1,6 @@
 -- ato-mcp SQLite schema v5
 -- Minimal field set: doc_id PK, type, title, date + 3 build-time columns.
+-- [SL-01] Pre-v5 DBs are rejected with a migration prompt rather than transparently upgraded — schema is intentionally narrow.
 --
 -- Design notes:
 --   doc_id   The full ATO docid path, slashes included. The canonical URL
@@ -32,6 +33,7 @@ CREATE INDEX IF NOT EXISTS idx_doc_type ON documents(type);
 CREATE INDEX IF NOT EXISTS idx_doc_date ON documents(date);
 
 -- Chunks: text is zstd-compressed UTF-8.
+-- [SL-03] chunks.text is zstd-compressed UTF-8 BLOB; heading_path uses ' › ' (U+203A) separator; empty-string == intro chunk.
 --
 -- heading_path: nearest-heading trail joined with " › ". Front-matter
 -- echoes (the document title and its " — "-separated components) are
@@ -49,6 +51,7 @@ CREATE TABLE IF NOT EXISTS chunks (
 );
 CREATE INDEX IF NOT EXISTS idx_chunks_doc ON chunks(doc_id);
 
+-- [SL-04] FTS5 with Porter stemming + unicode61 + diacritic-insensitive — tuned for English legal text in both title_fts and chunks_fts.
 -- Title-level FTS — just the title plus per-doc heading text. Citations
 -- like "TR 2024/3" live inside ``title`` so title_fts finds them.
 CREATE VIRTUAL TABLE IF NOT EXISTS title_fts USING fts5(
@@ -86,3 +89,4 @@ CREATE TABLE IF NOT EXISTS empty_shells (
 CREATE INDEX IF NOT EXISTS idx_shells_last_checked ON empty_shells(last_checked_at);
 
 -- chunks_vec is created at runtime by store/db.py after sqlite-vec is loaded.
+-- [SL-02] chunks_vec lives outside this file — vec0 virtual table needs the sqlite-vec extension loaded first; DDL is in db.py:_VEC_TABLE_DDL.

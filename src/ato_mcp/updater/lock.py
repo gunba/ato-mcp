@@ -5,6 +5,7 @@ one ``update`` process may hold it at a time. Stale lock files from crashes
 are handled naturally: ``flock`` drops the advisory lock when the owning
 process exits, even if the file remains.
 """
+# [UM-01] apply takes flock; serve opens DB read-only and never takes the lock — read + update coexist. Stale files benign because flock drops on process exit.
 from __future__ import annotations
 
 import contextlib
@@ -42,6 +43,7 @@ def exclusive_lock(path: Path | None = None) -> Iterator[int]:
 
 
 def _lock_fd(fd: int) -> None:
+    # [UM-02] Cross-platform: fcntl.flock(LOCK_EX | LOCK_NB) on Linux/macOS, msvcrt.locking on Windows. Non-blocking — second writer fails immediately with LockError.
     try:
         import fcntl
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)

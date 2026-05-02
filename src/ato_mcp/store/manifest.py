@@ -85,6 +85,7 @@ def verify_signature(manifest_path: Path, sig_path: Path, pubkey_path: Path) -> 
     Returns True on success. Signature verification uses the ``minisign`` CLI
     so it exercises the same verifier maintainers use outside Python.
     """
+    # [SL-07] Use the minisign CLI via subprocess (not a Python library) so the offline verifier path is exercised — signing-key hygiene problems surface early.
     cli = shutil.which("minisign")
     if cli is None:
         raise RuntimeError(
@@ -107,6 +108,7 @@ def diff_manifests(
     old: Manifest | None, new: Manifest
 ) -> tuple[list[DocRef], list[DocRef], list[str]]:
     """Return (added, changed, removed_doc_ids)."""
+    # [SL-08] content_hash is the only diff signal — a chunk-only edit that doesn't bump content_hash is invisible to the updater (intentional simplification).
     old_ix: dict[str, DocRef] = old.doc_index() if old else {}
     new_ix = new.doc_index()
     added: list[DocRef] = []

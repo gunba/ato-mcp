@@ -33,6 +33,7 @@ class AtoBrowseClient:
 	to avoid hammering the ATO API — the tree crawler issues thousands of
 	these per run.
 	"""
+	# [SS-02] Single source of truth: https://www.ato.gov.au/API/v1/law/lawservices/browse-content/. No retry policy — the rate-limiter smooths load, errors surface to caller.
 
 	def __init__(
 		self,
@@ -67,6 +68,7 @@ class AtoBrowseClient:
 		return payload
 
 	def _acquire_request_slot(self) -> None:
+		# [SS-03] Lock + time.monotonic() enforces request_interval between any two outgoing calls — the tree crawler issues thousands per run.
 		if self._request_interval <= 0.0:
 			return
 		with self._rate_lock:

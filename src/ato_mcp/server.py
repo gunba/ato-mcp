@@ -21,6 +21,7 @@ _FALLBACK_INSTRUCTIONS = (
 mcp: FastMCP = FastMCP(name="ato-mcp", instructions=_FALLBACK_INSTRUCTIONS)
 
 
+# [SW-01] Five tools: search, search_titles, get_document, get_chunks, whats_new — minimal predictable surface.
 @mcp.tool
 def search(
     query: str,
@@ -145,6 +146,7 @@ def whats_new(
 
 
 def _build_instructions() -> str:
+    # [SW-02] Build instructions dynamically from corpus stats at server start so the agent sees current doc count, chunk count, type breakdown, and meta.
     try:
         backend = T.get_backend()
         conn = backend.db
@@ -162,6 +164,7 @@ def _build_instructions() -> str:
             ).fetchall()
         ]
     except Exception:  # noqa: BLE001 — missing DB should not crash import
+        # [SW-03] Fall back to the static one-liner so a fresh install (no 'ato-mcp update' yet) still serves a working MCP endpoint.
         return _FALLBACK_INSTRUCTIONS
 
     lines = [
@@ -202,6 +205,7 @@ def _build_instructions() -> str:
 
 def run() -> None:
     """Entry point invoked by ``ato-mcp serve``."""
+    # [SW-04] Opportunistic warmup pages the ONNX model into memory before the first real tool call; swallow any failure so the server still starts without a model.
     try:
         backend = T.get_backend()
         if backend.model is not None:

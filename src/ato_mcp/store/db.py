@@ -28,6 +28,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0(
 
 
 def _load_vec(conn: sqlite3.Connection) -> None:
+    # [SL-06] Toggle extension loading only for sqlite_vec.load — re-disable so application queries can't smuggle other extensions through.
     conn.enable_load_extension(True)
     sqlite_vec.load(conn)
     conn.enable_load_extension(False)
@@ -56,6 +57,7 @@ def connect(
     conn.execute(f"PRAGMA mmap_size = {mmap_bytes}")
     conn.execute("PRAGMA temp_store = MEMORY")
     if mode != "ro":
+        # [SL-05] WAL+synchronous=NORMAL for writers only; read-only handles skip these pragmas (writes would fail anyway).
         conn.execute("PRAGMA journal_mode = WAL")
         conn.execute("PRAGMA synchronous = NORMAL")
     return conn

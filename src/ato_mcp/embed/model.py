@@ -23,6 +23,7 @@ LOGGER = get_logger(__name__)
 
 MAX_TOKENS = 1024
 # Query prefix used during training per EmbeddingGemma docs. Applied at encode.
+# [EM-02] Distinct query/passage prefixes per EmbeddingGemma training protocol — applied at encode time, not stored.
 QUERY_PREFIX = "task: search result | query: "
 PASSAGE_PREFIX = "title: none | text: "
 
@@ -64,6 +65,7 @@ class EmbeddingModel:
         avail = set(ort.get_available_providers())
         default_providers = ["CPUExecutionProvider"]
         if "CUDAExecutionProvider" in avail:
+            # [EM-01] Prefer CUDA when present; transparently fall back to CPU on enterprise laptops without GPU.
             default_providers.insert(0, "CUDAExecutionProvider")
         self.session = ort.InferenceSession(
             str(self.model_path),
@@ -77,6 +79,7 @@ class EmbeddingModel:
             "sentence_embedding" if "sentence_embedding" in self.output_names else None
         )
         self.tokenizer = Tokenizer.from_file(str(self.tokenizer_path))
+        # [EM-03] Truncate at MAX_TOKENS=1024; dynamic padding (length=None) pads to batch max so small batches aren't penalised.
         self.tokenizer.enable_truncation(max_length=MAX_TOKENS)
         self.tokenizer.enable_padding(length=None)  # pad to batch max
         LOGGER.info(
@@ -118,14 +121,17 @@ class EmbeddingModel:
             if self._pooled_output_name is not None:
                 (emb,) = self.session.run([self._pooled_output_name], feed)
             else:
+                # [EM-04] No pooled output: mean-pool 3D token embeddings with attention mask, clipped to avoid div-by-zero on all-pad rows.
                 outputs = self.session.run(None, feed)
                 emb = outputs[0]
                 if emb.ndim == 3:
                     # token embeddings returned -> mean-pool with attention mask
                     mask = attention_mask.astype(np.float32)[:, :, None]
                     emb = (emb * mask).sum(axis=1) / np.clip(mask.sum(axis=1), 1e-6, None)
+            # [EM-05] Matryoshka: slice to first EMBEDDING_DIM dimensions so smaller indices remain compatible with the same model file.
             # Matryoshka truncation
             emb = emb[:, :EMBEDDING_DIM]
+            # [EM-06] L2 normalize then linear int8 quantize: clip [-1,1] → ×127 → round → int8 (saturating, so a rogue dim can't squash the rest).
             # L2 normalize
             norms = np.linalg.norm(emb, axis=1, keepdims=True)
             emb = emb / np.clip(norms, 1e-12, None)

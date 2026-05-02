@@ -16,6 +16,7 @@ def canonical_url(doc_id: str) -> str:
     ``doc_id`` is the ATO's own slashed path (e.g. ``TXR/TR20243/NAT/ATO/00001``);
     the URL is a direct substitution so we don't store ``href`` separately.
     """
+    # [OF-01] Direct substitution — no separate href stored, link always reflects current doc_id.
     return f"{BASE_URL}/law/view/document?docid={doc_id}"
 
 
@@ -32,6 +33,7 @@ def format_hits_markdown(
         for i, hit in enumerate(hits, start=1):
             title = hit.get("title") or hit["doc_id"]
             typ = hit.get("type") or ""
+            # [OF-04] Escape '|' to '\\|' and replace newlines with spaces so cells stay inside the table grid.
             heading = (hit.get("heading_path") or "").replace("|", "\\|")
             snippet = (hit.get("snippet") or "").replace("|", "\\|").replace("\n", " ")
             lines.append(
@@ -40,8 +42,10 @@ def format_hits_markdown(
             )
         parts.append("\n".join(lines))
     else:
+        # [OF-02] Distinguish 'nothing matched at all' from 'all top results were suppressed by SeenTracker'.
         parts.append("_No fresh matches._")
     if previously_seen:
+        # [OF-03] Suppressed-results tail: bullet list of (chunk_id, title, doc_id, heading) + ready-to-paste get_chunks([...]) for one-shot recovery.
         ids_repr = ", ".join(str(s["chunk_id"]) for s in previously_seen)
         tail = [
             "",
@@ -85,6 +89,7 @@ def format_document_outline_markdown(
     ]
     for i, e in enumerate(outline_entries, start=1):
         heading = (e.get("heading_path") or "(intro)").replace("|", "\\|")
+        # [OF-05] Indent by depth using doubled non-breaking spaces ('&nbsp;&nbsp;' per level) so deeper headings nest visually.
         indent = "&nbsp;&nbsp;" * max(0, (e.get("depth") or 1) - 1)
         lines.append(
             f"| {i} | {indent}{heading} | `{e.get('anchor') or ''}` "
@@ -133,4 +138,5 @@ def format_document_full_markdown(doc: dict, chunks: list[dict]) -> str:
 
 
 def as_json(obj: object) -> str:
+    # [OF-06] orjson + OPT_INDENT_2 for human-readable output; decoded to UTF-8 so the MCP response is always str, not bytes.
     return orjson.dumps(obj, option=orjson.OPT_INDENT_2).decode("utf-8")

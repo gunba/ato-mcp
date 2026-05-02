@@ -23,6 +23,7 @@ _WS_RE = re.compile(r"\s+")
 
 DEFAULT_MAX_TOKENS = 900
 DEFAULT_OVERLAP_TOKENS = 120
+# [IB-02] Section-aware chunking with tail-overlap bridge: 900 tokens cap, 120-token bridge between adjacent chunks under the same heading so vector search doesn't lose context at boundaries.
 TITLE_SEP = " — "
 PATH_SEP = " › "
 
@@ -52,6 +53,7 @@ def strip_title_prefix(heading_path: str) -> str:
     Pure string transform — safe to apply at chunk emission time and as a
     one-shot rewrite over an existing ``chunks.heading_path`` column.
     """
+    # [IB-04] Pure string transform — safe at chunk emission time AND as a one-shot rewrite over chunks.heading_path.
     if not heading_path:
         return ""
     parts = heading_path.split(PATH_SEP)
@@ -78,6 +80,7 @@ class Chunk:
 
 def approx_tokens(text: str) -> int:
     """Rough token count: whitespace split + a constant factor for subwords."""
+    # [IB-05] Boundary-control heuristic only; the embedding tokenizer enforces the real per-batch token limit.
     return max(1, int(len(text.split()) * 1.3))
 
 
@@ -158,6 +161,7 @@ def chunk_markdown(
     Each chunk carries a heading_path formed by joining the stack of active
     headings with ``' › '`` (note the non-ASCII separator).
     """
+    # [IB-01] Recursive chunker: heading-boundary split first, then paragraph (blank-line) split, then sentence split — never silently truncates.
     if not markdown.strip():
         return []
 
@@ -181,6 +185,7 @@ def chunk_markdown(
         heading = section["heading"]
         anchor = section["anchor"]
         if level > 0:
+            # [IB-03] Pop same-level siblings before pushing — converts consecutive <h5>Note 1:</h5> / <h5>Note 2:</h5> blocks from false 2-deep stack into siblings.
             # Pop siblings and descendants of the new heading. This is what
             # converts ``<h5>Note 1:</h5>`` followed by ``<h5>Note 2:</h5>``
             # from a false 2-deep stack into siblings.

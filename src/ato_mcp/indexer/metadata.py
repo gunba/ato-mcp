@@ -90,6 +90,7 @@ def doc_id_for(canonical_id: str) -> str:
     Falls back to the raw URL if the ``docid=`` query parameter is missing,
     so we always have *some* unique key even for malformed inputs.
     """
+    # [IB-18] doc_id is the verbatim docid= path (prefix, case, slashes preserved); raw-URL fallback ensures every record has a unique key even when the canonical URL is malformed.
     return _extract_docid_path(canonical_id) or canonical_id
 
 

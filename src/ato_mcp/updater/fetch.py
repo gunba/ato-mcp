@@ -17,6 +17,7 @@ def fetch_url(client: httpx.Client, url: str, dest: Path) -> None:
     be exposed through an approved mirror or installed from a local/offline
     bundle.
     """
+    # [UM-04] No GitHub token env vars, no `gh` shell-out — keeps end-user runtime credential-free; private assets must use an approved mirror or local bundle.
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists():
         dest.unlink()
@@ -42,6 +43,7 @@ def verify_sha256(path: Path, expected: str) -> None:
 
 def make_client() -> httpx.Client:
     """Return a reusable httpx client with http/2 + bounded timeouts."""
+    # [UM-03] httpx + http/2 + 64 KB streaming chunks; bounded timeouts (connect=10s, read=60s, write=60s, pool=60s); sha256 verify in verify_sha256 before any file is considered downloaded.
     return httpx.Client(
         http2=True,
         timeout=httpx.Timeout(connect=10.0, read=60.0, write=60.0, pool=60.0),

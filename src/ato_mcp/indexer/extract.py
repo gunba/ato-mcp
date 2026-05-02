@@ -119,6 +119,7 @@ def _leading_headings(container: Node) -> list[str]:
 
 def _compose_title(headings: list[str]) -> str | None:
     """Join a small number of leading headings into a readable title."""
+    # [IB-07] Compose title from leading headings (h1=doc_type, h2=code, h3=subject on rulings); suppress prefix-overlap so 'TR' + 'TR 2024/3' doesn't double up; falls back to <title> at caller.
     cleaned = [h.strip() for h in headings if h and h.strip()]
     if not cleaned:
         return None
@@ -141,6 +142,7 @@ def _first_text(tree: HTMLParser, selector: str) -> str | None:
 
 
 def _pick_container(tree: HTMLParser) -> Node | None:
+    # [IB-06] Container fallback chain absorbs the various wrapper IDs ATO has used over the years; final fallback is body or root.
     # ATO has used several wrapper ids over the years; try each.
     for selector in ("#LawContent", "#lawContents", "#contents", "#content", "article", "main"):
         node = tree.css_first(selector)
@@ -166,6 +168,7 @@ def _inject_anchor_suffixes(node: Node) -> None:
     markdownify preserves the text; we append the anchor so chunks can reference
     it directly. Same rule applied to ``<a name="foo">`` siblings.
     """
+    # [IB-08] Inject heading id as ' {#anchor}' suffix so the chunker can reference sections; markdownify runs with heading_style=ATX, bullets='-', and script/style/iframe stripped.
     for tag in _HEADING_TAGS:
         for heading in node.css(tag):
             anchor = heading.attributes.get("id")

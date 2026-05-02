@@ -14,6 +14,8 @@ Flow:
 Rollback = copy the snapshot back and drop the new manifest. ``doctor
 --rollback`` uses this.
 """
+# [UM-05] Pointer-after-data: installed_manifest.json is written LAST so a partial run can't claim a successful update — the manifest is the success signal.
+# [UM-06] Rollback = copy backups/ato.db.prev back + drop new manifest; serve picks up the rollback via its mtime-based connection refresh.
 from __future__ import annotations
 
 import shutil

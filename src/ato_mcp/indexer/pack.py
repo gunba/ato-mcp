@@ -44,9 +44,11 @@ from ..store.db import EMBEDDING_DIM
 TRAILER_MAGIC = b"ATOPK\x01"
 RECORD_LEN = struct.Struct("<I")  # uint32 little-endian
 PACK_TARGET_SIZE = 64 * 1024 * 1024  # 64 MB uncompressed record payload before zstd
+# [IB-10] Pack target 64 MB uncompressed before zstd level 3 — keeps individual pack downloads tractable on slow links; PackBuilder seals + opens next writer when offset crosses target.
 
 
 def encode_embedding(raw_bytes: bytes) -> str:
+    # [IB-11] Embeddings travel as base64-encoded raw int8 bytes; both encode + decode length-check against EMBEDDING_DIM so a wrong-shape embedding can't slip through.
     if len(raw_bytes) != EMBEDDING_DIM:
         raise ValueError(f"embedding must be {EMBEDDING_DIM} bytes, got {len(raw_bytes)}")
     return base64.b64encode(raw_bytes).decode("ascii")
@@ -75,6 +77,7 @@ class PackWriter:
             writer.add(doc_id, record_dict)
         pack_sha8 = writer.sha8
     """
+    # [IB-09] Pack record format: length:uint32 (LE) | zstd(orjson(record)); content-addressable via sha256[:8]; trailer at end has MAGIC + count + index_offset + index_blob (reverse index of (doc_id, offset, length)) for offline verification.
 
     path: Path
     level: int = 3

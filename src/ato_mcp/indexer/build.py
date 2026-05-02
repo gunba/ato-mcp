@@ -59,6 +59,7 @@ LOGGER = get_logger(__name__)
 
 BASE_URL = "https://www.ato.gov.au"
 
+# [IB-13] CHECKPOINT_EVERY=1000 docs commits the in-progress SQLite txn AND flushes the in-flight pack — a kill mid-run loses at most this many docs of work.
 # Commit the in-progress transaction every N newly-processed docs so a kill
 # mid-run only loses at most this many docs of work. Packs sealed at each
 # checkpoint become immutable on disk and are picked up on restart.
@@ -144,6 +145,7 @@ class WindowTimings:
 
 
 def _build_fresh_windowed(args: BuildArgs) -> Manifest:
+    # [IB-12] Fresh-build path (no previous_manifest): full re-embed; lexical-hash-rust is allowed here. Incremental build() is a separate path that requires embeddinggemma + reuses pack slots when content_hash unchanged.
     _reset_fresh_outputs(args.out_dir, args.db_path)
     packs_dir = args.out_dir / "packs"
     packs_dir.mkdir(parents=True, exist_ok=True)
@@ -215,6 +217,7 @@ def _build_fresh_windowed(args: BuildArgs) -> Manifest:
                 vectors_i8 = encoded.vectors_int8
                 tokens_seen += encoded.tokens_seen
             elif texts and args.embedder == "lexical-hash-rust":
+                # [IB-17] Fast CPU-only fallback embedder: rustc-compiled FNV-hash vectorizer producing same-shape int8 vectors so query-time path is identical to embeddinggemma.
                 vectors_i8 = rust_lexical_hash(texts, binary_dir=args.out_dir / ".build")
                 tokens_seen += _cheap_token_estimate(texts)
             else:
@@ -322,6 +325,7 @@ def build(args: BuildArgs) -> Manifest:
     store_db.set_meta(conn, "embedding_model_id", args.model_id)
     store_db.set_meta(conn, "index_version", _today_version())
 
+    # [IB-14] Resume support: doc_ids already in documents with sealed pack_sha8 (not 'PENDING') are skipped — prior commit landed rows + pack atomically.
     # Resume support: any doc_id already in documents with a sealed pack
     # (pack_sha8 != PENDING) is skipped this run. The prior commit landed its
     # rows + pack bytes atomically, so the state is safe to keep.
@@ -389,6 +393,7 @@ def build(args: BuildArgs) -> Manifest:
             if has_content and not markdown.strip():
                 has_content = False
 
+            # [IB-15] Empty shells (status=success but no extractable body — broken pages, EPA stubs) go to empty_shells, NOT documents/title_fts/chunks_fts; later retry runs can re-probe by URL.
             # Empty shell: scraper succeeded but extracted no body. Log it
             # to empty_shells so a later retry run can re-probe the URL,
             # then skip inserting into ``documents``.
@@ -616,6 +621,7 @@ def _prepare_window(pages_dir: Path, records: list[dict], workers: int) -> list[
     items = ((pages_dir, rec) for rec in records)
     if workers <= 1:
         return [_prepare_one(item) for item in items]
+    # [IB-16] Window-prepare phase parallelises HTML extract + chunking via ProcessPoolExecutor (workers = cpu_count - 1); embed + DB-write phases stay single-threaded since they hold the SQLite transaction.
     with ProcessPoolExecutor(max_workers=workers, initializer=_prepare_worker_init) as pool:
         return list(pool.map(_prepare_one, items, chunksize=32))
 

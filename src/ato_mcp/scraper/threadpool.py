@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from typing import Iterator, Optional
 
 _DEFAULT_MAX_WORKERS = 4
+# [SS-08] 4-worker default for fan-out; concurrent fetches still serialise on AtoBrowseClient's rate lock — worker count caps parsing parallelism, not network throughput.
 
 _executor: Optional[ThreadPoolExecutor] = None
 

@@ -60,6 +60,7 @@ class SnapshotWriter:
 
 
 def diff_snapshots(old_file: Path | str, new_file: Path | str) -> SnapshotDiff:
+	# [SS-05] Compare two snapshots by canonical_id (or 'uid:<uid>' fallback when canonical_id absent) for added/removed/changed sets — basis for catch_up mode.
 	old_nodes = _load_node_map(Path(old_file))
 	new_nodes = _load_node_map(Path(new_file))
 

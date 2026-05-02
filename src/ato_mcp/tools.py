@@ -56,6 +56,7 @@ class Backend:
 
     @property
     def db(self) -> sqlite3.Connection:
+        # [MT-07] Reopen connection when the db file's mtime advances — picks up a concurrent ato-mcp update without restart.
         tls = self._tls
         conn: sqlite3.Connection | None = getattr(tls, "conn", None)
         try:
@@ -91,6 +92,7 @@ def get_backend() -> Backend:
     return _BACKEND
 
 
+# [MT-01] Process-scoped, thread-safe set of chunk_ids — MCP stdio runs one session per process.
 class SeenTracker:
     """Per-process record of chunk_ids surfaced to the agent.
 
@@ -178,10 +180,11 @@ _GLOB_ESCAPE = str.maketrans({"\\": r"\\", "%": r"\%", "_": r"\_"})
 
 def _glob_to_like(pattern: str) -> str:
     """Turn a shell glob into a SQL LIKE pattern (use with ``ESCAPE '\\'``)."""
+    # [MT-13] Translate '*' → '%' and escape '\\', '%', '_' so types/doc_scope globs work via LIKE ... ESCAPE '\\'.
     return pattern.translate(_GLOB_ESCAPE).replace("*", "%")
 
 
-# Types excluded from search / search_titles / whats_new by default.
+# [MT-10] Types excluded from search / search_titles / whats_new by default.
 # Agents still reach them by passing the type name explicitly in ``types``.
 # Edited private advice is one-off, individual-taxpayer rulings the ATO
 # publishes in a redacted form — informative if you know you want EPA
@@ -283,6 +286,7 @@ def _fts_query(query: str) -> str:
     ``"355-25"``) are preserved as phrases so section-number lookups keep
     working even though FTS5 indexes them as separate tokens internally.
     """
+    # [MT-08] Implicit AND across tokens; drop 1-char tokens so R&D doesn't degenerate; preserve hyphenated tokens as quoted phrases (s 8-1, 355-25).
     tokens = [t for t in _WORD_RE.findall(query) if len(t) >= 2]
     if not tokens:
         return '""'
@@ -290,6 +294,7 @@ def _fts_query(query: str) -> str:
 
 
 def _encode_query(conn: sqlite3.Connection, query: str) -> bytes:
+    # [MT-09] is_query=True applies the EmbeddingGemma query prefix; lexical-hash-rust fallback when meta.embedding_model_id matches that prefix.
     backend = get_backend()
     model_id = store_db.get_meta(conn, "embedding_model_id") or ""
     if model_id.startswith("lexical-hash-rust"):
@@ -334,6 +339,7 @@ def _rrf_fuse(
     vec: list[tuple[int, float]],
     k: int = RRF_K,
 ) -> list[tuple[int, float]]:
+    # [MT-05] Reciprocal Rank Fusion: 1/(K+rank+1) per ranker, summed across rankers (K=RRF_K=60).
     scores: dict[int, float] = {}
     for rank, (chunk_id, _score) in enumerate(fts):
         scores[chunk_id] = scores.get(chunk_id, 0.0) + 1.0 / (k + rank + 1)
@@ -393,8 +399,7 @@ def search(
         types, date_from, date_to, doc_scope, include_old=include_old
     )
 
-    # Bump internal_k by |seen| so the seen filter can hide that many
-    # without starving the frontier.
+    # [MT-02] Bump internal_k by |seen| so the seen filter can hide that many without starving the frontier.
     internal_k = max(k * 5, 50) + len(seen)
     fts_hits: list[tuple[int, float]] = []
     vec_hits: list[tuple[int, float]] = []
@@ -414,8 +419,8 @@ def search(
     else:
         fused = [(cid, -score) for cid, score in vec_hits]
 
-    # Split fused ranking into fresh candidates and a capped echo of the
-    # most relevant chunks the agent has already seen this session.
+    # [MT-03] Split fused ranking into fresh candidates and a MAX_SEEN_ECHO-capped echo of the
+    # most relevant chunks the agent has already seen this session, in fused-rank order.
     fresh: list[tuple[int, float]] = []
     seen_ids: list[int] = []
     for chunk_id, score in fused:
@@ -459,6 +464,7 @@ def search(
 
 def _apply_recency_boost(records: list[dict], *, half_life_years: float) -> None:
     """Multiply each record's ``score`` by a recency factor in (0.5, 1.5]."""
+    # [MT-06] Multiplicative factor in (0.5, 1.5] with 5-year half-life; only applied for sort_by='relevance'; rows without a parseable year are untouched.
     import datetime as _dt
     import math
     now_year = _dt.datetime.now(tz=_dt.timezone.utc).year
@@ -475,6 +481,7 @@ def _apply_recency_boost(records: list[dict], *, half_life_years: float) -> None
 
 
 def _slim_hit(hit: dict) -> dict:
+    # [MT-04] Strip body/text — search returns slim handles + snippets only; bodies materialize via get_chunks (progressive disclosure).
     keys = (
         "doc_id", "title", "type", "date",
         "heading_path", "anchor", "snippet",
@@ -524,6 +531,7 @@ def search_titles(
     format: Literal["markdown", "json"] = "markdown",
     include_old: bool = False,
 ) -> str:
+    # [MT-14] bm25 against title_fts (titles + collected headings); independent of chunks/SeenTracker — title/citation lookup, not body retrieval.
     backend = get_backend()
     k = max(1, min(k, 100))
     where, params = _build_sql_filter(types, None, None, None, include_old=include_old)
@@ -569,7 +577,7 @@ def get_document(
 ) -> str:
     """Return a document or a slice of it.
 
-    Three retrieval modes, one tool:
+    [MT-11] Three retrieval modes, one tool:
 
     * **Whole document** (no selector) — ``format='outline'`` for the TOC,
       ``format='markdown'`` for the full body. ``max_chars`` caps either.
@@ -605,8 +613,8 @@ def get_document(
         )
     selected, continuation_ord = chunks
 
-    # Materialised chunks now sit in the agent's context; mark them as
-    # seen so subsequent searches don't re-surface them.
+    # [MT-12] Materialised chunks now sit in the agent's context; mark them as
+    # seen so subsequent searches don't re-surface them. (Outline path returns earlier and never reaches this point.)
     get_seen().add(c["chunk_id"] for c in selected)
 
     if format == "json":
@@ -802,6 +810,7 @@ def whats_new(
     types: list[str] | None = None,
     format: Literal["markdown", "json"] = "markdown",
 ) -> str:
+    # [MT-15] Sort by COALESCE(date, downloaded_at) DESC; snippet shows 'published <date>' or 'ingested <downloaded_at>'.
     backend = get_backend()
     sort_expr = "COALESCE(date, downloaded_at)"
     clauses: list[str] = []
