@@ -6,7 +6,7 @@
 # them by default duplicates the pack assets.
 #
 # Prereqs:
-#   - build-index has finished; release/ contains ato.db, packs/, manifest.json
+#   - build-index has finished; release/ contains packs/ and manifest.json
 #   - model at models/embeddinggemma/
 #   - optional ATO_MCP_MODEL_URL for an approved model mirror
 #   - gh authenticated for the maintainer account

@@ -83,8 +83,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
     v5 collapsed the schema (human_code/human_title/category/doc_type/
     pub_date/first_published_date/effective_date/status/has_content/href
     all dropped or merged into ``type``/``title``/``date``). In-place
-    column migrations aren't worth supporting — pre-v5 DBs should be
-    migrated with ``scripts/migrate_v4_to_v5.py`` or rebuilt from source.
+    column migrations are no longer supported; pre-v5 DBs should be rebuilt
+    from source.
 
     Additive tables introduced after v5.0 (``empty_shells``) are created
     here if absent so older v5 DBs pick them up on open.
@@ -95,9 +95,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if "human_code" in cols or "category" in cols or "href" in cols:
         raise RuntimeError(
             "This database is pre-v5 (it still has human_code/category/href columns).\n"
-            "v5 replaced those with type/title/date. Run\n"
-            "  python scripts/migrate_v4_to_v5.py <db>\n"
-            "to migrate in place, or rebuild from ato_pages/."
+            "v5 replaced those with type/title/date. Rebuild from ato_pages/ with\n"
+            "  ato-mcp build-index ..."
         )
     if "canonical_id" in cols or "docid_code" in cols:
         raise RuntimeError(

@@ -196,6 +196,10 @@ Release builds use EmbeddingGemma vectors. The model is not uploaded to
 GitHub Releases; by default the manifest points at pinned Hugging Face
 EmbeddingGemma files, and the Rust client downloads and verifies them during
 `init`, `update`, or `serve`. Pass `--model-url` only for an approved mirror.
+Corpus releases must come from `build-index`; DB-derived repack scripts are not
+a supported release path. A full current corpus should use the current 64 MB
+pack target, which is about a dozen pack assets rather than dozens of small
+packs.
 Explicit `mode=keyword` is a query-time FTS mode, not an alternative corpus
 embedder. The optional `corpus release (gpu)` workflow targets a self-hosted
 runner labelled `gpu` and fails if `nvidia-smi` or ONNX Runtime's

@@ -3,7 +3,7 @@
 Maintainer commands:
     ato-mcp refresh-source ...    Scrape (incremental | full) into ato_pages/.
     ato-mcp build-index ...       Produce ato.db + packs + manifest.json.
-    ato-mcp release ...           Upload release artifacts (stub).
+    ato-mcp release ...           Upload release artifacts.
 """
 from __future__ import annotations
 
@@ -21,38 +21,6 @@ LOGGER = get_logger("ato_mcp.cli")
 app = typer.Typer(no_args_is_help=True, add_completion=False, help=__doc__)
 # [CC-01] Rust owns the installed MCP runtime. This Python CLI is maintainer tooling.
 # [CC-06] no_args_is_help=True + add_completion=False — small intentional CLI, no shell-completion magic.
-
-
-@app.command()
-def migrate(
-    db_path: Optional[Path] = typer.Option(
-        None, help="Path to ato.db. Defaults to the live install path."
-    ),
-) -> None:
-    """Upgrade an ato.db from schema v4 to v5 in place.
-
-    Safe to run on an already-v5 DB — it's a no-op. For pre-v4 DBs
-    (``canonical_id``/``docid_code`` present) this fails: those need a
-    full rebuild from ``ato_pages/``.
-    """
-    import sqlite3
-    from .store.migrate import migrate_v4_to_v5, needs_v4_to_v5
-
-    target = db_path or paths.db_path()
-    if not target.exists():
-        typer.echo(f"no DB at {target}", err=True)
-        raise typer.Exit(code=1)
-    probe = sqlite3.connect(str(target))
-    probe.row_factory = sqlite3.Row
-    try:
-        if not needs_v4_to_v5(probe):
-            typer.echo(f"{target}: already v5 — nothing to do")
-            return
-    finally:
-        probe.close()
-    typer.echo(f"{target}: migrating v4 → v5 ...")
-    migrate_v4_to_v5(target)
-    typer.echo("migrate: done")
 
 
 @app.command("refresh-source")

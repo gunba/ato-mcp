@@ -80,6 +80,7 @@ Run it by pushing a `v*` tag or via `workflow_dispatch`.
 After a local `build-index`:
 
 ```bash
+jq '.packs | length' release/manifest.json
 scripts/publish-release.sh v0.3.0 gunba/ato-mcp
 ```
 
@@ -87,7 +88,7 @@ Set `ATO_MCP_MODEL_URL` only when publishing against an approved model mirror.
 By default the manifest points at pinned Hugging Face EmbeddingGemma files.
 This uploads manifest and packs to GitHub Releases; it does not upload the
 model to GitHub, build Python wheels, or duplicate the corpus into an offline
-bundle by default.
+bundle by default. Do not publish DB-derived repacks.
 
 For an explicit air-gapped install package:
 
