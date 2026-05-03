@@ -3036,7 +3036,24 @@ fn apply_update_locked(manifest_url: &str) -> Result<UpdateStats> {
     let db = db_path()?;
     let had_existing_db = db.exists();
     let (added, mut changed, removed) = diff_manifests(old_manifest.as_ref(), &new_manifest);
-    let semantic_backfill = if had_existing_db {
+    let rebuild_for_schema = if had_existing_db {
+        live_db_requires_rebuild(&db)?
+    } else {
+        false
+    };
+    let rebuild_for_missing_manifest = had_existing_db && old_manifest.is_none();
+    let rebuild_for_replacement = whole_corpus_replacement(
+        old_manifest.as_ref(),
+        &new_manifest,
+        &added,
+        &changed,
+        &removed,
+    );
+    let semantic_backfill = if had_existing_db
+        && !rebuild_for_schema
+        && !rebuild_for_missing_manifest
+        && !rebuild_for_replacement
+    {
         let conn = open_read()?;
         semantic_backfill_required(&conn, &new_manifest)?
     } else {
@@ -3056,14 +3073,10 @@ fn apply_update_locked(manifest_url: &str) -> Result<UpdateStats> {
     }
 
     if !had_existing_db
+        || rebuild_for_schema
+        || rebuild_for_missing_manifest
         || semantic_backfill
-        || whole_corpus_replacement(
-            old_manifest.as_ref(),
-            &new_manifest,
-            &added,
-            &changed,
-            &removed,
-        )
+        || rebuild_for_replacement
     {
         return rebuild_live_db_from_manifest(
             &new_manifest,
@@ -3144,6 +3157,21 @@ fn whole_corpus_replacement(
         && removed.is_empty()
         && !new_manifest.documents.is_empty()
         && added.len() + changed.len() == new_manifest.documents.len()
+}
+
+fn live_db_requires_rebuild(path: &Path) -> Result<bool> {
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .context("opening local corpus database for schema check")?;
+    if !table_exists(&conn, "meta")? {
+        return Ok(true);
+    }
+    let Some(value) = get_meta(&conn, "schema_version")? else {
+        return Ok(true);
+    };
+    let Ok(parsed) = value.parse::<u32>() else {
+        return Ok(true);
+    };
+    Ok(parsed != SUPPORTED_SCHEMA_VERSION)
 }
 
 fn rebuild_live_db_from_manifest(
@@ -6335,6 +6363,111 @@ mod tests {
                 embeddings, 1,
                 "pack embedding_b64 should populate chunk_embeddings"
             );
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn apply_update_locked_rebuilds_unsupported_schema_db() -> Result<()> {
+        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let data = tempdir()?;
+        let release = tempdir()?;
+        let release_dir = release.path();
+        let packs_dir = release_dir.join("packs");
+        fs::create_dir_all(&packs_dir)?;
+
+        let model_bundle = release_dir.join("model-bundle.tar.zst");
+        write_test_tar_zst(
+            &model_bundle,
+            &[
+                ("model_quantized.onnx", b"dummy onnx bytes"),
+                ("tokenizer.json", br#"{"version":"1.0","truncation":null}"#),
+            ],
+        )?;
+        let model_bundle_bytes = fs::read(&model_bundle)?;
+
+        let embedding_b64 =
+            base64::engine::general_purpose::STANDARD.encode(vec![0u8; EMBEDDING_DIM]);
+        let record = json!({
+            "doc_id": "DOC_REBUILD_SCHEMA",
+            "type": "Public_ruling",
+            "title": "Rebuilt unsupported schema corpus",
+            "date": "2026-05-03",
+            "downloaded_at": "2026-05-03T00:00:00Z",
+            "content_hash": "hash-rebuild-schema",
+            "withdrawn_date": JsonValue::Null,
+            "superseded_by": JsonValue::Null,
+            "replaces": JsonValue::Null,
+            "chunks": [{
+                "ord": 0,
+                "heading_path": "Ruling",
+                "anchor": "ruling",
+                "text": "Unsupported schema update path must rebuild before semantic probes.",
+                "embedding_b64": embedding_b64
+            }]
+        });
+        let pack_bytes = encode_test_pack_record(&record)?;
+        let pack_path = packs_dir.join("pack-feedface.bin.zst");
+        fs::write(&pack_path, &pack_bytes)?;
+
+        let manifest = Manifest {
+            schema_version: MAX_SUPPORTED_MANIFEST_VERSION as i64,
+            index_version: "test-rebuild-schema".to_string(),
+            created_at: "2026-05-03T00:00:00Z".to_string(),
+            min_client_version: env!("CARGO_PKG_VERSION").to_string(),
+            model: ModelInfo {
+                id: "embeddinggemma-test".to_string(),
+                sha256: sha256_hex(&model_bundle_bytes),
+                size: model_bundle_bytes.len() as u64,
+                url: "model-bundle.tar.zst".to_string(),
+                tokenizer_sha256: None,
+            },
+            reranker: None,
+            documents: vec![DocRef {
+                doc_id: "DOC_REBUILD_SCHEMA".to_string(),
+                content_hash: "hash-rebuild-schema".to_string(),
+                pack_sha8: "feedface".to_string(),
+                offset: 0,
+                length: pack_bytes.len() as u64,
+            }],
+            packs: vec![PackInfo {
+                sha8: "feedface".to_string(),
+                sha256: sha256_hex(&pack_bytes),
+                size: pack_bytes.len() as u64,
+                url: "packs/pack-feedface.bin.zst".to_string(),
+            }],
+        };
+        let manifest_path = release_dir.join("manifest.json");
+        fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
+
+        with_data_dir(data.path(), || -> Result<()> {
+            let conn = open_write_at(&db_path()?)?;
+            init_db(&conn)?;
+            set_meta(&conn, "schema_version", "5")?;
+            drop(conn);
+            fs::write(
+                installed_manifest_path()?,
+                serde_json::to_vec_pretty(&sample_manifest(
+                    MAX_SUPPORTED_MANIFEST_VERSION as i64,
+                    env!("CARGO_PKG_VERSION"),
+                ))?,
+            )?;
+
+            let stats = apply_update_locked(manifest_path.to_str().expect("utf-8 path"))?;
+            assert_eq!(stats.added, 1);
+            assert_eq!(stats.changed, 0);
+            assert_eq!(stats.removed, 0);
+
+            let conn = open_read()?;
+            assert_eq!(get_meta(&conn, "schema_version")?.as_deref(), Some("6"));
+            let title: String = conn.query_row(
+                "SELECT title FROM documents WHERE doc_id = ?",
+                ["DOC_REBUILD_SCHEMA"],
+                |row| row.get(0),
+            )?;
+            assert_eq!(title, "Rebuilt unsupported schema corpus");
+            assert_eq!(chunk_embedding_count(&conn)?, 1);
             Ok(())
         })?;
         Ok(())

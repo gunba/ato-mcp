@@ -25,7 +25,7 @@ Hybrid BM25+vector search, slim hits, RRF fusion, recency boost, session-scoped 
 - [MT-11 L2239] get_document supports three retrieval modes through one tool: format='outline' returns the TOC; anchor/heading_path returns a section (include_children rolls up the subtree); from_ord paginates with count or max_chars and emits continuation_ord.
 - [MT-12 L2240] get_document outline/card/markdown/json all resolve through the same document row and chunk selectors; outline/card use outline_for_doc, while markdown/json materialize selected chunks with continuation metadata.
 - [MT-15 L2597] whats_new sorts by COALESCE(date, downloaded_at) DESC; the synthesised snippet says 'published <date>' when date is present, otherwise 'ingested <downloaded_at>'.
-- [MT-07 L4246] get_chunks fetches exact chunk ids from search results, can include before/after ordinal neighbours, deduplicates overlapping requested ranges, and emits next_call when max_chars truncates context.
+- [MT-07 L4274] get_chunks fetches exact chunk ids from search results, can include before/after ordinal neighbours, deduplicates overlapping requested ranges, and emits next_call when max_chars truncates context.
 
 ## Rust Output Formatters
 Markdown table for hits, previously_seen tail, document outline + section + full renderers, JSON output.
@@ -41,9 +41,9 @@ Markdown table for hits, previously_seen tail, document outline + section + full
 FastMCP tool registration, instructions builder from corpus stats, opportunistic warmup.
 
 - [SW-04 L1733] ServerState lazily loads SemanticRuntime on first semantic query and resolves the reranker state once; reranker load failures disable reranking for the rest of that server process.
-- [SW-02 L4401] Server instructions are built dynamically at start time from corpus stats (doc count, chunk count, type breakdown, meta keys), so the agent sees up-to-date corpus shape without restart-time configuration.
-- [SW-03 L4402] server_instructions is built from stats(OutputFormat::Json); if stats cannot be read, the server returns a static instruction telling the user to run ato-mcp init instead of crashing.
-- [SW-01 L4753] Six MCP tools are exposed by tool_descriptors/call_tool: search, search_titles, get_document, get_chunks, verify_quote, and whats_new.
+- [SW-02 L4429] Server instructions are built dynamically at start time from corpus stats (doc count, chunk count, type breakdown, meta keys), so the agent sees up-to-date corpus shape without restart-time configuration.
+- [SW-03 L4430] server_instructions is built from stats(OutputFormat::Json); if stats cannot be read, the server returns a static instruction telling the user to run ato-mcp init instead of crashing.
+- [SW-01 L4781] Six MCP tools are exposed by tool_descriptors/call_tool: search, search_titles, get_document, get_chunks, verify_quote, and whats_new.
   - The surface stays small and explicit; unsupported tools fail through the normal tools/call error path.
 
 ## Rust Update Mechanism
@@ -53,8 +53,8 @@ End-user update flow: manifest diff, pack fetch, in-place SQLite patch applicati
 - [UM-06 L2800] Rollback path copies backups/ato.db.prev back over the live DB; failed delta updates also restore the backup before returning the error.
 - [UM-01 L2917] Single-writer guard: apply_update takes the app LOCK file before apply_update_locked and releases it afterwards; serve/search paths open read-only DB connections and do not take the writer lock.
 - [UM-05 L3017] Delta update flow: diff manifests, optionally promote to whole-corpus rebuild/backfill, fetch changed/added pack records, mutate SQLite in one transaction, verify semantic install, then write installed_manifest.json last.
-- [UM-03 L3238] Fetch helpers resolve local paths, file://, manifest-relative assets, HTTP(S), and hf:// model/reranker URLs; downloaded model, reranker, and pack bytes are sha256-verified when the manifest provides a hash.
-- [UM-04 L3405] fetch helpers intentionally don't read GitHub token env vars and don't shell out to gh — private release assets must be exposed through an approved mirror or installed from a local/offline bundle. This keeps the end-user runtime credential-free.
+- [UM-03 L3266] Fetch helpers resolve local paths, file://, manifest-relative assets, HTTP(S), and hf:// model/reranker URLs; downloaded model, reranker, and pack bytes are sha256-verified when the manifest provides a hash.
+- [UM-04 L3433] fetch helpers intentionally don't read GitHub token env vars and don't shell out to gh — private release assets must be exposed through an approved mirror or installed from a local/offline bundle. This keeps the end-user runtime credential-free.
 
 ## CLI Commands
 Typer command surface, end-user vs maintainer split, defaults and global excludes.
