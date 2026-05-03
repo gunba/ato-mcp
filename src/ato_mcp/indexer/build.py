@@ -98,6 +98,9 @@ class BuildArgs:
     reranker_tokenizer_sha256: str | None = None
     previous_manifest: Path | None = None
     limit: int | None = None  # optional cap for testing
+    # [IB-17] Production build-index exposes only EmbeddingGemma.
+    # Lexical/hash-vector experiments are not release corpus embedders, and
+    # query-time keyword mode is separate.
     embedder: Literal["embeddinggemma"] = "embeddinggemma"
     encode_batch_size: int = 64
     max_batch_tokens: int = 8192
@@ -169,6 +172,9 @@ class WindowTimings:
 
 @dataclass
 class EncodedWindow:
+    # [IB-19] Fresh-build telemetry reports batch shape and throughput from
+    # this wrapper: encode calls, real tokens_seen, approximate padded-token
+    # pressure, and max observed batch size.
     vectors_int8: np.ndarray
     tokens_seen: int
     encode_calls: int

@@ -468,6 +468,7 @@ fn reranker_tokenizer_path() -> Result<PathBuf> {
 }
 
 fn lock_file() -> Result<File> {
+    // [UM-02] fs2::FileExt gives the update/install path a cross-platform advisory lock.
     let path = lock_path()?;
     let file = OpenOptions::new()
         .create(true)
@@ -523,6 +524,7 @@ fn open_write_at(path: &Path) -> Result<Connection> {
 /// install — refuse with a recovery hint rather than silently operating
 /// on a DB that may be missing required tables/indexes.
 fn enforce_db_schema_version(conn: &Connection) -> Result<()> {
+    // [CC-04] DB compatibility is fail-fast; the Rust runtime does not run Python-era migrations.
     if !table_exists(conn, "meta")? {
         bail!(
             "no schema_version metadata; corpus may be corrupt or incomplete; run `ato-mcp init`"
@@ -637,6 +639,7 @@ fn set_meta(conn: &Connection, key: &str, value: &str) -> Result<()> {
 }
 
 fn canonical_url(doc_id: &str) -> String {
+    // [OF-01] canonical_url is synthesized directly from doc_id.
     format!("https://www.ato.gov.au/law/view/document?docid={}", doc_id)
 }
 
@@ -650,6 +653,7 @@ fn compress_text(text: &str) -> Result<Vec<u8>> {
 }
 
 fn fts_query(query: &str) -> String {
+    // [MT-08] FTS query construction quotes >=2-char terms and preserves hyphenated phrases.
     let re = Regex::new(r"[A-Za-z0-9']+(?:-[A-Za-z0-9']+)*").expect("valid regex");
     let tokens: Vec<String> = re
         .find_iter(query)
@@ -665,6 +669,7 @@ fn fts_query(query: &str) -> String {
 }
 
 fn glob_to_like(pattern: &str) -> String {
+    // [MT-13] User glob filters translate '*' to LIKE '%' and escape LIKE metacharacters.
     let mut out = String::new();
     for ch in pattern.chars() {
         match ch {
@@ -694,6 +699,7 @@ fn build_doc_filter(
     include_old: bool,
     current_only: bool,
 ) -> SqlFilter {
+    // [MT-10] Default search policy excludes EPA and old non-legislation unless overridden.
     let mut clauses = Vec::new();
     let mut params_out = Vec::new();
 
@@ -753,6 +759,7 @@ fn build_doc_filter(
 
 #[derive(Debug, Serialize)]
 struct Hit {
+    // [MT-04] Search-family hits stay slim; bodies materialize through follow-up tools.
     doc_id: String,
     title: String,
     #[serde(rename = "type")]
@@ -929,6 +936,7 @@ fn search(
         opts.include_old,
         opts.current_only,
     );
+    // [MT-02] k is clamped, first-stage recall is widened, then candidates dedupe per document.
     let internal_limit = std::cmp::max(k * 5, 50);
     let lexical_hits = if matches!(opts.mode, SearchMode::Hybrid | SearchMode::Keyword) {
         lexical_search(&conn, query, &filter, internal_limit)?
@@ -1039,9 +1047,11 @@ fn search(
         }
     }
     if matches!(opts.sort_by, SortBy::Recency) {
+        // [MT-06] Recency sort materializes a widened frontier, then sorts by date descending.
         records.sort_by(|a, b| b.date.cmp(&a.date));
         records.truncate(k);
     }
+    // [MT-03] JSON metadata preserves query/filter state in next_call when k can grow.
     let next_call = if candidate_count > records.len() && k < MAX_K {
         Some(search_next_call(query, std::cmp::min(k * 2, MAX_K), &opts))
     } else {
@@ -1259,6 +1269,7 @@ fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
 }
 
 fn ensure_vector_search_ready(conn: &Connection) -> Result<()> {
+    // [MT-09] Hybrid/vector modes require an installed EmbeddingGemma semantic corpus.
     let model_id = get_meta(conn, "embedding_model_id")?.ok_or_else(|| {
         anyhow!("semantic search unavailable: missing embedding_model_id metadata")
     })?;
@@ -1376,6 +1387,7 @@ fn lexical_search(
 }
 
 fn rrf_fuse(vector_hits: &[VectorHit], lexical_hits: &[VectorHit]) -> Vec<VectorHit> {
+    // [MT-05] Hybrid ranking fuses vector and lexical ranks via RRF with K=60.
     const RRF_K: f64 = 60.0;
     let mut scores: HashMap<i64, f64> = HashMap::new();
     for (rank, hit) in vector_hits.iter().enumerate() {
@@ -1717,6 +1729,8 @@ enum RerankerState {
     Disabled,
 }
 
+// [MT-01] MCP stdio keeps one ServerState per process and reuses lazy runtimes.
+// [SW-04] SemanticRuntime/reranker load once; failed reranker loads disable reranking for the session.
 #[derive(Default)]
 struct ServerState {
     semantic_runtime: Option<SemanticRuntime>,
@@ -2056,6 +2070,7 @@ fn trim_chars(s: &str, max_chars: usize) -> String {
 }
 
 fn format_hits_markdown(hits: &[Hit]) -> String {
+    // [OF-02] Empty hit lists render a compact no-hit marker; otherwise use a table.
     if hits.is_empty() {
         return "_No hits._".to_string();
     }
@@ -2073,6 +2088,7 @@ fn format_hits_markdown(hits: &[Hit]) -> String {
         } else {
             escape_md(&hit.title)
         };
+        // [OF-03] Hit rows link titles to canonical_url and show doc_id for follow-up retrieval.
         out.push_str(&format!(
             "| {} | {} | {} | `{}` | {} | [{}]({})<br><small>`{}`</small> | {} | {} |\n",
             idx + 1,
@@ -2091,6 +2107,7 @@ fn format_hits_markdown(hits: &[Hit]) -> String {
 }
 
 fn escape_md(value: &str) -> String {
+    // [OF-04] Table cells escape pipes and flatten newlines so snippets cannot break the grid.
     value.replace('|', "\\|").replace('\n', " ")
 }
 
@@ -2102,6 +2119,7 @@ fn search_titles(
     current_only: bool,
     format: OutputFormat,
 ) -> Result<String> {
+    // [MT-14] search_titles ranks title_fts independently and uses the same default filters.
     let conn = open_read()?;
     let k = k.clamp(1, 100);
     let filter = build_doc_filter("d", types, None, None, None, include_old, current_only);
@@ -2218,6 +2236,8 @@ struct GetDocumentOptions<'a> {
 }
 
 fn get_document(doc_id: &str, opts: GetDocumentOptions<'_>) -> Result<String> {
+    // [MT-11] get_document supports outline/card/markdown/json plus section and ordinal selection.
+    // [MT-12] Outline/card share outline_for_doc; markdown/json materialize selected chunks.
     let conn = open_read()?;
     let doc = load_document_row(&conn, doc_id)?;
     let Some(doc) = doc else {
@@ -2523,6 +2543,7 @@ fn format_outline(doc: &DocumentRow, entries: &[OutlineEntry]) -> String {
     }
     out.push_str("| Ord | Chunks | Heading |\n|---:|---:|---|\n");
     for e in entries {
+        // [OF-05] Outline rows indent by heading depth using doubled non-breaking spaces.
         let indent = "&nbsp;".repeat(e.depth.saturating_sub(1) * 2);
         let display = if e.heading_path.is_empty() {
             "(intro)".to_string()
@@ -2573,6 +2594,7 @@ fn whats_new(
     current_only: bool,
     format: OutputFormat,
 ) -> Result<String> {
+    // [MT-15] whats_new sorts by COALESCE(date, downloaded_at) and labels published vs ingested.
     let conn = open_read()?;
     let mut clauses = Vec::new();
     let mut params_out = Vec::new();
@@ -2741,6 +2763,7 @@ fn stats(format: OutputFormat) -> Result<String> {
         }
     });
     match format {
+        // [OF-06] JSON outputs use serde_json pretty rendering before return/write.
         OutputFormat::Json => Ok(serde_json::to_string_pretty(&payload)?),
         OutputFormat::Markdown => {
             let mut out = String::new();
@@ -2774,6 +2797,7 @@ fn stats(format: OutputFormat) -> Result<String> {
 
 fn doctor(rollback: bool) -> Result<()> {
     if rollback {
+        // [UM-06] Rollback restores the previous DB snapshot from backups/ato.db.prev.
         let backup = backups_dir()?.join("ato.db.prev");
         if !backup.exists() {
             bail!("no backup found at {}", backup.display());
@@ -2890,6 +2914,7 @@ struct UpdateStats {
 }
 
 fn apply_update(manifest_url: &str) -> Result<UpdateStats> {
+    // [UM-01] apply_update holds the app LOCK around all install/update mutation.
     let lock = lock_file()?;
     let result = apply_update_locked(manifest_url);
     lock.unlock()?;
@@ -2897,6 +2922,7 @@ fn apply_update(manifest_url: &str) -> Result<UpdateStats> {
 }
 
 fn update_before_serve() -> Result<()> {
+    // [CC-02] serve updates first, but falls back to the installed DB if update fails.
     let url = default_manifest_url();
     match apply_update(&url) {
         Ok(stats) => {
@@ -2943,6 +2969,7 @@ fn ensure_installed_db() -> Result<()> {
 /// how to ingest, or whose `min_client_version` is newer than the
 /// currently-running binary.
 fn enforce_manifest_compatibility(manifest: &Manifest) -> Result<()> {
+    // [CC-03] init/update/serve share manifest compatibility gates through apply_update.
     let schema_version = manifest.schema_version;
     if schema_version < 0 {
         bail!("manifest schema_version is negative ({schema_version}); manifest is malformed");
@@ -2987,6 +3014,7 @@ fn cmp_dotted_version(a: &str, b: &str) -> std::cmp::Ordering {
 }
 
 fn apply_update_locked(manifest_url: &str) -> Result<UpdateStats> {
+    // [UM-05] Delta updates mutate SQLite transactionally, verify, then write installed_manifest last.
     let staging = staging_dir()?;
     let manifest_context = UrlContext::from_manifest_url(manifest_url);
     let manifest_bytes = fetch_bytes(manifest_url, &manifest_context)
@@ -3207,6 +3235,7 @@ fn insert_docs_from_packs(
     docs: &[DocRef],
     bytes_downloaded: &mut u64,
 ) -> Result<()> {
+    // [UM-03] Pack bytes are fetched from manifest-resolved assets and sha256-verified.
     let mut pack_to_refs: HashMap<String, Vec<DocRef>> = HashMap::new();
     for doc in docs {
         pack_to_refs
@@ -3373,6 +3402,7 @@ fn local_path_from_urlish(value: &str) -> Option<PathBuf> {
 }
 
 fn fetch_bytes(url_or_path: &str, context: &UrlContext) -> Result<Vec<u8>> {
+    // [UM-04] The Rust downloader is credential-free: no GitHub token env vars and no gh shell-out.
     if let Some(path) = local_path_from_urlish(url_or_path) {
         return Ok(fs::read(path)?);
     }
@@ -4213,6 +4243,7 @@ struct ChunkPointer {
 }
 
 fn get_chunks(chunk_ids: &[i64], opts: GetChunksOptions) -> Result<String> {
+    // [MT-07] get_chunks fetches exact chunk ids, optional neighbours, and truncation next_call.
     if chunk_ids.is_empty() {
         return Ok("_No chunk ids provided._".to_string());
     }
@@ -4367,6 +4398,8 @@ fn load_chunks_by_ord_range(
 }
 
 fn server_instructions() -> String {
+    // [SW-02] Instructions are generated from live corpus stats.
+    // [SW-03] Missing/unreadable stats fall back to static init guidance.
     match stats(OutputFormat::Json)
         .ok()
         .and_then(|s| serde_json::from_str::<JsonValue>(&s).ok())
@@ -4717,6 +4750,7 @@ fn format_verify_quote_markdown(matches: &[QuoteMatch], found: bool, truncated: 
 }
 
 fn tool_descriptors() -> JsonValue {
+    // [SW-01] Tool surface is deliberately limited to six explicit MCP tools.
     json!([
         {
             "name": "search",

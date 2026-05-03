@@ -7,8 +7,7 @@ paths:
 
 Tag line: `L<n>`; code usually starts at `L<n+1>`.
 
-## Index Builder
-Build orchestration, heading-aware chunking with overlap, token estimation, packing, manifest, release.
+## Index Extraction And Chunking
 
 - [IB-02 L26] DEFAULT_MAX_TOKENS=900 with DEFAULT_OVERLAP_TOKENS=120; adjacent chunks under the same heading are stitched with a tail-overlap bridge so vector search doesn't lose context at section boundaries.
 - [IB-04 L56] strip_title_prefix de-duplicates the document title's front-matter echo from heading_path; e.g. 'Taxation Ruling — TR 2024/3 — Subject › Taxation Ruling › TR 2024/3 › Ruling' collapses to 'Ruling'. Pure string transform — safe to apply at chunk emission and as a one-shot rewrite.

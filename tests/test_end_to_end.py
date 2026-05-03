@@ -8,6 +8,7 @@ the pipeline wires together against real HTML.
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
 
@@ -15,6 +16,40 @@ import numpy as np
 import pytest
 
 ATO_PAGES = Path(os.environ.get("ATO_MCP_TEST_PAGES_DIR", "ato_pages"))
+
+
+@pytest.fixture()
+def tiny_pages_dir(tmp_path: Path) -> Path:
+    pages_dir = tmp_path / "ato_pages_tiny"
+    payload = pages_dir / "payloads" / "tiny.html"
+    payload.parent.mkdir(parents=True)
+    payload.write_text(
+        """
+        <html>
+          <head><title>Example ruling</title></head>
+          <body>
+            <main>
+              <h1>Taxation Ruling</h1>
+              <h2>TR 2026/1</h2>
+              <h3>Example ruling</h3>
+              <p>This is body text for the small telemetry build smoke.</p>
+            </main>
+          </body>
+        </html>
+        """,
+        encoding="utf-8",
+    )
+    record = {
+        "canonical_id": (
+            "https://www.ato.gov.au/law/view/document?"
+            "docid=TR/TR20261/NAT/ATO/00001"
+        ),
+        "payload_path": "payloads/tiny.html",
+        "status": "success",
+        "downloaded_at": "2026-05-03T00:00:00+00:00",
+    }
+    (pages_dir / "index.jsonl").write_text(json.dumps(record) + "\n", encoding="utf-8")
+    return pages_dir
 
 
 def test_embedding_input_includes_heading_between_title_and_text() -> None:
@@ -66,6 +101,100 @@ def test_length_bucketed_encoder_reports_batch_telemetry(monkeypatch) -> None:
     assert encoded.max_batch_size == 2
     assert encoded.max_padded_tokens == 216
     assert encoded.approx_padded_tokens == 334
+
+
+def test_length_bucketed_encoder_logs_batch_shape_on_failure(monkeypatch, caplog) -> None:
+    import ato_mcp.indexer.build as build_module
+
+    token_counts = {"a": 10, "b": 20, "c": 30}
+    monkeypatch.setattr(
+        build_module.chunk_mod,
+        "approx_tokens",
+        lambda text: token_counts[text],
+    )
+    logger = logging.getLogger("tests.embedding.batch_failure")
+    logger.handlers.clear()
+    logger.propagate = True
+    monkeypatch.setattr(build_module, "LOGGER", logger)
+    caplog.set_level(logging.ERROR, logger=logger.name)
+
+    class FailingModel:
+        def encode(self, texts, *, is_query, batch_size: int):
+            raise RuntimeError("encode failed")
+
+    with pytest.raises(RuntimeError, match="encode failed"):
+        build_module._encode_length_bucketed(
+            FailingModel(),
+            ["a", "b", "c"],
+            batch_size=3,
+            max_batch_tokens=100,
+        )
+
+    assert (
+        "embedding batch failed batch_size=2 max_len=36 "
+        "approx_padded_tokens=72 max_batch_tokens=100 pos=0 remaining=3"
+    ) in caplog.text
+
+
+def test_fresh_build_logs_embedding_window_telemetry(
+    tiny_pages_dir: Path,
+    tmp_path: Path,
+    monkeypatch,
+    caplog,
+) -> None:
+    import ato_mcp.indexer.build as build_module
+    from ato_mcp.embed.model import EncodedBatch
+    from ato_mcp.store import db as store_db
+
+    logger = logging.getLogger("tests.embedding.window_telemetry")
+    logger.handlers.clear()
+    logger.propagate = True
+    monkeypatch.setattr(build_module, "LOGGER", logger)
+    caplog.set_level(logging.INFO, logger=logger.name)
+
+    class StubModel:
+        def __init__(self, *a, **kw) -> None:
+            pass
+
+        def encode(self, texts, *, is_query, batch_size: int = 16):
+            texts_list = list(texts)
+            return EncodedBatch(
+                vectors_int8=np.zeros(
+                    (len(texts_list), store_db.EMBEDDING_DIM),
+                    dtype=np.int8,
+                ),
+                tokens_seen=123,
+            )
+
+    monkeypatch.setattr(build_module, "EmbeddingModel", StubModel)
+
+    out_dir = tmp_path / "release"
+    manifest = build_module.build(
+        build_module.BuildArgs(
+            pages_dir=tiny_pages_dir,
+            out_dir=out_dir,
+            db_path=out_dir / "ato.db",
+            model_id="stub",
+            model_path=Path("/dev/null"),
+            tokenizer_path=Path("/dev/null"),
+            model_url="stub",
+            model_sha256="0" * 64,
+            model_size=0,
+            workers=1,
+            window_docs=1,
+        )
+    )
+
+    assert len(manifest.documents) == 1
+    assert "window=1" in caplog.text
+    assert "embed_calls=1" in caplog.text
+    assert "tokens=123" in caplog.text
+    assert "tokens/s=" in caplog.text
+    assert "chunks/s=" in caplog.text
+    assert "max_batch=" in caplog.text
+    assert "max_padded_tokens=" in caplog.text
+    assert "approx_padded_tokens=" in caplog.text
+    assert "encode_batch_size=64 max_batch_tokens=8192" in caplog.text
 
 
 @pytest.fixture()
