@@ -167,6 +167,16 @@ class WindowTimings:
     manifest: float = 0.0
 
 
+@dataclass
+class EncodedWindow:
+    vectors_int8: np.ndarray
+    tokens_seen: int
+    encode_calls: int
+    max_batch_size: int
+    max_padded_tokens: int
+    approx_padded_tokens: int
+
+
 def _build_fresh_windowed(args: BuildArgs) -> Manifest:
     # [IB-12] Fresh-build path (no previous_manifest): full re-embed. Incremental build() is a separate path that reuses pack slots when content_hash is unchanged.
     if args.embedder != "embeddinggemma":
@@ -201,6 +211,7 @@ def _build_fresh_windowed(args: BuildArgs) -> Manifest:
     doc_refs: list[DocRef] = []
     timings = WindowTimings()
     seen = docs_count = empty_shells = chunks_count = tokens_seen = windows = 0
+    encode_calls = approx_padded_tokens = 0
     since_checkpoint = 0
     t0 = time.monotonic()
 
@@ -215,7 +226,8 @@ def _build_fresh_windowed(args: BuildArgs) -> Manifest:
             seen += len(window)
             phase = time.monotonic()
             prepared = _prepare_window(args.pages_dir, window, args.workers)
-            timings.prepare += time.monotonic() - phase
+            prepare_s = time.monotonic() - phase
+            timings.prepare += prepare_s
 
             docs = [item for item in prepared if isinstance(item, PreparedDoc)]
             empties = [item for item in prepared if isinstance(item, EmptyShell)]
@@ -235,6 +247,11 @@ def _build_fresh_windowed(args: BuildArgs) -> Manifest:
             chunks_count += len(texts)
 
             phase = time.monotonic()
+            window_tokens = 0
+            window_encode_calls = 0
+            window_max_batch_size = 0
+            window_max_padded_tokens = 0
+            window_approx_padded_tokens = 0
             if texts:
                 assert model is not None
                 encoded = _encode_length_bucketed(
@@ -244,10 +261,18 @@ def _build_fresh_windowed(args: BuildArgs) -> Manifest:
                     max_batch_tokens=args.max_batch_tokens,
                 )
                 vectors_i8 = encoded.vectors_int8
-                tokens_seen += encoded.tokens_seen
+                window_tokens = encoded.tokens_seen
+                window_encode_calls = encoded.encode_calls
+                window_max_batch_size = encoded.max_batch_size
+                window_max_padded_tokens = encoded.max_padded_tokens
+                window_approx_padded_tokens = encoded.approx_padded_tokens
+                tokens_seen += window_tokens
+                encode_calls += window_encode_calls
+                approx_padded_tokens += window_approx_padded_tokens
             else:
                 vectors_i8 = np.empty((0, store_db.EMBEDDING_DIM), dtype=np.int8)
-            timings.embed += time.monotonic() - phase
+            embed_s = time.monotonic() - phase
+            timings.embed += embed_s
 
             phase = time.monotonic()
             _write_window(
@@ -259,7 +284,8 @@ def _build_fresh_windowed(args: BuildArgs) -> Manifest:
                 vectors_i8=vectors_i8,
                 zstd_level=args.zstd_level,
             )
-            timings.write += time.monotonic() - phase
+            write_s = time.monotonic() - phase
+            timings.write += write_s
 
             since_checkpoint += len(prepared)
             if since_checkpoint >= args.checkpoint_every:
@@ -268,7 +294,11 @@ def _build_fresh_windowed(args: BuildArgs) -> Manifest:
 
             elapsed = time.monotonic() - t0
             LOGGER.info(
-                "window=%d seen=%d docs=%d empty_shells=%d chunks=%d elapsed=%.1fs docs/s=%.1f",
+                "window=%d seen=%d docs=%d empty_shells=%d chunks=%d elapsed=%.1fs "
+                "docs/s=%.1f prepare=%.1fs embed=%.1fs write=%.1fs "
+                "embed_calls=%d tokens=%d tokens/s=%.1f chunks/s=%.1f "
+                "max_batch=%d max_padded_tokens=%d approx_padded_tokens=%d "
+                "encode_batch_size=%d max_batch_tokens=%d",
                 windows,
                 seen,
                 docs_count,
@@ -276,6 +306,18 @@ def _build_fresh_windowed(args: BuildArgs) -> Manifest:
                 chunks_count,
                 elapsed,
                 seen / elapsed if elapsed else 0.0,
+                prepare_s,
+                embed_s,
+                write_s,
+                window_encode_calls,
+                window_tokens,
+                window_tokens / embed_s if embed_s else 0.0,
+                len(texts) / embed_s if embed_s else 0.0,
+                window_max_batch_size,
+                window_max_padded_tokens,
+                window_approx_padded_tokens,
+                args.encode_batch_size,
+                args.max_batch_tokens,
             )
 
         _checkpoint(conn, pack_builder, doc_refs)
@@ -305,7 +347,9 @@ def _build_fresh_windowed(args: BuildArgs) -> Manifest:
     total = time.monotonic() - t0
     LOGGER.info(
         "Indexed %d docs, %d chunks, %d empty shells in %.1fs "
-        "(prepare=%.1fs embed=%.1fs write=%.1fs manifest=%.1fs tokens=%d)",
+        "(prepare=%.1fs embed=%.1fs write=%.1fs manifest=%.1fs "
+        "tokens=%d embed_calls=%d tokens/s=%.1f chunks/s=%.1f approx_padded_tokens=%d "
+        "encode_batch_size=%d max_batch_tokens=%d)",
         len(doc_refs_final),
         chunks_count,
         empty_shells,
@@ -315,6 +359,12 @@ def _build_fresh_windowed(args: BuildArgs) -> Manifest:
         timings.write,
         timings.manifest,
         tokens_seen,
+        encode_calls,
+        tokens_seen / timings.embed if timings.embed else 0.0,
+        chunks_count / timings.embed if timings.embed else 0.0,
+        approx_padded_tokens,
+        args.encode_batch_size,
+        args.max_batch_tokens,
     )
     _log_currency_summary(conn)
     return manifest
@@ -797,19 +847,25 @@ def _encode_length_bucketed(
     *,
     batch_size: int,
     max_batch_tokens: int,
-):
-    from ..embed.model import EncodedBatch
-
+) -> EncodedWindow:
     if not texts:
-        return EncodedBatch(
+        return EncodedWindow(
             vectors_int8=np.empty((0, store_db.EMBEDDING_DIM), dtype=np.int8),
             tokens_seen=0,
+            encode_calls=0,
+            max_batch_size=0,
+            max_padded_tokens=0,
+            approx_padded_tokens=0,
         )
 
     lengths = [min(1024, chunk_mod.approx_tokens(t) + 16) for t in texts]
     order = sorted(range(len(texts)), key=lengths.__getitem__)
     vectors = np.empty((len(texts), store_db.EMBEDDING_DIM), dtype=np.int8)
     tokens_seen = 0
+    encode_calls = 0
+    max_seen_batch_size = 0
+    max_seen_padded_tokens = 0
+    approx_padded_tokens = 0
 
     pos = 0
     while pos < len(order):
@@ -826,12 +882,38 @@ def _encode_length_bucketed(
 
         batch_indices = order[pos:end]
         batch = [texts[i] for i in batch_indices]
-        encoded = model.encode(batch, is_query=False, batch_size=len(batch))
+        try:
+            encoded = model.encode(batch, is_query=False, batch_size=len(batch))
+        except Exception:
+            padded_tokens = max_len * len(batch_indices)
+            LOGGER.exception(
+                "embedding batch failed batch_size=%d max_len=%d "
+                "approx_padded_tokens=%d max_batch_tokens=%d pos=%d remaining=%d",
+                len(batch_indices),
+                max_len,
+                padded_tokens,
+                max_batch_tokens,
+                pos,
+                len(order) - pos,
+            )
+            raise
         vectors[batch_indices, :] = encoded.vectors_int8
         tokens_seen += encoded.tokens_seen
+        encode_calls += 1
+        padded_tokens = max_len * len(batch_indices)
+        approx_padded_tokens += padded_tokens
+        max_seen_batch_size = max(max_seen_batch_size, len(batch_indices))
+        max_seen_padded_tokens = max(max_seen_padded_tokens, padded_tokens)
         pos = end
 
-    return EncodedBatch(vectors_int8=vectors, tokens_seen=tokens_seen)
+    return EncodedWindow(
+        vectors_int8=vectors,
+        tokens_seen=tokens_seen,
+        encode_calls=encode_calls,
+        max_batch_size=max_seen_batch_size,
+        max_padded_tokens=max_seen_padded_tokens,
+        approx_padded_tokens=approx_padded_tokens,
+    )
 
 
 def _write_window(

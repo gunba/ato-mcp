@@ -27,6 +27,47 @@ def test_embedding_input_includes_heading_between_title_and_text() -> None:
     assert _embedding_input("", "", "Body text") == "Body text"
 
 
+def test_length_bucketed_encoder_reports_batch_telemetry(monkeypatch) -> None:
+    import ato_mcp.indexer.build as build_module
+    from ato_mcp.embed.model import EncodedBatch
+    from ato_mcp.store import db as store_db
+
+    token_counts = {"a": 10, "b": 20, "c": 30, "d": 200}
+    monkeypatch.setattr(
+        build_module.chunk_mod,
+        "approx_tokens",
+        lambda text: token_counts[text],
+    )
+
+    class StubModel:
+        def __init__(self) -> None:
+            self.batches: list[list[str]] = []
+
+        def encode(self, texts, *, is_query, batch_size: int):
+            batch = list(texts)
+            self.batches.append(batch)
+            return EncodedBatch(
+                vectors_int8=np.zeros((len(batch), store_db.EMBEDDING_DIM), dtype=np.int8),
+                tokens_seen=sum(token_counts[text] for text in batch),
+            )
+
+    model = StubModel()
+    encoded = build_module._encode_length_bucketed(
+        model,
+        ["d", "a", "c", "b"],
+        batch_size=4,
+        max_batch_tokens=100,
+    )
+
+    assert model.batches == [["a", "b"], ["c"], ["d"]]
+    assert encoded.vectors_int8.shape == (4, store_db.EMBEDDING_DIM)
+    assert encoded.tokens_seen == 260
+    assert encoded.encode_calls == 3
+    assert encoded.max_batch_size == 2
+    assert encoded.max_padded_tokens == 216
+    assert encoded.approx_padded_tokens == 334
+
+
 @pytest.fixture()
 def sample_pages_dir(tmp_path: Path) -> Path:
     if not (ATO_PAGES / "index.jsonl").exists():
