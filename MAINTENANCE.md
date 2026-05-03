@@ -35,7 +35,7 @@ ATO_MCP_REPO_DIR="$PWD" \
 ATO_MCP_PAGES_DIR="/path/to/ato_pages" \
 ATO_MCP_MODEL_DIR="$PWD/models/embeddinggemma" \
 ATO_MCP_RERANKER_BUNDLE="$PWD/models/reranker" \
-ATO_MCP_RERANKER_URL="hf://cross-encoder/ms-marco-MiniLM-L-6-v2-onnx-int8@<revision-sha>" \
+ATO_MCP_RERANKER_URL="hf://Alibaba-NLP/gte-reranker-modernbert-base@<revision-sha>" \
 ATO_MCP_GH_REPO=gunba/ato-mcp \
 scripts/maintainer-sync.sh
 ```
@@ -113,9 +113,9 @@ directory. Do not build offline bundles by copying `release/ato.db` directly.
 ## Reranker model preparation
 
 Wave 3 (0.6.0+) introduces an optional cross-encoder reranker that the Rust
-runtime applies to the top-N hybrid candidates. The model is
-`cross-encoder/ms-marco-MiniLM-L-6-v2`, quantized to int8 ONNX (~25 MB on
-disk after quantization).
+runtime applies to the top-N hybrid candidates. The preferred model is
+`Alibaba-NLP/gte-reranker-modernbert-base`, using the quantized ONNX export
+(~151 MB on disk).
 
 The reranker is **optional**. A release built without `--reranker-bundle`
 leaves the manifest's `reranker` field `null` and the runtime falls back to
@@ -125,18 +125,17 @@ result quality drops.
 ### One-off: build the bundle
 
 ```bash
-pip install optimum[onnxruntime]==1.21.* onnx onnxruntime
-optimum-cli export onnx \
-    --model cross-encoder/ms-marco-MiniLM-L-6-v2 \
-    --task text-classification \
-    --quantization int8 \
-    ./reranker_bundle/
+mkdir -p ./reranker_bundle/onnx
+curl -fL -o ./reranker_bundle/onnx/model_quantized.onnx \
+    https://huggingface.co/Alibaba-NLP/gte-reranker-modernbert-base/resolve/<revision-sha>/onnx/model_quantized.onnx
+curl -fL -o ./reranker_bundle/tokenizer.json \
+    https://huggingface.co/Alibaba-NLP/gte-reranker-modernbert-base/resolve/<revision-sha>/tokenizer.json
 ```
 
 The output directory contains:
 
-- `model_quantized.onnx` (~25 MB) — the quantized weights
-- `tokenizer.json` (~700 KB) — the WordPiece tokenizer
+- `onnx/model_quantized.onnx` (~151 MB) — the quantized weights
+- `tokenizer.json` (~3.5 MB) — the tokenizer
 - `config.json` — model architecture metadata
 
 ### Hosting
@@ -146,15 +145,15 @@ URL so the Rust client always fetches the same artifact bytes. The manifest
 records this URL via `--reranker-url`. Format:
 
 ```
-hf://cross-encoder/ms-marco-MiniLM-L-6-v2-onnx-int8@<revision-sha>
+hf://Alibaba-NLP/gte-reranker-modernbert-base@<revision-sha>
 ```
 
 The Rust client tries the following filenames in order under that revision
 (first one whose download matches the manifest's `reranker.sha256` wins):
 
-1. `onnx/model.onnx` (the canonical optimum-cli output path)
-2. `onnx/model_quantized.onnx` (older quantized variants)
-3. `model_quantized.onnx` (root-level alias)
+1. `onnx/model_quantized.onnx` (preferred quantized output path)
+2. `model_quantized.onnx` (root-level quantized alias)
+3. `onnx/model.onnx` (canonical optimum-cli output path)
 4. `model.onnx` (root-level alias)
 
 This means you can host the bundle's `model_quantized.onnx` under any of
@@ -185,7 +184,7 @@ ato-mcp release \
     --repo gunba/ato-mcp \
     --model-dir ./models/embeddinggemma \
     --reranker-bundle ./reranker_bundle \
-    --reranker-url 'hf://cross-encoder/ms-marco-MiniLM-L-6-v2-onnx-int8@<revision-sha>' \
+    --reranker-url 'hf://Alibaba-NLP/gte-reranker-modernbert-base@<revision-sha>' \
     --overwrite
 ```
 

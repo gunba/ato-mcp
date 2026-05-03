@@ -26,9 +26,9 @@ MANIFEST_SCHEMA_VERSION = 3
 # rejects any manifest whose `min_client_version` is greater than
 # `CARGO_PKG_VERSION`, so this is the actual gate that prevents an older
 # binary from ingesting a newer corpus. Bump in lockstep with binary
-# releases that introduce schema or model changes (Wave 3: 0.6.0 introduces
+# releases that introduce schema or model changes (Wave 3: 0.6.x introduces
 # the optional cross-encoder reranker bundle).
-DEFAULT_MIN_CLIENT_VERSION = "0.6.0"
+DEFAULT_MIN_CLIENT_VERSION = "0.6.1"
 
 
 class ModelInfo(BaseModel):
@@ -71,11 +71,11 @@ class Manifest(BaseModel):
     created_at: str
     min_client_version: str = DEFAULT_MIN_CLIENT_VERSION
     model: ModelInfo
-    # Optional cross-encoder reranker bundle. Wave 3 (0.6.0) introduces a
-    # local int8 ONNX reranker (cross-encoder/ms-marco-MiniLM-L-6-v2) that
-    # the Rust runtime applies to top-N hybrid candidates. The field is
-    # optional: a release built without ``--reranker-bundle`` leaves it as
-    # ``None`` and the runtime falls back to the un-reranked hybrid score.
+    # Optional cross-encoder reranker bundle. Wave 3 (0.6.x) introduces a
+    # local ONNX reranker that the Rust runtime applies to top-N hybrid
+    # candidates. The field is optional: a release built without
+    # ``--reranker-bundle`` leaves it as ``None`` and the runtime falls back
+    # to the un-reranked hybrid score.
     reranker: Optional[ModelInfo] = None
     documents: list[DocRef] = Field(default_factory=list)
     packs: list[PackInfo] = Field(default_factory=list)

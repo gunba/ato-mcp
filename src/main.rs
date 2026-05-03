@@ -55,20 +55,19 @@ const SUPPORTED_SCHEMA_VERSION: u32 = 6;
 const MAX_SUPPORTED_MANIFEST_VERSION: u32 = 3;
 /// Maximum number of RRF top-N candidates we feed into the cross-encoder
 /// reranker per query. Reranking is O(N) ONNX inference; 50 keeps p99
-/// latency well below 500 ms on a CPU even on int8 ms-marco MiniLM.
+/// latency bounded on CPU even with a quantized cross-encoder.
 const RERANK_CANDIDATE_LIMIT: usize = 50;
-/// Cross-encoder query side max-token budget. Standard ms-marco
-/// MiniLM-L-6-v2 is trained with a 512-token total budget; we reserve
-/// the remaining ~448 tokens for the document side.
+/// Cross-encoder query side max-token budget. We reserve the remaining
+/// tokens for the document side so a long snippet does not evict the query.
 const RERANK_QUERY_MAX_TOKENS: usize = 64;
 /// Cross-encoder total sequence max length (`[CLS] q [SEP] d [SEP]`).
 const RERANK_PAIR_MAX_TOKENS: usize = 512;
 const DEFAULT_MAX_PER_DOC: usize = 2;
 const HARD_MAX_PER_DOC: usize = 3;
 const RERANKER_MODEL_CANDIDATES: &[&str] = &[
-    "onnx/model.onnx",
     "onnx/model_quantized.onnx",
     "model_quantized.onnx",
+    "onnx/model.onnx",
     "model.onnx",
 ];
 
@@ -1546,7 +1545,7 @@ impl SemanticRuntime {
     }
 }
 
-/// Cross-encoder reranker (`cross-encoder/ms-marco-MiniLM-L-6-v2` int8 ONNX).
+/// Cross-encoder reranker ONNX model.
 /// Loaded lazily on first search and cached on `ServerState`. Inputs are
 /// `[CLS] query [SEP] doc [SEP]` token pairs; the model emits a single
 /// relevance logit per pair which we squash through sigmoid into [0, 1].
@@ -1594,8 +1593,8 @@ impl Reranker {
     /// tokens upstream of tokenization. Note: the constant is in TOKENS;
     /// we approximate ~4 chars per token for the pre-tokenization trim
     /// (cheaper than re-running the tokenizer twice). The tokenizer's own
-    /// truncation handles the doc side; we leave a wide margin so MiniLM's
-    /// full 512-token budget can absorb a long heading_path-prefixed snippet.
+    /// truncation handles the doc side; we leave a wide margin so the
+    /// 512-token budget can absorb a long heading_path-prefixed snippet.
     fn rerank(&mut self, query: &str, candidates: &[(i64, &str)]) -> Result<Vec<(i64, f64)>> {
         if candidates.is_empty() {
             return Ok(Vec::new());
@@ -2810,9 +2809,8 @@ struct Manifest {
     #[serde(default)]
     min_client_version: String,
     model: ModelInfo,
-    /// Optional cross-encoder reranker (`cross-encoder/ms-marco-MiniLM-L-6-v2`
-    /// int8 ONNX). Older v1/v2 manifests omit this; the runtime degrades
-    /// gracefully to RRF-only ranking when absent.
+    /// Optional cross-encoder reranker. Older v1/v2 manifests omit this; the
+    /// runtime degrades gracefully to RRF-only ranking when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reranker: Option<ModelInfo>,
     #[serde(default)]

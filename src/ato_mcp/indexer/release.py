@@ -37,8 +37,8 @@ EMBEDDINGGEMMA_HF_FINGERPRINT = (
 )
 EMBEDDINGGEMMA_HF_SIZE = 329_781_810
 
-# Default cross-encoder reranker source: ms-marco-MiniLM-L-6-v2 quantized to
-# int8 ONNX. The Rust client downloads `model_quantized.onnx` + `tokenizer.json`
+# Default cross-encoder reranker source: gte-reranker-modernbert-base quantized
+# ONNX. The Rust client downloads `model_quantized.onnx` + `tokenizer.json`
 # from this Hugging Face revision and renames them to `live/reranker.onnx` +
 # `live/reranker_tokenizer.json` for runtime use.
 #
@@ -49,14 +49,11 @@ EMBEDDINGGEMMA_HF_SIZE = 329_781_810
 #      `--reranker-sha256`/`--reranker-size` (the bundle's own
 #      `model_quantized.onnx` is hashed automatically).
 #
-# We do not bake a default fingerprint here because — unlike EmbeddingGemma —
-# Wave 3 is the first release that publishes a reranker, so there's no
-# pre-existing pinned fingerprint to encode. Maintainers populate it on the
-# first release (the value will then be embedded in the Rust client as a
-# checksum constant alongside `EMBEDDINGGEMMA_HF_FILES`).
-RERANKER_DEFAULT_ID = "ms-marco-minilm-l6-v2-int8"
+# We do not bake a default fingerprint here because the release helper derives
+# the ONNX and tokenizer hashes from the maintainer's local bundle.
+RERANKER_DEFAULT_ID = "gte-reranker-modernbert-base-quantized"
 RERANKER_DEFAULT_HF_URL = (
-    "hf://cross-encoder/ms-marco-MiniLM-L-6-v2-onnx-int8@main"
+    "hf://Alibaba-NLP/gte-reranker-modernbert-base@f7481e6055501a30fb19d090657df9ec1f79ab2c"
 )
 
 
@@ -285,9 +282,9 @@ def _resolve_reranker_info(args: ReleaseArgs, current_reranker: ModelInfo | None
 # name). The Rust runtime walks the same list when downloading from HF —
 # the maintainer recipe in MAINTENANCE.md must keep them in sync.
 RERANKER_MODEL_CANDIDATES = (
-    "onnx/model.onnx",
     "onnx/model_quantized.onnx",
     "model_quantized.onnx",
+    "onnx/model.onnx",
     "model.onnx",
 )
 

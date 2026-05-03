@@ -146,7 +146,7 @@ def build_index(
     ),
     reranker_url: Optional[str] = typer.Option(
         None,
-        help="Optional reranker source URL (e.g. hf://cross-encoder/ms-marco-MiniLM-L-6-v2-onnx-int8@<sha>).",
+        help="Optional reranker source URL (e.g. hf://Alibaba-NLP/gte-reranker-modernbert-base@<sha>).",
     ),
     reranker_sha256: Optional[str] = typer.Option(
         None, help="sha256 of the externally hosted reranker ONNX file."
@@ -256,7 +256,7 @@ def release(
     ),
     reranker_id: Optional[str] = typer.Option(
         None,
-        help="Reranker model id stored in the manifest (default: ms-marco-minilm-l6-v2-int8).",
+        help="Reranker model id stored in the manifest (default: gte-reranker-modernbert-base-quantized).",
     ),
     reranker_url: Optional[str] = typer.Option(
         None,

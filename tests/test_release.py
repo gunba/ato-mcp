@@ -31,7 +31,7 @@ from ato_mcp.store.manifest import (
 
 def test_freshly_built_manifest_pins_min_client_version() -> None:
     """A freshly-constructed Manifest must default `min_client_version` to
-    "0.6.0" so older binaries refuse to ingest a v3 corpus.
+    "0.6.1" so older binaries refuse to ingest this corpus.
 
     The Rust enforce_manifest_compatibility check compares this field to
     `CARGO_PKG_VERSION`; without this default the gate is dormant and a
@@ -43,8 +43,8 @@ def test_freshly_built_manifest_pins_min_client_version() -> None:
         created_at="2026-05-03T00:00:00+00:00",
         model=ModelInfo(id="m", sha256="0" * 64, size=1, url="model/m.onnx.zst"),
     )
-    assert manifest.min_client_version == "0.6.0"
-    assert DEFAULT_MIN_CLIENT_VERSION == "0.6.0"
+    assert manifest.min_client_version == "0.6.1"
+    assert DEFAULT_MIN_CLIENT_VERSION == "0.6.1"
     # And the manifest format version is bumped to v3 (Wave 3 boundary).
     assert manifest.schema_version == MANIFEST_SCHEMA_VERSION
     assert MANIFEST_SCHEMA_VERSION == 3
@@ -313,7 +313,7 @@ def test_release_cli_accepts_reranker_bundle(
             tag="index-2026.05.03",
             repo="gunba/ato-mcp",
             reranker_bundle=bundle,
-            reranker_url="hf://cross-encoder/ms-marco-MiniLM-L-6-v2-onnx-int8@deadbeef",
+            reranker_url="hf://Alibaba-NLP/gte-reranker-modernbert-base@deadbeef",
             overwrite=True,
         )
     )
@@ -325,8 +325,8 @@ def test_release_cli_accepts_reranker_bundle(
     expected_sha = _hashlib.sha256(onnx_bytes).hexdigest()
     assert out.reranker.sha256 == expected_sha
     assert out.reranker.size == len(onnx_bytes)
-    assert out.reranker.url == "hf://cross-encoder/ms-marco-MiniLM-L-6-v2-onnx-int8@deadbeef"
-    assert out.reranker.id == "ms-marco-minilm-l6-v2-int8"
+    assert out.reranker.url == "hf://Alibaba-NLP/gte-reranker-modernbert-base@deadbeef"
+    assert out.reranker.id == "gte-reranker-modernbert-base-quantized"
 
     # Bundle bytes never make it to gh upload — the Rust runtime fetches
     # them from the HF URL on first use.

@@ -73,25 +73,25 @@ def test_manifest_schema_version_bumped_to_3() -> None:
     assert fresh.schema_version == 3
 
 
-def test_min_client_version_pins_to_0_6_0() -> None:
-    """Wave 3 bumps the minimum client version to 0.6.0. Older binaries
+def test_min_client_version_pins_to_0_6_1() -> None:
+    """Wave 3 bumps the minimum client version to 0.6.1. Older binaries
     decoding the v3 manifest would parse fine (the new `reranker` field is
     optional), but the runtime's `min_client_version > CARGO_PKG_VERSION`
     check rejects them earlier with a friendlier "upgrade required" error.
     """
-    assert DEFAULT_MIN_CLIENT_VERSION == "0.6.0"
+    assert DEFAULT_MIN_CLIENT_VERSION == "0.6.1"
     fresh = _m([])
-    assert fresh.min_client_version == "0.6.0"
+    assert fresh.min_client_version == "0.6.1"
 
 
 def test_manifest_with_reranker_serializes_and_deserializes(tmp_path: Path) -> None:
     """A manifest with a populated `reranker: ModelInfo` round-trips
     losslessly through JSON serialization."""
     rer = ModelInfo(
-        id="ms-marco-minilm-l6-v2-int8",
+        id="gte-reranker-modernbert-base-quantized",
         sha256="b" * 64,
-        size=25_000_000,
-        url="hf://cross-encoder/ms-marco-MiniLM-L-6-v2-onnx-int8@abc123",
+        size=150_871_837,
+        url="hf://Alibaba-NLP/gte-reranker-modernbert-base@abc123",
     )
     m = Manifest(
         index_version="2026.05.03",
@@ -105,15 +105,15 @@ def test_manifest_with_reranker_serializes_and_deserializes(tmp_path: Path) -> N
     save_manifest(m, path)
     loaded = load_manifest(path)
     assert loaded.reranker is not None
-    assert loaded.reranker.id == "ms-marco-minilm-l6-v2-int8"
+    assert loaded.reranker.id == "gte-reranker-modernbert-base-quantized"
     assert loaded.reranker.sha256 == "b" * 64
-    assert loaded.reranker.size == 25_000_000
-    assert loaded.reranker.url == "hf://cross-encoder/ms-marco-MiniLM-L-6-v2-onnx-int8@abc123"
+    assert loaded.reranker.size == 150_871_837
+    assert loaded.reranker.url == "hf://Alibaba-NLP/gte-reranker-modernbert-base@abc123"
 
     # The on-disk JSON must include the reranker field so older Rust binaries
     # can detect it (and the new ones can deserialize it).
     raw = json.loads(path.read_text())
-    assert raw["reranker"]["id"] == "ms-marco-minilm-l6-v2-int8"
+    assert raw["reranker"]["id"] == "gte-reranker-modernbert-base-quantized"
 
 
 def test_manifest_without_reranker_omits_field_or_defaults_none(tmp_path: Path) -> None:
