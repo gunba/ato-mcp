@@ -13,7 +13,7 @@ import sqlite_vec
 
 from ..util import paths
 
-SCHEMA_VERSION = "5"
+SCHEMA_VERSION = "6"
 EMBEDDING_DIM = 256
 EMBEDDING_DTYPE = "int8"
 
@@ -64,11 +64,16 @@ def connect(
 
 
 def init_db(path: Path | None = None) -> sqlite3.Connection:
-    """Create the DB file (if missing), apply schema, and create the vec0 table."""
+    """Create the DB file (if missing), apply schema, and create the vec0 table.
+
+    Runs the migration check BEFORE executing schema.sql so a pre-v6 DB
+    bails with a clear rebuild prompt rather than tripping over the new
+    ``CREATE INDEX ... withdrawn_date`` DDL.
+    """
     conn = connect(path, mode="rwc")
+    _migrate(conn)
     conn.executescript(_SCHEMA_PATH.read_text(encoding="utf-8"))
     conn.execute(_VEC_TABLE_DDL)
-    _migrate(conn)
     conn.execute(
         "INSERT INTO meta(key, value) VALUES (?, ?) "
         "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -78,7 +83,13 @@ def init_db(path: Path | None = None) -> sqlite3.Connection:
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
-    """Reject pre-v5 databases; additively patch v5 DBs missing later tables.
+    """Reject pre-v6 databases; additively patch v6 DBs missing later tables.
+
+    v6 adds three currency columns (``withdrawn_date``, ``superseded_by``,
+    ``replaces``) to ``documents``. Wave 2 forces a re-embed because of the
+    heading-aware embedder change, so additive ALTER buys nothing for end
+    users; pre-v6 DBs are rejected with a rebuild prompt mirroring the
+    pre-v5 rejection pattern.
 
     v5 collapsed the schema (human_code/human_title/category/doc_type/
     pub_date/first_published_date/effective_date/status/has_content/href
@@ -86,8 +97,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
     column migrations are no longer supported; pre-v5 DBs should be rebuilt
     from source.
 
-    Additive tables introduced after v5.0 (``empty_shells``) are created
-    here if absent so older v5 DBs pick them up on open.
+    Additive tables introduced in v5 (``empty_shells``) are created here
+    if absent so older v6 DBs that pre-date the additive table land safely.
     """
     cols = {row["name"] for row in conn.execute("PRAGMA table_info(documents)").fetchall()}
     if not cols:
@@ -102,6 +113,15 @@ def _migrate(conn: sqlite3.Connection) -> None:
         raise RuntimeError(
             "This database is pre-v4. Rebuild from ato_pages/ with\n"
             "  ato-mcp build-index ..."
+        )
+    if "withdrawn_date" not in cols:
+        raise RuntimeError(
+            "This database is v5 (missing currency columns).\n"
+            "v6 adds withdrawn_date / superseded_by / replaces to documents,\n"
+            "and Wave 2 also forces a re-embed under the heading-aware input\n"
+            "format, so an in-place migration would not be sound.\n"
+            "v5 corpus needs rebuild for v6 schema; run `ato-mcp init` to\n"
+            "fetch the new release, or rebuild locally with `ato-mcp build-index`."
         )
     # Additive: empty_shells table landed after the initial v5 schema.
     conn.executescript(

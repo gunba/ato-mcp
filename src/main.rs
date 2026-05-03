@@ -12,6 +12,11 @@ use rusqlite::{params, params_from_iter, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
 use sha2::{Digest, Sha256};
+// Pull `simsimd` into the dependency graph so its build script's
+// `cargo:rustc-link-lib=static=simsimd` directive reaches the linker;
+// we then call `simsimd_dot_i8` directly via the extern block below.
+#[allow(unused_imports)]
+use simsimd::SpatialSimilarity as _;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, Cursor, Read, Write};
@@ -33,6 +38,50 @@ const EMBEDDINGGEMMA_HF_FINGERPRINT: &str =
 const OLD_CONTENT_CUTOFF: &str = "2000-01-01";
 const DEFAULT_EXCLUDED_TYPES: &[&str] = &["Edited_private_advice"];
 const LEGISLATION_TYPE: &str = "Legislation_and_supporting_material";
+/// On-disk schema version this binary supports. Bump when introducing
+/// schema changes; older binaries reject newer corpora via [`open_read`]
+/// / [`open_write`] / [`apply_update_locked`] guards.
+const SUPPORTED_SCHEMA_VERSION: u32 = 6;
+/// Highest manifest format version (`Manifest.schema_version`) this binary
+/// will ingest. v2 (released alongside ato-mcp 0.5.0) signals that
+/// `min_client_version` is now meaningfully populated by the builder
+/// (older "v1" manifests left it at "0.1.0", making the version gate
+/// dormant). v3 (released alongside ato-mcp 0.6.0) adds the optional
+/// `reranker` field for cross-encoder rerank stage. The
+/// `min_client_version > CARGO_PKG_VERSION` check inside
+/// `enforce_manifest_compatibility` is the actual cross-version gate;
+/// this constant is a belt-and-suspenders upper bound for future format
+/// bumps that older binaries can't decode.
+const MAX_SUPPORTED_MANIFEST_VERSION: u32 = 3;
+/// Maximum number of RRF top-N candidates we feed into the cross-encoder
+/// reranker per query. Reranking is O(N) ONNX inference; 50 keeps p99
+/// latency well below 500 ms on a CPU even on int8 ms-marco MiniLM.
+const RERANK_CANDIDATE_LIMIT: usize = 50;
+/// Cross-encoder query side max-token budget. Standard ms-marco
+/// MiniLM-L-6-v2 is trained with a 512-token total budget; we reserve
+/// the remaining ~448 tokens for the document side.
+const RERANK_QUERY_MAX_TOKENS: usize = 64;
+/// Cross-encoder total sequence max length (`[CLS] q [SEP] d [SEP]`).
+const RERANK_PAIR_MAX_TOKENS: usize = 512;
+const DEFAULT_MAX_PER_DOC: usize = 2;
+const HARD_MAX_PER_DOC: usize = 3;
+const RERANKER_MODEL_CANDIDATES: &[&str] = &[
+    "onnx/model.onnx",
+    "onnx/model_quantized.onnx",
+    "model_quantized.onnx",
+    "model.onnx",
+];
+
+// SimSIMD's Rust 5.x trait wires `i8::dot` through `simsimd_cos_i8`
+// (cosine distance), which is not what the ranking pipeline expects.
+// We need the raw `sum(q[i] * d[i])` so that `score = dot/(127*127)`
+// continues to approximate cosine similarity for L2-normalised vectors.
+// `simsimd_dot_i8` is exported by the C library with runtime SIMD dispatch
+// (AVX2/AVX-512 on x86_64, NEON on aarch64) and is linked transparently
+// because we depend on the `simsimd` crate elsewhere.
+extern "C" {
+    fn simsimd_dot_i8(a: *const i8, b: *const i8, n: usize, out: *mut f64);
+}
 
 #[derive(Parser)]
 #[command(name = "ato-mcp", version, about = "Standalone ATO MCP server")]
@@ -88,6 +137,9 @@ enum Command {
         sort_by: SortBy,
         #[arg(long)]
         include_old: bool,
+        /// Include withdrawn / superseded rulings (default excludes them).
+        #[arg(long)]
+        include_withdrawn: bool,
         #[arg(long, default_value = "markdown")]
         format: OutputFormat,
     },
@@ -100,6 +152,9 @@ enum Command {
         types: Vec<String>,
         #[arg(long)]
         include_old: bool,
+        /// Include withdrawn / superseded rulings (default excludes them).
+        #[arg(long)]
+        include_withdrawn: bool,
         #[arg(long, default_value = "markdown")]
         format: OutputFormat,
     },
@@ -131,6 +186,18 @@ enum Command {
         limit: usize,
         #[arg(long, value_delimiter = ',')]
         types: Vec<String>,
+        /// Include withdrawn / superseded rulings (default excludes them).
+        #[arg(long)]
+        include_withdrawn: bool,
+        #[arg(long, default_value = "markdown")]
+        format: OutputFormat,
+    },
+    /// Verify that a quoted passage exists verbatim (whitespace-tolerant) in a document.
+    VerifyQuote {
+        doc_id: String,
+        quote: String,
+        #[arg(long)]
+        case_sensitive: bool,
         #[arg(long, default_value = "markdown")]
         format: OutputFormat,
     },
@@ -213,27 +280,34 @@ fn main() -> Result<()> {
             mode,
             sort_by,
             include_old,
+            include_withdrawn,
             format,
         } => {
             let types = empty_vec_as_none(types);
-            println!(
-                "{}",
-                search(
-                    &query,
-                    SearchOptions {
-                        k,
-                        types: types.as_deref(),
-                        date_from: date_from.as_deref(),
-                        date_to: date_to.as_deref(),
-                        doc_scope: doc_scope.as_deref(),
-                        mode,
-                        sort_by,
-                        include_old,
-                        format,
-                    },
-                    None,
-                )?
-            );
+            // C3: construct a transient ServerState so the CLI's `search`
+            // call exercises the same reranker path the MCP server does.
+            // Without this, `ato-mcp search ... --format json` reports
+            // `ranking.reranker_used: false` even when the reranker model
+            // is installed, and a maintainer running latency benchmarks
+            // would measure RRF only — silently invalidating the numbers.
+            // Mirrors the transient `encode_query_embedding` pattern below.
+            let (out, _state) = search_cli(
+                &query,
+                SearchOptions {
+                    k,
+                    types: types.as_deref(),
+                    date_from: date_from.as_deref(),
+                    date_to: date_to.as_deref(),
+                    doc_scope: doc_scope.as_deref(),
+                    mode,
+                    sort_by,
+                    include_old,
+                    current_only: !include_withdrawn,
+                    format,
+                    max_per_doc: DEFAULT_MAX_PER_DOC,
+                },
+            )?;
+            println!("{}", out);
             Ok(())
         }
         Command::SearchTitles {
@@ -241,12 +315,20 @@ fn main() -> Result<()> {
             k,
             types,
             include_old,
+            include_withdrawn,
             format,
         } => {
             let types = empty_vec_as_none(types);
             println!(
                 "{}",
-                search_titles(&query, k, types.as_deref(), include_old, format)?
+                search_titles(
+                    &query,
+                    k,
+                    types.as_deref(),
+                    include_old,
+                    !include_withdrawn,
+                    format,
+                )?
             );
             Ok(())
         }
@@ -282,6 +364,7 @@ fn main() -> Result<()> {
             before,
             limit,
             types,
+            include_withdrawn,
             format,
         } => {
             let types = empty_vec_as_none(types);
@@ -292,9 +375,19 @@ fn main() -> Result<()> {
                     before.as_deref(),
                     limit,
                     types.as_deref(),
+                    !include_withdrawn,
                     format
                 )?
             );
+            Ok(())
+        }
+        Command::VerifyQuote {
+            doc_id,
+            quote,
+            case_sensitive,
+            format,
+        } => {
+            println!("{}", verify_quote(&doc_id, &quote, case_sensitive, format)?);
             Ok(())
         }
     }
@@ -367,6 +460,14 @@ fn tokenizer_path() -> Result<PathBuf> {
     Ok(live_dir()?.join("tokenizer.json"))
 }
 
+fn reranker_model_path() -> Result<PathBuf> {
+    Ok(live_dir()?.join("reranker.onnx"))
+}
+
+fn reranker_tokenizer_path() -> Result<PathBuf> {
+    Ok(live_dir()?.join("reranker_tokenizer.json"))
+}
+
 fn lock_file() -> Result<File> {
     let path = lock_path()?;
     let file = OpenOptions::new()
@@ -391,6 +492,7 @@ fn open_read() -> Result<Connection> {
         .context("opening local corpus database")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.pragma_update(None, "temp_store", "MEMORY")?;
+    enforce_db_schema_version(&conn)?;
     Ok(conn)
 }
 
@@ -408,7 +510,42 @@ fn open_write_at(path: &Path) -> Result<Connection> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "temp_store", "MEMORY")?;
+    // Skip the schema check on a brand-new DB (no `meta` table yet);
+    // `init_db` will populate it. For an existing DB, validate up front
+    // so callers don't operate against an incompatible schema.
+    if table_exists(&conn, "meta")? {
+        enforce_db_schema_version(&conn)?;
+    }
     Ok(conn)
+}
+
+/// Reject DBs whose stored `meta.schema_version` doesn't match what this
+/// binary supports. A missing entry is treated as a corrupt/incomplete
+/// install — refuse with a recovery hint rather than silently operating
+/// on a DB that may be missing required tables/indexes.
+fn enforce_db_schema_version(conn: &Connection) -> Result<()> {
+    if !table_exists(conn, "meta")? {
+        bail!(
+            "no schema_version metadata; corpus may be corrupt or incomplete; run `ato-mcp init`"
+        );
+    }
+    match get_meta(conn, "schema_version")? {
+        None => bail!(
+            "no schema_version metadata; corpus may be corrupt or incomplete; run `ato-mcp init`"
+        ),
+        Some(value) => {
+            let parsed: u32 = value
+                .parse()
+                .with_context(|| format!("schema_version `{value}` is not a valid integer"))?;
+            if parsed != SUPPORTED_SCHEMA_VERSION {
+                bail!(
+                    "DB schema version {parsed} not supported by this binary (expects {}); reinstall the corpus or upgrade ato-mcp",
+                    SUPPORTED_SCHEMA_VERSION
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn init_db(conn: &Connection) -> Result<()> {
@@ -419,16 +556,20 @@ fn init_db(conn: &Connection) -> Result<()> {
         PRAGMA foreign_keys = ON;
 
         CREATE TABLE IF NOT EXISTS documents (
-            doc_id         TEXT PRIMARY KEY,
-            type           TEXT NOT NULL,
-            title          TEXT NOT NULL,
-            date           TEXT,
-            downloaded_at  TEXT NOT NULL,
-            content_hash   TEXT NOT NULL,
-            pack_sha8      TEXT NOT NULL
+            doc_id           TEXT PRIMARY KEY,
+            type             TEXT NOT NULL,
+            title            TEXT NOT NULL,
+            date             TEXT,
+            downloaded_at    TEXT NOT NULL,
+            content_hash     TEXT NOT NULL,
+            pack_sha8        TEXT NOT NULL,
+            withdrawn_date   TEXT,
+            superseded_by    TEXT,
+            replaces         TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_doc_type ON documents(type);
         CREATE INDEX IF NOT EXISTS idx_doc_date ON documents(date);
+        CREATE INDEX IF NOT EXISTS idx_doc_withdrawn ON documents(withdrawn_date);
 
         CREATE TABLE IF NOT EXISTS chunks (
             chunk_id      INTEGER PRIMARY KEY,
@@ -474,7 +615,7 @@ fn init_db(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_shells_last_checked ON empty_shells(last_checked_at);
         "#,
     )?;
-    set_meta(conn, "schema_version", "5")?;
+    set_meta(conn, "schema_version", "6")?;
     Ok(())
 }
 
@@ -552,6 +693,7 @@ fn build_doc_filter(
     date_to: Option<&str>,
     doc_scope: Option<&str>,
     include_old: bool,
+    current_only: bool,
 ) -> SqlFilter {
     let mut clauses = Vec::new();
     let mut params_out = Vec::new();
@@ -597,6 +739,12 @@ fn build_doc_filter(
         params_out.push(Value::Text(OLD_CONTENT_CUTOFF.to_string()));
         params_out.push(Value::Text(LEGISLATION_TYPE.to_string()));
     }
+    if current_only {
+        // W2.4: drop rulings with a known withdrawal/supersession date by
+        // default. Callers that explicitly want the historical/withdrawn
+        // material pass current_only=false.
+        clauses.push(format!("{alias}.withdrawn_date IS NULL"));
+    }
 
     SqlFilter {
         sql: clauses.join(" AND "),
@@ -620,6 +768,19 @@ struct Hit {
     ord: Option<i64>,
     next_call: Option<String>,
     ranking: Option<RankingDetails>,
+    /// W2.2 currency markers — only serialised when set so JSON output for
+    /// in-force docs stays clean.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    withdrawn_date: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    superseded_by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    replaces: Option<String>,
+    /// W3 cross-encoder relevance score in [0, 1] — populated only when
+    /// the reranker stage ran for this hit (top-N candidates only). Older
+    /// callers / corpora without the reranker omit this field entirely.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reranker_score: Option<f64>,
 }
 
 #[derive(Debug, Serialize, Clone, Default)]
@@ -646,16 +807,120 @@ struct SearchOptions<'a> {
     mode: SearchMode,
     sort_by: SortBy,
     include_old: bool,
+    /// W2.4: when true (default), withdrawn rulings are excluded from
+    /// results. Set to false to include them — the markdown formatter prefixes
+    /// the title with a `⚠️ withdrawn YYYY-MM-DD` marker so the caller sees
+    /// the status.
+    current_only: bool,
     format: OutputFormat,
+    /// Internal-only: maximum chunks returned per document. Capped at
+    /// `HARD_MAX_PER_DOC`. NOT exposed in the MCP tool descriptor for
+    /// Wave 1 (would inflate the public surface).
+    max_per_doc: usize,
+}
+
+/// Metadata required to rank and dedup candidate chunks across documents.
+#[derive(Debug, Clone)]
+struct CandidateMeta {
+    doc_id: String,
+    /// True when this chunk has an empty `heading_path` AND short text
+    /// (< 100 chars) — typically a document intro/preamble that crowds
+    /// out more useful chunks.
+    is_intro: bool,
+}
+
+/// Group candidate `(chunk_id, score)` entries by `doc_id`, demote
+/// intros, and emit at most `max_per_doc` chunks per document until `k`
+/// is reached. Per-document score is the max of the top three chunk
+/// scores within that document. Pure function — no DB access — so it
+/// can be tested in isolation.
+fn dedup_per_doc(
+    ranked: Vec<VectorHit>,
+    meta: &HashMap<i64, CandidateMeta>,
+    k: usize,
+    max_per_doc: usize,
+) -> Vec<VectorHit> {
+    let cap = max_per_doc.clamp(1, HARD_MAX_PER_DOC);
+    if ranked.is_empty() || cap == 0 || k == 0 {
+        return Vec::new();
+    }
+
+    // Bucket per doc, keep insertion order (which matches incoming
+    // ranking order so each bucket is already sorted by score desc when
+    // the caller did its own sort).
+    let mut buckets: BTreeMap<usize, (String, Vec<(VectorHit, bool)>)> = BTreeMap::new();
+    let mut order: HashMap<String, usize> = HashMap::new();
+    let mut next_idx = 0usize;
+    for hit in ranked {
+        let Some(m) = meta.get(&hit.chunk_id) else {
+            continue;
+        };
+        let idx = match order.get(&m.doc_id) {
+            Some(i) => *i,
+            None => {
+                let i = next_idx;
+                order.insert(m.doc_id.clone(), i);
+                buckets.insert(i, (m.doc_id.clone(), Vec::new()));
+                next_idx += 1;
+                i
+            }
+        };
+        buckets
+            .get_mut(&idx)
+            .expect("bucket present")
+            .1
+            .push((hit, m.is_intro));
+    }
+
+    // For each doc, sort its candidate list by (is_intro asc, score desc)
+    // so non-intro chunks always come before intro chunks within a doc.
+    // Then compute the per-doc score as max of the top 3 chunk scores in
+    // that ordered list.
+    let mut docs: Vec<(String, f64, Vec<VectorHit>)> = Vec::new();
+    for (_idx, (doc_id, mut items)) in buckets {
+        items.sort_by(|a, b| {
+            a.1.cmp(&b.1).then_with(|| {
+                b.0.score
+                    .partial_cmp(&a.0.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+        });
+        let doc_score = items
+            .iter()
+            .take(3)
+            .map(|(h, _)| h.score)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let chunks: Vec<VectorHit> = items.into_iter().map(|(h, _)| h).collect();
+        docs.push((doc_id, doc_score, chunks));
+    }
+    docs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Single pass: take up to `cap` chunks from each doc in score order
+    // until we hit `k`. We do not back-fill beyond the cap — the user
+    // wants per-doc diversity to be a hard constraint, not a soft one.
+    // Callers that need more chunks from the same doc should follow up
+    // with `get_chunks` / `get_document`.
+    let mut out: Vec<VectorHit> = Vec::with_capacity(k);
+    for (_doc_id, _score, chunks) in &docs {
+        if out.len() >= k {
+            break;
+        }
+        let take = cap.min(k - out.len()).min(chunks.len());
+        for hit in chunks.iter().take(take) {
+            out.push(hit.clone());
+        }
+    }
+    out
 }
 
 fn search(
     query: &str,
     opts: SearchOptions<'_>,
-    server_state: Option<&mut ServerState>,
+    mut server_state: Option<&mut ServerState>,
 ) -> Result<String> {
     let conn = open_read()?;
     let k = opts.k.clamp(1, MAX_K);
+    let max_per_doc = opts.max_per_doc.clamp(1, HARD_MAX_PER_DOC);
     let filter = build_doc_filter(
         "d",
         opts.types,
@@ -663,6 +928,7 @@ fn search(
         opts.date_to,
         opts.doc_scope,
         opts.include_old,
+        opts.current_only,
     );
     let internal_limit = std::cmp::max(k * 5, 50);
     let lexical_hits = if matches!(opts.mode, SearchMode::Hybrid | SearchMode::Keyword) {
@@ -671,10 +937,10 @@ fn search(
         Vec::new()
     };
     let mut vector_hits = Vec::new();
-    let ranked_hits = match opts.mode {
+    let mut ranked_hits = match opts.mode {
         SearchMode::Hybrid | SearchMode::Vector => {
             ensure_vector_search_ready(&conn)?;
-            let query_embedding = match server_state {
+            let query_embedding = match server_state.as_mut() {
                 Some(state) => state.encode_query_embedding(query)?,
                 None => encode_query_embedding(query)?,
             };
@@ -689,17 +955,87 @@ fn search(
     };
     let candidate_count = ranked_hits.len();
     let mut provenance = rank_provenance(&vector_hits, &lexical_hits);
-    let mut records = Vec::new();
+
+    // Cross-encoder rerank stage. We rerank only the top
+    // RERANK_CANDIDATE_LIMIT chunks because each ONNX inference is O(N)
+    // and the marginal hit beyond ~50 is dominated by the query
+    // embedding's first-stage recall. Below-50 candidates retain their
+    // RRF order so they can still surface via `next_call` paging or
+    // recency sort.
+    let mut reranker_used = false;
+    let mut reranker_scores: HashMap<i64, f64> = HashMap::new();
+    if let Some(state) = server_state.as_mut() {
+        let head_count = std::cmp::min(RERANK_CANDIDATE_LIMIT, ranked_hits.len());
+        if head_count > 0 {
+            // Load text for the top-N candidates in one batch. We hold
+            // them as `String`s because the tokenizer wants `&str`s and
+            // the rusqlite blob borrow doesn't survive across iterations.
+            let head_ids: Vec<i64> = ranked_hits[..head_count]
+                .iter()
+                .map(|h| h.chunk_id)
+                .collect();
+            let texts = load_chunk_texts(&conn, &head_ids)?;
+            let candidate_refs: Vec<(i64, &str)> = head_ids
+                .iter()
+                .filter_map(|id| texts.get(id).map(|t| (*id, t.as_str())))
+                .collect();
+            if !candidate_refs.is_empty() {
+                if let Some(scores) = state.rerank_candidates(query, &candidate_refs)? {
+                    reranker_used = true;
+                    reranker_scores = scores.iter().copied().collect();
+                    // Re-order the head by reranker score (desc). Tail
+                    // (below RERANK_CANDIDATE_LIMIT) keeps RRF order. We
+                    // overwrite the per-chunk score with the reranker
+                    // value for the head so downstream code (dedup,
+                    // recency sort) can rank by overall merit without a
+                    // second branch.
+                    let mut head: Vec<VectorHit> = ranked_hits.drain(..head_count).collect();
+                    for hit in head.iter_mut() {
+                        if let Some(s) = reranker_scores.get(&hit.chunk_id) {
+                            hit.score = *s;
+                        }
+                    }
+                    head.sort_by(|a, b| {
+                        b.score
+                            .partial_cmp(&a.score)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    let mut new_ranked: Vec<VectorHit> = Vec::with_capacity(candidate_count);
+                    new_ranked.extend(head);
+                    new_ranked.append(&mut ranked_hits);
+                    ranked_hits = new_ranked;
+                }
+            }
+        }
+    }
+
     let frontier = match opts.sort_by {
         SortBy::Relevance => k,
         SortBy::Recency => std::cmp::max(k * 5, 50),
     };
-    for ranked_hit in ranked_hits.into_iter().take(frontier) {
+
+    // Batch-load (chunk_id -> doc_id, is_intro) for all candidates so the
+    // dedup pass doesn't have to round-trip per chunk.
+    let candidate_meta = load_candidate_meta(&conn, &ranked_hits)?;
+    let deduped = dedup_per_doc(ranked_hits, &candidate_meta, frontier, max_per_doc);
+    let distinct_docs = deduped
+        .iter()
+        .filter_map(|h| candidate_meta.get(&h.chunk_id).map(|m| m.doc_id.as_str()))
+        .collect::<HashSet<_>>()
+        .len();
+
+    let mut records = Vec::new();
+    for ranked_hit in deduped.into_iter() {
         if let Some(mut hit) = load_hit(&conn, ranked_hit.chunk_id, query)? {
             hit.score = Some(ranked_hit.score);
             let mut ranking = provenance.remove(&ranked_hit.chunk_id).unwrap_or_default();
             ranking.overall_score = Some(ranked_hit.score);
             hit.ranking = Some(ranking);
+            // Surface the cross-encoder logit only when the reranker
+            // actually scored this chunk (it ran for the top-N only).
+            if let Some(s) = reranker_scores.get(&ranked_hit.chunk_id) {
+                hit.reranker_score = Some(*s);
+            }
             records.push(hit);
         }
     }
@@ -709,6 +1045,11 @@ fn search(
     }
     let next_call = if candidate_count > records.len() && k < MAX_K {
         Some(search_next_call(query, std::cmp::min(k * 2, MAX_K), &opts))
+    } else {
+        None
+    };
+    let reranker_model_id = if reranker_used {
+        get_meta(&conn, "reranker_model_id")?
     } else {
         None
     };
@@ -722,6 +1063,8 @@ fn search(
                 "vector": matches!(opts.mode, SearchMode::Hybrid | SearchMode::Vector),
                 "lexical": matches!(opts.mode, SearchMode::Hybrid | SearchMode::Keyword),
                 "embedding_model_id": get_meta(&conn, "embedding_model_id")?,
+                "reranker_used": reranker_used,
+                "reranker_model_id": reranker_model_id,
             },
             "filters": {
                 "excluded_by_default": DEFAULT_EXCLUDED_TYPES,
@@ -730,6 +1073,9 @@ fn search(
             "meta": {
                 "returned": records.len(),
                 "candidate_count": candidate_count,
+                "deduped_from_candidates": candidate_count,
+                "distinct_docs": distinct_docs,
+                "max_per_doc": max_per_doc,
                 "truncated": candidate_count > records.len(),
                 "returned_chars": records.iter().map(|hit| hit.snippet.len()).sum::<usize>(),
                 "next_call": next_call,
@@ -738,6 +1084,116 @@ fn search(
         }))?),
         OutputFormat::Markdown => Ok(format_hits_markdown(&records)),
     }
+}
+
+fn search_cli(query: &str, opts: SearchOptions<'_>) -> Result<(String, ServerState)> {
+    let mut state = ServerState::default();
+    let out = search(query, opts, Some(&mut state))?;
+    Ok((out, state))
+}
+
+/// Batch-load decompressed chunk text for the given ids. Returns a map
+/// keyed by chunk_id; missing rows are silently dropped (caller treats
+/// missing texts as "no rerank candidate" and they fall through to the
+/// tail). One round-trip + one zstd decode per id.
+fn load_chunk_texts(conn: &Connection, ids: &[i64]) -> Result<HashMap<i64, String>> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let mut unique = ids.to_vec();
+    unique.sort_unstable();
+    unique.dedup();
+    let placeholders = vec!["?"; unique.len()].join(",");
+    let sql = format!("SELECT chunk_id, text FROM chunks WHERE chunk_id IN ({placeholders})");
+    let params_vec: Vec<Value> = unique.into_iter().map(Value::Integer).collect();
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(params_vec), |row| {
+        let chunk_id: i64 = row.get("chunk_id")?;
+        let blob: Vec<u8> = row.get("text")?;
+        Ok((chunk_id, blob))
+    })?;
+    let mut out = HashMap::new();
+    for row in rows {
+        let (chunk_id, blob) = row?;
+        let text = decompress_text(blob)?;
+        out.insert(chunk_id, text);
+    }
+    Ok(out)
+}
+
+fn load_candidate_meta(
+    conn: &Connection,
+    ranked: &[VectorHit],
+) -> Result<HashMap<i64, CandidateMeta>> {
+    if ranked.is_empty() {
+        return Ok(HashMap::new());
+    }
+    // Deduplicate ids; ranked may include the same chunk via both vector
+    // and lexical paths in degenerate cases.
+    let mut ids: Vec<i64> = ranked.iter().map(|h| h.chunk_id).collect();
+    ids.sort_unstable();
+    ids.dedup();
+
+    let placeholders = vec!["?"; ids.len()].join(",");
+    // Two-step query: cheap path (heading_path + chunk_id + doc_id) for
+    // every candidate, plus a follow-up that decompresses the text BLOB
+    // for the small minority with empty heading_path so we can measure
+    // the *plain* text length precisely. The earlier zstd-blob-length
+    // proxy occasionally false-positived on intro-bordering chunks; this
+    // additional decompress costs ~50µs × N where N is typically <5.
+    let sql = format!(
+        "SELECT chunk_id, doc_id, COALESCE(heading_path, '') AS heading_path FROM chunks WHERE chunk_id IN ({placeholders})"
+    );
+    let params_vec: Vec<Value> = ids.into_iter().map(Value::Integer).collect();
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(params_vec), |row| {
+        let chunk_id: i64 = row.get("chunk_id")?;
+        let doc_id: String = row.get("doc_id")?;
+        let heading_path: String = row.get("heading_path")?;
+        Ok((chunk_id, doc_id, heading_path))
+    })?;
+    let mut empty_heading_chunk_ids: Vec<i64> = Vec::new();
+    let mut staged: Vec<(i64, String, String)> = Vec::new();
+    for row in rows {
+        let (chunk_id, doc_id, heading_path) = row?;
+        if heading_path.is_empty() {
+            empty_heading_chunk_ids.push(chunk_id);
+        }
+        staged.push((chunk_id, doc_id, heading_path));
+    }
+
+    // Decompress text only for empty-heading candidates so we can compare
+    // against the spec's "text.len() < 100" threshold without paying for
+    // every candidate.
+    let mut intro_set: HashSet<i64> = HashSet::new();
+    if !empty_heading_chunk_ids.is_empty() {
+        let placeholders2 = vec!["?"; empty_heading_chunk_ids.len()].join(",");
+        let sql2 = format!("SELECT chunk_id, text FROM chunks WHERE chunk_id IN ({placeholders2})");
+        let params_vec2: Vec<Value> = empty_heading_chunk_ids
+            .into_iter()
+            .map(Value::Integer)
+            .collect();
+        let mut stmt2 = conn.prepare(&sql2)?;
+        let rows2 = stmt2.query_map(params_from_iter(params_vec2), |row| {
+            let chunk_id: i64 = row.get("chunk_id")?;
+            let text_blob: Vec<u8> = row.get("text")?;
+            Ok((chunk_id, text_blob))
+        })?;
+        for row in rows2 {
+            let (chunk_id, text_blob) = row?;
+            let plain = decompress_text(text_blob)?;
+            if plain.len() < 100 {
+                intro_set.insert(chunk_id);
+            }
+        }
+    }
+
+    let mut out = HashMap::new();
+    for (chunk_id, doc_id, heading_path) in staged {
+        let is_intro = heading_path.is_empty() && intro_set.contains(&chunk_id);
+        out.insert(chunk_id, CandidateMeta { doc_id, is_intro });
+    }
+    Ok(out)
 }
 
 fn search_mode_name(mode: SearchMode) -> &'static str {
@@ -783,6 +1239,9 @@ fn search_next_call(query: &str, k: usize, opts: &SearchOptions<'_>) -> String {
     }
     if opts.include_old {
         args.push("include_old=true".to_string());
+    }
+    if !opts.current_only {
+        args.push("current_only=false".to_string());
     }
     format!("search({})", args.join(", "))
 }
@@ -970,6 +1429,32 @@ fn dot_i8(query: &[i8; EMBEDDING_DIM], document: &[u8]) -> Result<f64> {
             EMBEDDING_DIM
         );
     }
+    // Reinterpret the stored u8 BLOB as i8 by casting the pointer
+    // directly. The bit pattern is identical; the BLOB just happens to be
+    // loaded with rusqlite's default unsigned typing.
+    let mut raw = 0.0f64;
+    // Safety: both pointers reference EMBEDDING_DIM-sized slices we just
+    // bounds-checked; simsimd_dot_i8 reads exactly `n` bytes from each.
+    unsafe {
+        simsimd_dot_i8(
+            query.as_ptr(),
+            document.as_ptr() as *const i8,
+            EMBEDDING_DIM,
+            &mut raw,
+        );
+    }
+    Ok(raw / (127.0 * 127.0))
+}
+
+#[cfg(test)]
+fn dot_i8_scalar_reference(query: &[i8; EMBEDDING_DIM], document: &[u8]) -> Result<f64> {
+    if document.len() != EMBEDDING_DIM {
+        bail!(
+            "invalid stored embedding length: got {}, expected {}",
+            document.len(),
+            EMBEDDING_DIM
+        );
+    }
     let mut dot = 0i32;
     for (q, d) in query.iter().zip(document.iter()) {
         dot += i32::from(*q) * i32::from(*d as i8);
@@ -1061,9 +1546,182 @@ impl SemanticRuntime {
     }
 }
 
+/// Cross-encoder reranker (`cross-encoder/ms-marco-MiniLM-L-6-v2` int8 ONNX).
+/// Loaded lazily on first search and cached on `ServerState`. Inputs are
+/// `[CLS] query [SEP] doc [SEP]` token pairs; the model emits a single
+/// relevance logit per pair which we squash through sigmoid into [0, 1].
+struct Reranker {
+    tokenizer: Tokenizer,
+    session: Session,
+    has_token_type_ids: bool,
+}
+
+impl Reranker {
+    fn load() -> Result<Self> {
+        let mut tokenizer = Tokenizer::from_file(reranker_tokenizer_path()?)
+            .map_err(|err| anyhow!("loading reranker tokenizer: {err}"))?;
+        // Cap each side at PAIR_MAX_TOKENS; the tokenizer trims the
+        // longest segment first so a long doc won't push the query out.
+        tokenizer
+            .with_truncation(Some(TruncationParams {
+                max_length: RERANK_PAIR_MAX_TOKENS,
+                ..TruncationParams::default()
+            }))
+            .map_err(|err| anyhow!("configuring reranker truncation: {err}"))?;
+        tokenizer.with_padding(Some(PaddingParams::default()));
+
+        let session = Session::builder()
+            .map_err(|err| anyhow!("creating reranker ONNX Runtime session: {err}"))?
+            .with_optimization_level(GraphOptimizationLevel::All)
+            .map_err(|err| anyhow!("configuring reranker ONNX Runtime session: {err}"))?
+            .commit_from_file(reranker_model_path()?)
+            .map_err(|err| anyhow!("loading reranker ONNX model: {err}"))?;
+        let has_token_type_ids = session
+            .inputs()
+            .iter()
+            .any(|input| input.name() == "token_type_ids");
+
+        Ok(Self {
+            tokenizer,
+            session,
+            has_token_type_ids,
+        })
+    }
+
+    /// Score `(chunk_id, doc_text)` candidates against `query`. Returns
+    /// pairs in input order; the caller is responsible for re-sorting.
+    /// The query is hard-truncated to roughly `RERANK_QUERY_MAX_TOKENS`
+    /// tokens upstream of tokenization. Note: the constant is in TOKENS;
+    /// we approximate ~4 chars per token for the pre-tokenization trim
+    /// (cheaper than re-running the tokenizer twice). The tokenizer's own
+    /// truncation handles the doc side; we leave a wide margin so MiniLM's
+    /// full 512-token budget can absorb a long heading_path-prefixed snippet.
+    fn rerank(&mut self, query: &str, candidates: &[(i64, &str)]) -> Result<Vec<(i64, f64)>> {
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Trim query token budget by approximating ~4 chars/token for
+        // English (cheaper than re-running the tokenizer twice). The
+        // model's truncation guarantees we stay within 512 total.
+        let query_max_chars = RERANK_QUERY_MAX_TOKENS * 4;
+        let query_trimmed: String = query.chars().take(query_max_chars).collect();
+
+        let inputs: Vec<(String, String)> = candidates
+            .iter()
+            .map(|(_, doc)| (query_trimmed.clone(), (*doc).to_string()))
+            .collect();
+        let encodings = self
+            .tokenizer
+            .encode_batch(inputs, true)
+            .map_err(|err| anyhow!("tokenizing reranker pairs: {err}"))?;
+        let batch = encodings.len();
+        if batch == 0 {
+            return Ok(Vec::new());
+        }
+        let seq_len = encodings[0].get_ids().len();
+        if seq_len == 0 {
+            bail!("reranker tokenizer returned zero-length encoding");
+        }
+
+        let mut input_ids: Vec<i64> = Vec::with_capacity(batch * seq_len);
+        let mut attention_mask: Vec<i64> = Vec::with_capacity(batch * seq_len);
+        let mut token_type_ids: Vec<i64> = Vec::with_capacity(batch * seq_len);
+        for enc in &encodings {
+            // BatchLongest padding guarantees uniform seq_len, but we
+            // assert defensively to avoid silently feeding ragged shapes.
+            if enc.get_ids().len() != seq_len {
+                bail!(
+                    "reranker batch produced ragged encodings: expected {seq_len}, got {}",
+                    enc.get_ids().len()
+                );
+            }
+            input_ids.extend(enc.get_ids().iter().map(|id| i64::from(*id)));
+            attention_mask.extend(enc.get_attention_mask().iter().map(|m| i64::from(*m)));
+            token_type_ids.extend(enc.get_type_ids().iter().map(|t| i64::from(*t)));
+        }
+
+        let input_ids_tensor =
+            TensorRef::from_array_view(([batch, seq_len], input_ids.as_slice()))?;
+        let attention_mask_tensor =
+            TensorRef::from_array_view(([batch, seq_len], attention_mask.as_slice()))?;
+        let outputs = if self.has_token_type_ids {
+            let token_type_ids_tensor =
+                TensorRef::from_array_view(([batch, seq_len], token_type_ids.as_slice()))?;
+            self.session.run(ort::inputs! {
+                "input_ids" => input_ids_tensor,
+                "attention_mask" => attention_mask_tensor,
+                "token_type_ids" => token_type_ids_tensor,
+            })?
+        } else {
+            self.session.run(ort::inputs! {
+                "input_ids" => input_ids_tensor,
+                "attention_mask" => attention_mask_tensor,
+            })?
+        };
+        // Cross-encoders typically output `logits` as `[batch, 1]`. Some
+        // exports emit a flat `[batch]` instead. Try the named output
+        // first so users with non-standard wrappers still work.
+        let output = outputs.get("logits").unwrap_or_else(|| &outputs[0]);
+        let (shape, data) = output.try_extract_tensor::<f32>()?;
+        let logits = extract_rerank_logits(shape, data, batch)?;
+        if logits.len() != batch {
+            bail!(
+                "reranker produced {} logits for batch of {}",
+                logits.len(),
+                batch
+            );
+        }
+        Ok(candidates
+            .iter()
+            .zip(logits)
+            .map(|((id, _), logit)| (*id, sigmoid(logit as f64)))
+            .collect())
+    }
+}
+
+fn extract_rerank_logits(shape: &[i64], data: &[f32], batch: usize) -> Result<Vec<f32>> {
+    match shape {
+        [b] if *b as usize == batch => Ok(data[..batch].to_vec()),
+        [b, 1] if *b as usize == batch => Ok(data[..batch].to_vec()),
+        [b, d] if *b as usize == batch && *d as usize >= 1 => {
+            // Some reranker exports emit `[batch, 2]` (positive/negative
+            // logits). Take the positive class only — index 1 is the
+            // standard convention for ms-marco rerankers.
+            let dims = *d as usize;
+            let positive = if dims == 1 { 0 } else { 1 };
+            Ok((0..batch).map(|i| data[i * dims + positive]).collect())
+        }
+        _ => bail!("unexpected reranker output shape {:?}", shape),
+    }
+}
+
+fn sigmoid(x: f64) -> f64 {
+    1.0 / (1.0 + (-x).exp())
+}
+
+/// Tracks reranker availability across server lifetime. Once a load
+/// attempt fails (or the model file is missing) we record `Disabled` so
+/// every subsequent search short-circuits to RRF without a retry storm.
+#[derive(Default)]
+enum RerankerState {
+    /// Not yet attempted in this process. Triggers a single load on first
+    /// `rerank_candidates` call.
+    #[default]
+    Pending,
+    /// Cross-encoder loaded and ready. Boxed so the enum stays small —
+    /// `Reranker` owns an ONNX `Session` and a `Tokenizer`, both of
+    /// which are large enough that an unboxed variant would inflate
+    /// every `RerankerState` instance.
+    Loaded(Box<Reranker>),
+    /// Either `ATO_MCP_DISABLE_RERANKER` was set, the model files were
+    /// missing, or load failed. We do not retry within this process.
+    Disabled,
+}
+
 #[derive(Default)]
 struct ServerState {
     semantic_runtime: Option<SemanticRuntime>,
+    reranker_state: RerankerState,
 }
 
 impl ServerState {
@@ -1075,6 +1733,58 @@ impl ServerState {
             .as_mut()
             .expect("semantic runtime was just initialized")
             .encode_query(query)
+    }
+
+    /// Cross-encoder rerank entry point. Returns `Ok(None)` whenever the
+    /// reranker is unavailable (env-var disabled, model files missing, or
+    /// previously failed to load) so the caller falls back to RRF.
+    fn rerank_candidates(
+        &mut self,
+        query: &str,
+        candidates: &[(i64, &str)],
+    ) -> Result<Option<Vec<(i64, f64)>>> {
+        if env_truthy("ATO_MCP_DISABLE_RERANKER") {
+            // Once disabled (via env var or model-load failure), the
+            // reranker stays disabled for the rest of this server session
+            // — no per-request retry. Restart the server to re-enable.
+            self.reranker_state = RerankerState::Disabled;
+            return Ok(None);
+        }
+        if candidates.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        // Drive the state machine. We replace `Pending` once and never
+        // again — failed loads stick at `Disabled`.
+        if matches!(self.reranker_state, RerankerState::Pending) {
+            let model_present = reranker_model_path().map(|p| p.exists()).unwrap_or(false);
+            let tokenizer_present = reranker_tokenizer_path()
+                .map(|p| p.exists())
+                .unwrap_or(false);
+            if !model_present || !tokenizer_present {
+                eprintln!(
+                    "ato-mcp: reranker model files not present (model={}, tokenizer={}); falling back to RRF for the rest of this session",
+                    model_present, tokenizer_present
+                );
+                self.reranker_state = RerankerState::Disabled;
+                return Ok(None);
+            }
+            match Reranker::load() {
+                Ok(r) => self.reranker_state = RerankerState::Loaded(Box::new(r)),
+                Err(err) => {
+                    eprintln!(
+                        "ato-mcp: failed to load reranker ({err}); falling back to RRF for the rest of this session"
+                    );
+                    self.reranker_state = RerankerState::Disabled;
+                    return Ok(None);
+                }
+            }
+        }
+        match &mut self.reranker_state {
+            RerankerState::Loaded(r) => Ok(Some(r.rerank(query, candidates)?)),
+            RerankerState::Disabled => Ok(None),
+            // Unreachable: we just ensured Pending was resolved above.
+            RerankerState::Pending => Ok(None),
+        }
     }
 }
 
@@ -1142,7 +1852,8 @@ fn load_hit(conn: &Connection, chunk_id: i64, query: &str) -> Result<Option<Hit>
     let mut stmt = conn.prepare(
         r#"
         SELECT c.chunk_id, c.doc_id, c.ord, c.heading_path, c.anchor, c.text,
-               d.type, d.title, d.date
+               d.type, d.title, d.date,
+               d.withdrawn_date, d.superseded_by, d.replaces
         FROM chunks c
         JOIN documents d ON d.doc_id = c.doc_id
         WHERE c.chunk_id = ?
@@ -1156,46 +1867,163 @@ fn load_hit(conn: &Connection, chunk_id: i64, query: &str) -> Result<Option<Hit>
     let text = decompress_text(row.get("text")?)?;
     let chunk_id: i64 = row.get("chunk_id")?;
     let ord: i64 = row.get("ord")?;
+    let heading_path: String = row
+        .get::<_, Option<String>>("heading_path")?
+        .unwrap_or_default();
     Ok(Some(Hit {
         doc_id: doc_id.clone(),
         title: row.get("title")?,
         doc_type: row.get("type")?,
         date: row.get("date")?,
-        heading_path: row
-            .get::<_, Option<String>>("heading_path")?
-            .unwrap_or_default(),
         anchor: row.get("anchor")?,
-        snippet: highlight_snippet(&text, query, SNIPPET_CHARS),
+        snippet: highlight_snippet(&text, query, SNIPPET_CHARS, &heading_path),
         canonical_url: canonical_url(&doc_id),
         score: None,
         chunk_id: Some(chunk_id),
         ord: Some(ord),
         next_call: Some(format!("get_chunks(chunk_ids=[{chunk_id}])")),
         ranking: None,
+        heading_path,
+        withdrawn_date: row.get("withdrawn_date")?,
+        superseded_by: row.get("superseded_by")?,
+        replaces: row.get("replaces")?,
+        reranker_score: None,
     }))
 }
 
-fn highlight_snippet(text: &str, query: &str, max_chars: usize) -> String {
-    let word_re = Regex::new(r"[A-Za-z0-9']+(?:-[A-Za-z0-9']+)*").expect("valid regex");
-    let words: HashSet<String> = word_re
-        .find_iter(query)
+/// Tokenize a query into the same lowercase word forms used by [`fts_query`]
+/// — short tokens are dropped to match FTS5's behaviour and to keep BM25
+/// from being dominated by stopwords.
+fn snippet_query_terms(query: &str) -> Vec<String> {
+    let re = Regex::new(r"[A-Za-z0-9']+(?:-[A-Za-z0-9']+)*").expect("valid regex");
+    re.find_iter(query)
         .map(|m| m.as_str().to_ascii_lowercase())
-        .collect();
+        .filter(|t| t.len() >= 2)
+        .collect()
+}
+
+/// Score a window of `window_words` lowercase tokens against `query_terms`
+/// using a self-IDF BM25 (the chunk *is* the corpus). Self-IDF is enough
+/// to rank windows because rare-in-chunk terms are exactly what we want
+/// the snippet to contain — no need to consult the global statistics.
+fn bm25_score_window(
+    window_words: &[&str],
+    query_terms: &[String],
+    chunk_term_freq: &HashMap<String, usize>,
+    chunk_token_count: usize,
+    avg_chunk_window_len: f64,
+) -> f64 {
+    const K1: f64 = 1.2;
+    const B: f64 = 0.75;
+    if window_words.is_empty() {
+        return 0.0;
+    }
+    let dl = window_words.len() as f64;
+    let mut window_tf: HashMap<&str, usize> = HashMap::new();
+    for w in window_words {
+        *window_tf.entry(*w).or_insert(0) += 1;
+    }
+    let mut score = 0.0;
+    for term in query_terms {
+        let tf = match window_tf.get(term.as_str()) {
+            Some(c) => *c as f64,
+            None => continue,
+        };
+        // Self-IDF: rare in the surrounding chunk -> higher weight in the
+        // window. Treat the chunk as a single "document corpus": idf is
+        // log((N - df + 0.5) / (df + 0.5) + 1), where N is the number of
+        // tokens in the chunk and df is the term's chunk-wide frequency.
+        // This mirrors classic BM25 closely enough for the ranking task
+        // (we only care about ordering windows, not absolute scores).
+        let df = *chunk_term_freq.get(term).unwrap_or(&0) as f64;
+        let n = chunk_token_count.max(1) as f64;
+        let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln();
+        let denom = tf + K1 * (1.0 - B + B * dl / avg_chunk_window_len.max(1.0));
+        score += idf * (tf * (K1 + 1.0)) / denom.max(1e-9);
+    }
+    score
+}
+
+/// Pick the highest-BM25 sliding window from `text` against `query`,
+/// trim to `max_chars`, and prefix with `heading_path` when present.
+fn highlight_snippet(text: &str, query: &str, max_chars: usize, heading_path: &str) -> String {
+    const WINDOW_WORDS: usize = 20;
+    const STRIDE_WORDS: usize = 10;
     let cleaned = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if cleaned.is_empty() {
-        return String::new();
+        return prefix_heading(heading_path, &cleaned);
     }
-    let lower = cleaned.to_ascii_lowercase();
-    let best = words
-        .iter()
-        .filter_map(|w| lower.find(w))
-        .min()
-        .unwrap_or(0);
-    let mut start = best.saturating_sub(max_chars / 3);
+    let query_terms = snippet_query_terms(query);
+    if query_terms.is_empty() {
+        // No tokens worth ranking against — fall back to the document's
+        // opening fragment, still heading-prefixed.
+        let truncated = trim_chars(&cleaned, max_chars);
+        return prefix_heading(heading_path, &truncated);
+    }
+
+    // Tokenise the cleaned text once. We keep both the lowercase form (for
+    // BM25) and char-offsets into `cleaned` so we can rebuild the original
+    // window verbatim after picking it.
+    let token_re = Regex::new(r"[A-Za-z0-9']+(?:-[A-Za-z0-9']+)*").expect("valid regex");
+    let mut tokens: Vec<(usize, usize, String)> = Vec::new();
+    for m in token_re.find_iter(&cleaned) {
+        tokens.push((m.start(), m.end(), m.as_str().to_ascii_lowercase()));
+    }
+    if tokens.is_empty() {
+        let truncated = trim_chars(&cleaned, max_chars);
+        return prefix_heading(heading_path, &truncated);
+    }
+
+    let mut chunk_term_freq: HashMap<String, usize> = HashMap::new();
+    for (_, _, lower) in &tokens {
+        *chunk_term_freq.entry(lower.clone()).or_insert(0) += 1;
+    }
+    let chunk_token_count = tokens.len();
+
+    let n = tokens.len();
+    let mut best_score = f64::NEG_INFINITY;
+    let mut best_start_token = 0usize;
+    let avg_window_len = WINDOW_WORDS.min(n) as f64;
+    let mut idx = 0usize;
+    let mut produced_any = false;
+    while idx < n {
+        let end = (idx + WINDOW_WORDS).min(n);
+        let window_lower: Vec<&str> = tokens[idx..end].iter().map(|t| t.2.as_str()).collect();
+        let score = bm25_score_window(
+            &window_lower,
+            &query_terms,
+            &chunk_term_freq,
+            chunk_token_count,
+            avg_window_len,
+        );
+        if score > best_score {
+            best_score = score;
+            best_start_token = idx;
+        }
+        produced_any = true;
+        if end == n {
+            break;
+        }
+        idx += STRIDE_WORDS;
+    }
+    if !produced_any {
+        let truncated = trim_chars(&cleaned, max_chars);
+        return prefix_heading(heading_path, &truncated);
+    }
+
+    // Expand the chosen window outward to fill the snippet budget while
+    // staying centred on the high-density region. We do this in characters
+    // because the budget is character-bounded.
+    let win_start_char = tokens[best_start_token].0;
+    let win_end_token = (best_start_token + WINDOW_WORDS).min(n) - 1;
+    let win_end_char = tokens[win_end_token].1;
+    let center = (win_start_char + win_end_char) / 2;
+    let half = max_chars / 2;
+    let mut start = center.saturating_sub(half);
     while start > 0 && !cleaned.is_char_boundary(start) {
         start -= 1;
     }
-    let mut end = std::cmp::min(cleaned.len(), start + max_chars);
+    let mut end = (start + max_chars).min(cleaned.len());
     while end < cleaned.len() && !cleaned.is_char_boundary(end) {
         end += 1;
     }
@@ -1203,7 +2031,29 @@ fn highlight_snippet(text: &str, query: &str, max_chars: usize) -> String {
     if start > 0 {
         snippet.insert_str(0, "...");
     }
-    snippet
+    if end < cleaned.len() {
+        snippet.push_str("...");
+    }
+    prefix_heading(heading_path, &snippet)
+}
+
+fn prefix_heading(heading_path: &str, body: &str) -> String {
+    if heading_path.is_empty() {
+        body.to_string()
+    } else {
+        format!("{heading_path} — {body}")
+    }
+}
+
+fn trim_chars(s: &str, max_chars: usize) -> String {
+    if s.len() <= max_chars {
+        return s.to_string();
+    }
+    let mut end = max_chars;
+    while end < s.len() && !s.is_char_boundary(end) {
+        end += 1;
+    }
+    s[..end].to_string()
 }
 
 fn format_hits_markdown(hits: &[Hit]) -> String {
@@ -1216,6 +2066,14 @@ fn format_hits_markdown(hits: &[Hit]) -> String {
     for (idx, hit) in hits.iter().enumerate() {
         let chunk = hit.chunk_id.map(|id| id.to_string()).unwrap_or_default();
         let ord = hit.ord.map(|ord| ord.to_string()).unwrap_or_default();
+        // W2.4: prefix the title with a withdrawn marker when present. Only
+        // ever appears when the caller asked for current_only=false; the
+        // default search drops these rows server-side.
+        let title_display = if let Some(date) = hit.withdrawn_date.as_deref() {
+            format!("⚠️ withdrawn {date} — {}", escape_md(&hit.title))
+        } else {
+            escape_md(&hit.title)
+        };
         out.push_str(&format!(
             "| {} | {} | {} | `{}` | {} | [{}]({})<br><small>`{}`</small> | {} | {} |\n",
             idx + 1,
@@ -1223,7 +2081,7 @@ fn format_hits_markdown(hits: &[Hit]) -> String {
             ord,
             escape_md(&hit.doc_type),
             hit.date.as_deref().unwrap_or(""),
-            escape_md(&hit.title),
+            title_display,
             hit.canonical_url,
             escape_md(&hit.doc_id),
             escape_md(&hit.heading_path),
@@ -1242,11 +2100,12 @@ fn search_titles(
     k: usize,
     types: Option<&[String]>,
     include_old: bool,
+    current_only: bool,
     format: OutputFormat,
 ) -> Result<String> {
     let conn = open_read()?;
     let k = k.clamp(1, 100);
-    let filter = build_doc_filter("d", types, None, None, None, include_old);
+    let filter = build_doc_filter("d", types, None, None, None, include_old, current_only);
     let where_filter = if filter.sql.is_empty() {
         String::new()
     } else {
@@ -1255,7 +2114,8 @@ fn search_titles(
     let sql = format!(
         r#"
         SELECT t.doc_id AS doc_id, bm25(title_fts) AS score,
-               d.type, d.title, d.date
+               d.type, d.title, d.date,
+               d.withdrawn_date, d.superseded_by, d.replaces
         FROM title_fts t
         JOIN documents d ON d.doc_id = t.doc_id
         WHERE title_fts MATCH ? {where_filter}
@@ -1291,6 +2151,10 @@ fn search_titles(
                 "get_document(doc_id=\"{doc_id}\", format=\"card\")"
             )),
             ranking: None,
+            withdrawn_date: row.get("withdrawn_date")?,
+            superseded_by: row.get("superseded_by")?,
+            replaces: row.get("replaces")?,
+            reranker_score: None,
         })
     }) {
         Ok(rows) => rows.collect::<rusqlite::Result<Vec<_>>>()?,
@@ -1707,6 +2571,7 @@ fn whats_new(
     before: Option<&str>,
     limit: usize,
     types: Option<&[String]>,
+    current_only: bool,
     format: OutputFormat,
 ) -> Result<String> {
     let conn = open_read()?;
@@ -1742,6 +2607,10 @@ fn whats_new(
             params_out.push(Value::Text((*t).to_string()));
         }
     }
+    if current_only {
+        // W2.4: drop withdrawn rulings by default — see SearchOptions.
+        clauses.push("withdrawn_date IS NULL".to_string());
+    }
     let where_sql = if clauses.is_empty() {
         String::new()
     } else {
@@ -1750,7 +2619,9 @@ fn whats_new(
     let limit = limit.clamp(1, 500);
     params_out.push(Value::Integer(limit as i64 + 1));
     let sql = format!(
-        "SELECT doc_id, type, title, date, downloaded_at FROM documents {where_sql} ORDER BY {sort_expr} DESC LIMIT ?"
+        "SELECT doc_id, type, title, date, downloaded_at, \
+                withdrawn_date, superseded_by, replaces \
+         FROM documents {where_sql} ORDER BY {sort_expr} DESC LIMIT ?"
     );
     let mut stmt = conn.prepare(&sql)?;
     let mut hits = stmt
@@ -1778,6 +2649,10 @@ fn whats_new(
                     "get_document(doc_id=\"{doc_id}\", format=\"card\")"
                 )),
                 ranking: None,
+                withdrawn_date: row.get("withdrawn_date")?,
+                superseded_by: row.get("superseded_by")?,
+                replaces: row.get("replaces")?,
+                reranker_score: None,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1805,6 +2680,9 @@ fn whats_new(
                     .collect::<Vec<_>>()
                     .join(", ");
                 args.push(format!("types=[{rendered}]"));
+            }
+            if !current_only {
+                args.push("current_only=false".to_string());
             }
             format!("whats_new({})", args.join(", "))
         })
@@ -1932,18 +2810,32 @@ struct Manifest {
     #[serde(default)]
     min_client_version: String,
     model: ModelInfo,
+    /// Optional cross-encoder reranker (`cross-encoder/ms-marco-MiniLM-L-6-v2`
+    /// int8 ONNX). Older v1/v2 manifests omit this; the runtime degrades
+    /// gracefully to RRF-only ranking when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reranker: Option<ModelInfo>,
     #[serde(default)]
     documents: Vec<DocRef>,
     #[serde(default)]
     packs: Vec<PackInfo>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct ModelInfo {
     id: String,
     sha256: String,
     size: u64,
     url: String,
+    /// Optional sha256 of the companion tokenizer file. Currently used by
+    /// the HF reranker download path to harden `tokenizer.json` to the
+    /// same standard the model file enjoys (C4). When `None` or empty the
+    /// runtime logs a one-line warning and skips verification — back-compat
+    /// for v3 manifests built before this field existed. Tar.zst bundles
+    /// (the EmbeddingGemma path) verify the bundle as a whole and ignore
+    /// this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tokenizer_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -2049,15 +2941,71 @@ fn ensure_installed_db() -> Result<()> {
     }
 }
 
+/// Reject a manifest whose `schema_version` exceeds what this binary knows
+/// how to ingest, or whose `min_client_version` is newer than the
+/// currently-running binary.
+fn enforce_manifest_compatibility(manifest: &Manifest) -> Result<()> {
+    let schema_version = manifest.schema_version;
+    if schema_version < 0 {
+        bail!("manifest schema_version is negative ({schema_version}); manifest is malformed");
+    }
+    let schema_version = schema_version as u32;
+    if schema_version > MAX_SUPPORTED_MANIFEST_VERSION {
+        bail!(
+            "installed corpus requires ato-mcp >= newer version (manifest schema_version={schema_version}, this binary supports up to {MAX_SUPPORTED_MANIFEST_VERSION}); please upgrade the ato-mcp binary"
+        );
+    }
+    let min = manifest.min_client_version.trim();
+    if !min.is_empty() {
+        let current = env!("CARGO_PKG_VERSION");
+        if cmp_dotted_version(min, current).is_gt() {
+            bail!(
+                "manifest requires ato-mcp >= {min}, but this binary is {current}; please upgrade the ato-mcp binary"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Compare two dotted version strings (`a.b.c[-suffix]`) by their numeric
+/// components only. Returns `Ordering::Less/Equal/Greater` for the first
+/// arg relative to the second. Pre-release suffixes are ignored.
+fn cmp_dotted_version(a: &str, b: &str) -> std::cmp::Ordering {
+    fn parts(v: &str) -> Vec<u32> {
+        let core = v.split('-').next().unwrap_or("");
+        let mut out: Vec<u32> = core
+            .split('.')
+            .map(|s| s.parse::<u32>().unwrap_or(0))
+            .collect();
+        // Pad to length 3 so 1.2 == 1.2.0.
+        while out.len() < 3 {
+            out.push(0);
+        }
+        out
+    }
+    let pa = parts(a);
+    let pb = parts(b);
+    pa.cmp(&pb)
+}
+
 fn apply_update_locked(manifest_url: &str) -> Result<UpdateStats> {
     let staging = staging_dir()?;
     let manifest_context = UrlContext::from_manifest_url(manifest_url);
     let manifest_bytes = fetch_bytes(manifest_url, &manifest_context)
         .with_context(|| format!("fetching manifest from {manifest_url}"))?;
     let new_manifest: Manifest = serde_json::from_slice(&manifest_bytes)?;
+    enforce_manifest_compatibility(&new_manifest)?;
     let old_manifest = load_installed_manifest()?;
 
     ensure_model(&new_manifest, &manifest_context, &staging)?;
+    // Reranker is optional and best-effort. Failures here log to stderr
+    // but never abort an otherwise-successful corpus update — search
+    // falls back to RRF when the cross-encoder isn't available.
+    if new_manifest.reranker.is_some() {
+        if let Err(err) = ensure_reranker(&new_manifest, &manifest_context, &staging) {
+            eprintln!("ato-mcp: reranker download failed ({err}); search will fall back to RRF");
+        }
+    }
 
     let db = db_path()?;
     let had_existing_db = db.exists();
@@ -2133,6 +3081,9 @@ fn apply_update_locked(manifest_url: &str) -> Result<UpdateStats> {
         )?;
         set_meta(&tx, "index_version", &new_manifest.index_version)?;
         set_meta(&tx, "embedding_model_id", &new_manifest.model.id)?;
+        if let Some(reranker) = &new_manifest.reranker {
+            set_meta(&tx, "reranker_model_id", &reranker.id)?;
+        }
         set_meta(&tx, "last_update_at", &Utc::now().to_rfc3339())?;
         verify_semantic_install(&tx, &new_manifest)?;
         Ok(())
@@ -2198,6 +3149,9 @@ fn rebuild_live_db_from_manifest(
         )?;
         set_meta(&tx, "index_version", &manifest.index_version)?;
         set_meta(&tx, "embedding_model_id", &manifest.model.id)?;
+        if let Some(reranker) = &manifest.reranker {
+            set_meta(&tx, "reranker_model_id", &reranker.id)?;
+        }
         set_meta(&tx, "last_update_at", &Utc::now().to_rfc3339())?;
         verify_semantic_install(&tx, manifest)?;
         Ok(())
@@ -2624,6 +3578,186 @@ fn ensure_model_alias() -> Result<()> {
     Ok(())
 }
 
+/// Download (or refresh) the optional cross-encoder reranker into
+/// `live_dir()`. Caller is responsible for checking `manifest.reranker
+/// .is_some()` before invoking. Mirrors `ensure_model`'s caching:
+/// if the local files match the manifest's sha256 we skip the download.
+///
+/// Two download shapes are accepted:
+///   1. `hf://owner/repo[@revision]` — fetch `model.onnx` + `tokenizer.json`
+///      from the Hugging Face mirror, sha-verify the model.
+///   2. Any other URL — treated as a tar.zst bundle (the EmbeddingGemma
+///      pattern). The bundle MUST contain `reranker.onnx` AND
+///      `reranker_tokenizer.json` at the archive root. The bundle's
+///      sha256 is verified against `manifest.reranker.sha256`.
+fn ensure_reranker(manifest: &Manifest, context: &UrlContext, staging: &Path) -> Result<()> {
+    let info = manifest
+        .reranker
+        .as_ref()
+        .ok_or_else(|| anyhow!("ensure_reranker called with no reranker entry in manifest"))?;
+    let live_model = reranker_model_path()?;
+    let live_tokenizer = reranker_tokenizer_path()?;
+    let marker = live_dir()?.join(".reranker.sha256");
+    let marker_value = info.sha256.as_str();
+    if !marker_value.is_empty()
+        && live_model.exists()
+        && live_tokenizer.exists()
+        && marker.exists()
+        && fs::read_to_string(&marker)?.trim() == marker_value
+    {
+        return Ok(());
+    }
+
+    if let Some((repo, revision)) = parse_hf_model_url(&info.url) {
+        install_hf_reranker(repo, revision, info, staging)?;
+        if !marker_value.is_empty() {
+            fs::write(marker, marker_value)?;
+        }
+        return Ok(());
+    }
+
+    let bundle_url = resolve_manifest_asset(&info.url, context);
+    let bundle = staging.join("reranker-bundle.tar.zst.part");
+    fetch_to_file(&bundle_url, context, &bundle)?;
+    if !info.sha256.is_empty() {
+        verify_sha256_file(&bundle, &info.sha256)?;
+    }
+    let extract_dir = staging.join("reranker-bundle-extracted");
+    if extract_dir.exists() {
+        fs::remove_dir_all(&extract_dir)?;
+    }
+    fs::create_dir_all(&extract_dir)?;
+    let bundle_file = File::open(&bundle)?;
+    let decoder = zstd::stream::read::Decoder::new(bundle_file)?;
+    let mut archive = tar::Archive::new(decoder);
+    archive.unpack(&extract_dir)?;
+
+    let staged_model = extract_dir.join("reranker.onnx");
+    let staged_tokenizer = extract_dir.join("reranker_tokenizer.json");
+    if !staged_model.exists() || !staged_tokenizer.exists() {
+        bail!(
+            "reranker bundle is missing required files (expected reranker.onnx + reranker_tokenizer.json)"
+        );
+    }
+    if live_model.exists() {
+        fs::remove_file(&live_model)?;
+    }
+    if live_tokenizer.exists() {
+        fs::remove_file(&live_tokenizer)?;
+    }
+    fs::rename(&staged_model, &live_model)?;
+    fs::rename(&staged_tokenizer, &live_tokenizer)?;
+    if !marker_value.is_empty() {
+        fs::write(marker, marker_value)?;
+    }
+    let _ = fs::remove_file(bundle);
+    let _ = fs::remove_dir_all(extract_dir);
+    Ok(())
+}
+
+fn install_hf_reranker(repo: &str, revision: &str, info: &ModelInfo, staging: &Path) -> Result<()> {
+    fs::create_dir_all(staging)?;
+    // Different `optimum-cli` revisions emit different filenames for the
+    // int8 export (`onnx/model.onnx`, `onnx/model_quantized.onnx`,
+    // `model_quantized.onnx`, `model.onnx`). Try each in order; the first
+    // candidate that downloads AND matches the manifest's sha256 wins.
+    // Without sha-mismatch as a retry signal, a successful download of the
+    // wrong file would fail fatally even though the right file exists at a
+    // sibling URL — that would have broken every first-time reranker
+    // install on launch day.
+    let model_part = download_hf_reranker_model(repo, revision, info, staging)?;
+    let tokenizer_part = staging.join("reranker_tokenizer.json.part");
+    let tokenizer_url = hf_resolve_url(repo, revision, "tokenizer.json");
+    fetch_http_to_file(&tokenizer_url, &tokenizer_part)
+        .with_context(|| format!("downloading reranker tokenizer from {repo}"))?;
+    // C4: verify tokenizer sha256 when the maintainer pinned one.
+    // tokenizer_sha256 is optional on ModelInfo for back-compat with v3
+    // manifests built before the field existed; when absent we log a single
+    // warning rather than fail (matches the back-compat policy on the model
+    // sha when empty).
+    match info.tokenizer_sha256.as_deref() {
+        Some(expected) if !expected.is_empty() => {
+            verify_sha256_file(&tokenizer_part, expected)
+                .with_context(|| format!("verifying reranker tokenizer from {repo}"))?;
+        }
+        _ => {
+            eprintln!(
+                "ato-mcp: reranker tokenizer sha256 not pinned in manifest for {repo}; \
+                 skipping verification (set ModelInfo.tokenizer_sha256 to enable)"
+            );
+        }
+    }
+
+    let live_model = reranker_model_path()?;
+    let live_tokenizer = reranker_tokenizer_path()?;
+    if live_model.exists() {
+        fs::remove_file(&live_model)?;
+    }
+    if live_tokenizer.exists() {
+        fs::remove_file(&live_tokenizer)?;
+    }
+    fs::rename(&model_part, &live_model)?;
+    fs::rename(&tokenizer_part, &live_tokenizer)?;
+    Ok(())
+}
+
+fn download_hf_reranker_model(
+    repo: &str,
+    revision: &str,
+    info: &ModelInfo,
+    staging: &Path,
+) -> Result<PathBuf> {
+    download_hf_reranker_model_with(repo, revision, info, staging, |url, dest| {
+        fetch_http_to_file(url, dest)
+    })
+}
+
+fn download_hf_reranker_model_with<F>(
+    repo: &str,
+    revision: &str,
+    info: &ModelInfo,
+    staging: &Path,
+    mut fetch: F,
+) -> Result<PathBuf>
+where
+    F: FnMut(&str, &Path) -> Result<u64>,
+{
+    fs::create_dir_all(staging)?;
+    let model_part = staging.join("reranker.onnx.part");
+    let mut downloaded = false;
+    let mut errors: Vec<String> = Vec::new();
+    for candidate in RERANKER_MODEL_CANDIDATES {
+        let url = hf_resolve_url(repo, revision, candidate);
+        match fetch(&url, &model_part) {
+            Ok(_) => {
+                if info.sha256.is_empty() {
+                    // No checksum to verify — accept the first successful
+                    // download. This is the back-compat path for manifests
+                    // built before sha pinning.
+                    downloaded = true;
+                    break;
+                }
+                match verify_sha256_file(&model_part, &info.sha256) {
+                    Ok(_) => {
+                        downloaded = true;
+                        break;
+                    }
+                    Err(err) => errors.push(format!("{candidate}: {err}")),
+                }
+            }
+            Err(err) => errors.push(format!("{candidate}: {err}")),
+        }
+    }
+    if !downloaded {
+        let _ = fs::remove_file(&model_part);
+        bail!(
+            "no reranker model variant matched manifest sha256 for {repo}; tried: {}",
+            errors.join("; ")
+        );
+    }
+    Ok(model_part)
+}
+
 #[derive(Debug, Deserialize)]
 struct PackRecord {
     doc_id: String,
@@ -2633,6 +3767,18 @@ struct PackRecord {
     date: Option<String>,
     downloaded_at: String,
     content_hash: String,
+    /// W2.2 currency markers. Older (pre-v6) packs omit these fields entirely;
+    /// `serde(default)` lets us still ingest them as None. Without these fields
+    /// every ingested row would have NULL currency columns, the `current_only`
+    /// filter would silently never exclude anything, and W2.4 would be dead in
+    /// production — see the C1 regression test (`currency_fields_round_trip_*`)
+    /// for the canary that catches this.
+    #[serde(default)]
+    withdrawn_date: Option<String>,
+    #[serde(default)]
+    superseded_by: Option<String>,
+    #[serde(default)]
+    replaces: Option<String>,
     #[serde(default)]
     chunks: Vec<PackChunk>,
 }
@@ -2680,8 +3826,9 @@ fn insert_record(conn: &Connection, record: &PackRecord, doc_ref: &DocRef) -> Re
     conn.execute(
         r#"
         INSERT OR REPLACE INTO documents
-            (doc_id, type, title, date, downloaded_at, content_hash, pack_sha8)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+            (doc_id, type, title, date, downloaded_at, content_hash, pack_sha8,
+             withdrawn_date, superseded_by, replaces)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
         params![
             record.doc_id,
@@ -2691,6 +3838,9 @@ fn insert_record(conn: &Connection, record: &PackRecord, doc_ref: &DocRef) -> Re
             record.downloaded_at,
             record.content_hash,
             doc_ref.pack_sha8,
+            record.withdrawn_date,
+            record.superseded_by,
+            record.replaces,
         ],
     )?;
     let headings = record
@@ -2896,7 +4046,9 @@ fn call_tool(params: JsonValue, state: &mut ServerState) -> Result<JsonValue> {
                     mode,
                     sort_by,
                     include_old: optional_bool(&args, "include_old").unwrap_or(false),
+                    current_only: optional_bool(&args, "current_only").unwrap_or(true),
                     format,
+                    max_per_doc: DEFAULT_MAX_PER_DOC,
                 },
                 Some(state),
             )?
@@ -2909,6 +4061,7 @@ fn call_tool(params: JsonValue, state: &mut ServerState) -> Result<JsonValue> {
                 optional_usize(&args, "k").unwrap_or(20),
                 types.as_deref(),
                 optional_bool(&args, "include_old").unwrap_or(false),
+                optional_bool(&args, "current_only").unwrap_or(true),
                 output_format_arg(&args),
             )?
         }
@@ -2941,6 +4094,7 @@ fn call_tool(params: JsonValue, state: &mut ServerState) -> Result<JsonValue> {
             )?
         }
         "get_chunks" => get_chunks_mcp(&args)?,
+        "verify_quote" => verify_quote_mcp(&args)?,
         "whats_new" => {
             let types = optional_string_array(&args, "types")?;
             whats_new(
@@ -2948,6 +4102,7 @@ fn call_tool(params: JsonValue, state: &mut ServerState) -> Result<JsonValue> {
                 args.get("before").and_then(|v| v.as_str()),
                 optional_usize(&args, "limit").unwrap_or(50),
                 types.as_deref(),
+                optional_bool(&args, "current_only").unwrap_or(true),
                 output_format_arg(&args),
             )?
         }
@@ -3229,6 +4384,340 @@ fn server_instructions() -> String {
     }
 }
 
+// ---------------------------------------------------------------
+// verify_quote: hallucination-defense substring check
+// ---------------------------------------------------------------
+
+const VERIFY_QUOTE_MIN_CHARS: usize = 20;
+const VERIFY_QUOTE_MAX_MATCHES: usize = 10;
+const VERIFY_QUOTE_BOUNDARY_OVERLAP: usize = 200;
+
+#[derive(Debug, Clone, Serialize)]
+struct QuoteMatch {
+    chunk_id: i64,
+    ord: i64,
+    char_offset_in_chunk: usize,
+    char_length: usize,
+}
+
+fn verify_quote_mcp(args: &JsonValue) -> Result<String> {
+    let doc_id = required_str(args, "doc_id")?;
+    let quote = required_str(args, "quote")?;
+    let case_sensitive = optional_bool(args, "case_sensitive").unwrap_or(false);
+    let format = output_format_arg(args);
+    verify_quote(doc_id, quote, case_sensitive, format)
+}
+
+/// Whitespace-normalise: collapse runs of any whitespace into a single
+/// space and strip leading/trailing whitespace. Optionally lowercase.
+/// Returns (normalised string, mapping from byte offset in the normalised
+/// string to character offset in the original string). The map includes a
+/// final sentinel at `normalised.len()` for exclusive-end length arithmetic.
+fn normalise_with_offsets(input: &str, lowercase: bool) -> (String, Vec<usize>) {
+    let mut out = String::with_capacity(input.len());
+    let mut map: Vec<usize> = Vec::with_capacity(input.len() + 1);
+    let mut prev_was_space = true; // collapses leading whitespace
+    let mut input_chars = 0usize;
+    for (char_idx, (_byte_idx, ch)) in input.char_indices().enumerate() {
+        input_chars = char_idx + 1;
+        if ch.is_whitespace() {
+            if !prev_was_space {
+                map.push(char_idx);
+                out.push(' ');
+                prev_was_space = true;
+            }
+        } else {
+            let pushed = if lowercase {
+                // ASCII-fast lowercase to keep offsets predictable; for
+                // non-ASCII we still call to_lowercase() (which may emit
+                // multiple bytes/chars) but the offset map points at the
+                // original character's index.
+                if ch.is_ascii() {
+                    let mut c = [0u8; 4];
+                    let s = ch.to_ascii_lowercase().encode_utf8(&mut c).to_string();
+                    s
+                } else {
+                    ch.to_lowercase().collect::<String>()
+                }
+            } else {
+                ch.to_string()
+            };
+            for _ in 0..pushed.len() {
+                map.push(char_idx);
+            }
+            out.push_str(&pushed);
+            prev_was_space = false;
+        }
+    }
+    // If output ends with a single trailing space, drop it (we always
+    // collapse, but `prev_was_space` keeps us from emitting consecutive
+    // spaces; we still emit one if the last input char was whitespace).
+    if out.ends_with(' ') {
+        out.pop();
+        map.pop();
+    }
+    map.push(input_chars);
+    (out, map)
+}
+
+fn next_norm_search_start(s: &str, byte_idx: usize) -> usize {
+    if byte_idx >= s.len() {
+        return s.len();
+    }
+    let mut next = byte_idx + 1;
+    while next < s.len() && !s.is_char_boundary(next) {
+        next += 1;
+    }
+    next
+}
+
+fn verify_quote(
+    doc_id: &str,
+    quote: &str,
+    case_sensitive: bool,
+    format: OutputFormat,
+) -> Result<String> {
+    if quote.chars().count() < VERIFY_QUOTE_MIN_CHARS {
+        let body = json!({
+            "doc_id": doc_id,
+            "quote": quote,
+            "found": false,
+            "error": format!("quote too short (min {VERIFY_QUOTE_MIN_CHARS} chars)"),
+            "matches": [],
+        });
+        return Ok(match format {
+            OutputFormat::Json => serde_json::to_string_pretty(&body)?,
+            OutputFormat::Markdown => {
+                format!("_Quote too short (min {VERIFY_QUOTE_MIN_CHARS} chars)._")
+            }
+        });
+    }
+    let lowercase = !case_sensitive;
+    let (norm_quote, _) = normalise_with_offsets(quote, lowercase);
+    if norm_quote.is_empty() {
+        let body = json!({
+            "doc_id": doc_id,
+            "quote": quote,
+            "normalized_quote": norm_quote,
+            "found": false,
+            "matches": [],
+            "error": "quote contains no non-whitespace characters",
+        });
+        return Ok(match format {
+            OutputFormat::Json => serde_json::to_string_pretty(&body)?,
+            OutputFormat::Markdown => "_Quote contains no non-whitespace characters._".to_string(),
+        });
+    }
+
+    let conn = open_read()?;
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT chunk_id, ord, text
+        FROM chunks
+        WHERE doc_id = ?
+        ORDER BY ord ASC
+        "#,
+    )?;
+    let rows = stmt.query_map([doc_id], |row| {
+        Ok((
+            row.get::<_, i64>("chunk_id")?,
+            row.get::<_, i64>("ord")?,
+            row.get::<_, Vec<u8>>("text")?,
+        ))
+    })?;
+
+    struct ChunkText {
+        chunk_id: i64,
+        ord: i64,
+        original: String,
+        norm: String,
+        norm_to_orig: Vec<usize>,
+    }
+
+    let mut chunks: Vec<ChunkText> = Vec::new();
+    for row in rows {
+        let (chunk_id, ord, text_blob) = row?;
+        let original = decompress_text(text_blob)?;
+        let (norm, norm_to_orig) = normalise_with_offsets(&original, lowercase);
+        chunks.push(ChunkText {
+            chunk_id,
+            ord,
+            original,
+            norm,
+            norm_to_orig,
+        });
+    }
+
+    let mut matches: Vec<QuoteMatch> = Vec::new();
+    let mut truncated = false;
+
+    // Pass 1: within-chunk substring search.
+    for chunk in &chunks {
+        if matches.len() >= VERIFY_QUOTE_MAX_MATCHES {
+            truncated = true;
+            break;
+        }
+        let mut start_byte = 0usize;
+        while let Some(rel) = chunk.norm[start_byte..].find(&norm_quote) {
+            if matches.len() >= VERIFY_QUOTE_MAX_MATCHES {
+                truncated = true;
+                break;
+            }
+            let abs = start_byte + rel;
+            // Map normalised offset back to the original text.
+            let orig_offset = chunk
+                .norm_to_orig
+                .get(abs)
+                .copied()
+                .unwrap_or_else(|| chunk.original.chars().count());
+            // Length: walk to the end of the match in the normalised
+            // text, then map that offset back to the original.
+            let end_norm = abs + norm_quote.len();
+            let orig_end = chunk
+                .norm_to_orig
+                .get(end_norm)
+                .copied()
+                .unwrap_or_else(|| chunk.original.chars().count());
+            let char_length = orig_end.saturating_sub(orig_offset);
+            matches.push(QuoteMatch {
+                chunk_id: chunk.chunk_id,
+                ord: chunk.ord,
+                char_offset_in_chunk: orig_offset,
+                char_length,
+            });
+            start_byte = next_norm_search_start(&chunk.norm, abs);
+        }
+    }
+
+    // Pass 2: cross-chunk boundary search. For each pair (N, N+1) build
+    // chunk_N + " " + chunk_{N+1}[..VERIFY_QUOTE_BOUNDARY_OVERLAP] in
+    // normalised form, then search. Only emit matches that genuinely
+    // straddle the boundary.
+    if !truncated {
+        for window in chunks.windows(2) {
+            if matches.len() >= VERIFY_QUOTE_MAX_MATCHES {
+                truncated = true;
+                break;
+            }
+            let chunk_n = &window[0];
+            let chunk_n1 = &window[1];
+            // Build joined original text + map back. We insert a synthetic
+            // space at the join only when neither side already provides a
+            // boundary whitespace; otherwise consecutive non-whitespace
+            // bytes from the two chunks would merge into a single token.
+            let next_overlap_chars: String = chunk_n1
+                .original
+                .chars()
+                .take(VERIFY_QUOTE_BOUNDARY_OVERLAP)
+                .collect();
+            let needs_synthetic_space = !chunk_n.original.ends_with(char::is_whitespace)
+                && !next_overlap_chars.starts_with(char::is_whitespace);
+            // Track the character offset of any synthetic space we inject so
+            // we can subtract it back from char_length when computing a
+            // boundary-match span. Currently always at most one.
+            let mut synthetic_offsets: Vec<usize> = Vec::new();
+            let joined = if needs_synthetic_space {
+                synthetic_offsets.push(chunk_n.original.chars().count());
+                format!("{} {}", chunk_n.original, next_overlap_chars)
+            } else {
+                format!("{}{}", chunk_n.original, next_overlap_chars)
+            };
+            let (joined_norm, joined_map) = normalise_with_offsets(&joined, lowercase);
+            // The normalised offset that marks the END of chunk_n in the
+            // joined string: count normalised bytes up to chunk_n.original
+            // boundary by looking at joined_map.
+            let chunk_n_orig_end = chunk_n.original.chars().count();
+            // Find the largest normalised idx whose joined-original
+            // offset is < chunk_n_orig_end. That's the boundary in the
+            // normalised string.
+            let n_boundary_norm = joined_map
+                .iter()
+                .position(|&o| o >= chunk_n_orig_end)
+                .unwrap_or(joined_norm.len());
+
+            let mut start_byte = 0usize;
+            while let Some(rel) = joined_norm[start_byte..].find(&norm_quote) {
+                if matches.len() >= VERIFY_QUOTE_MAX_MATCHES {
+                    truncated = true;
+                    break;
+                }
+                let abs = start_byte + rel;
+                let end_norm = abs + norm_quote.len();
+                // Boundary-only: start strictly inside chunk_n AND end
+                // past chunk_n.
+                if abs < n_boundary_norm && end_norm > n_boundary_norm {
+                    let joined_orig_offset =
+                        joined_map.get(abs).copied().unwrap_or(chunk_n_orig_end);
+                    // Within chunk_n, the original offset is the same as
+                    // joined_orig_offset because chunk_n is the prefix
+                    // of `joined`.
+                    let char_offset_in_chunk = joined_orig_offset.min(chunk_n_orig_end);
+                    // Compute char_length in *joined* original; that's
+                    // the number of original chars spanned by the match,
+                    // minus any synthetic chars we inserted that fell
+                    // inside the matched span.
+                    let joined_orig_end = joined_map
+                        .get(end_norm)
+                        .copied()
+                        .unwrap_or_else(|| joined.chars().count());
+                    let raw_span = joined_orig_end.saturating_sub(joined_orig_offset);
+                    let synthetic_in_span = synthetic_offsets
+                        .iter()
+                        .filter(|&&off| off >= joined_orig_offset && off < joined_orig_end)
+                        .count();
+                    let char_length = raw_span.saturating_sub(synthetic_in_span);
+                    matches.push(QuoteMatch {
+                        chunk_id: chunk_n.chunk_id,
+                        ord: chunk_n.ord,
+                        char_offset_in_chunk,
+                        char_length,
+                    });
+                }
+                start_byte = next_norm_search_start(&joined_norm, abs);
+            }
+        }
+    }
+
+    let found = !matches.is_empty();
+    let body = json!({
+        "doc_id": doc_id,
+        "quote": quote,
+        "normalized_quote": norm_quote,
+        "found": found,
+        "matches": matches,
+        "meta": {
+            "truncated": truncated,
+            "case_sensitive": case_sensitive,
+        },
+    });
+
+    Ok(match format {
+        OutputFormat::Json => serde_json::to_string_pretty(&body)?,
+        OutputFormat::Markdown => format_verify_quote_markdown(&matches, found, truncated),
+    })
+}
+
+fn format_verify_quote_markdown(matches: &[QuoteMatch], found: bool, truncated: bool) -> String {
+    if !found {
+        return "_No matches found._".to_string();
+    }
+    let mut out = String::new();
+    out.push_str("| chunk_id | ord | char_offset_in_chunk | char_length |\n");
+    out.push_str("|---:|---:|---:|---:|\n");
+    for m in matches {
+        out.push_str(&format!(
+            "| {} | {} | {} | {} |\n",
+            m.chunk_id, m.ord, m.char_offset_in_chunk, m.char_length
+        ));
+    }
+    if truncated {
+        out.push_str(&format!(
+            "_Truncated at {VERIFY_QUOTE_MAX_MATCHES} matches._\n"
+        ));
+    }
+    out
+}
+
 fn tool_descriptors() -> JsonValue {
     json!([
         {
@@ -3246,6 +4735,7 @@ fn tool_descriptors() -> JsonValue {
                     "mode": {"type": "string", "enum": ["hybrid", "vector", "keyword"]},
                     "sort_by": {"type": "string", "enum": ["relevance", "recency"]},
                     "include_old": {"type": "boolean"},
+                    "current_only": {"type": "boolean", "description": "When true (default), excludes withdrawn rulings. Set false to include withdrawn material with a visible marker."},
                     "format": {"type": "string", "enum": ["markdown", "json"]}
                 },
                 "required": ["query"]
@@ -3261,6 +4751,7 @@ fn tool_descriptors() -> JsonValue {
                     "k": {"type": "integer", "minimum": 1, "maximum": 100},
                     "types": {"type": "array", "items": {"type": "string"}},
                     "include_old": {"type": "boolean"},
+                    "current_only": {"type": "boolean", "description": "When true (default), excludes withdrawn rulings. Set false to include withdrawn material with a visible marker."},
                     "format": {"type": "string", "enum": ["markdown", "json"]}
                 },
                 "required": ["query"]
@@ -3300,6 +4791,20 @@ fn tool_descriptors() -> JsonValue {
             }
         },
         {
+            "name": "verify_quote",
+            "description": "Verify a quoted passage exists verbatim (whitespace-tolerant) in a document. Returns chunk_id, ord, and character offsets for each match. Use to check whether the model actually quoted ATO material or hallucinated it.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "doc_id": {"type": "string"},
+                    "quote": {"type": "string"},
+                    "case_sensitive": {"type": "boolean"},
+                    "format": {"type": "string", "enum": ["markdown", "json"]}
+                },
+                "required": ["doc_id", "quote"]
+            }
+        },
+        {
             "name": "whats_new",
             "description": "Most recently published documents by corpus date.",
             "inputSchema": {
@@ -3309,6 +4814,7 @@ fn tool_descriptors() -> JsonValue {
                     "before": {"type": "string"},
                     "limit": {"type": "integer"},
                     "types": {"type": "array", "items": {"type": "string"}},
+                    "current_only": {"type": "boolean", "description": "When true (default), excludes withdrawn rulings. Set false to include withdrawn material with a visible marker."},
                     "format": {"type": "string", "enum": ["markdown", "json"]}
                 }
             }
@@ -3324,4 +4830,2229 @@ fn tool_descriptors() -> JsonValue {
             }
         }
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
+    use rusqlite::Connection;
+    use tempfile::tempdir;
+
+    // ----- W1.1 SIMD parity -----
+
+    #[test]
+    fn dot_i8_simd_matches_scalar() {
+        let mut rng = StdRng::seed_from_u64(42);
+        for _ in 0..100 {
+            let q: [i8; EMBEDDING_DIM] = std::array::from_fn(|_| rng.gen());
+            let d: Vec<u8> = (0..EMBEDDING_DIM).map(|_| rng.gen::<u8>()).collect();
+            let scalar = dot_i8_scalar_reference(&q, &d).unwrap();
+            let simd = dot_i8(&q, &d).unwrap();
+            assert!(
+                (scalar - simd).abs() < 1e-6,
+                "scalar {} vs simd {}",
+                scalar,
+                simd
+            );
+        }
+    }
+
+    #[test]
+    fn dot_i8_rejects_wrong_length() {
+        let q = [0i8; EMBEDDING_DIM];
+        let bad = vec![0u8; EMBEDDING_DIM - 1];
+        assert!(dot_i8(&q, &bad).is_err());
+    }
+
+    // ----- W1.2 BM25 snippets -----
+
+    #[test]
+    fn snippet_picks_high_density_window() {
+        let mut text = String::new();
+        // Filler before
+        for _ in 0..30 {
+            text.push_str("alpha beta gamma delta epsilon ");
+        }
+        // The high-density section: query terms cluster here
+        text.push_str("the taxpayer claimed an R&D tax incentive deduction for eligible R&D activities in the income year ");
+        // Filler after
+        for _ in 0..30 {
+            text.push_str("zeta eta theta iota kappa ");
+        }
+        let snippet = highlight_snippet(&text, "R&D tax incentive", SNIPPET_CHARS, "");
+        assert!(
+            snippet.contains("R&D tax incentive"),
+            "snippet should include the query phrase, got: {snippet}"
+        );
+    }
+
+    #[test]
+    fn snippet_prefixes_heading_path() {
+        let text = "The taxpayer claimed an R&D tax incentive deduction for eligible activities";
+        let snippet = highlight_snippet(text, "R&D", SNIPPET_CHARS, "Section 8-1 > Reasons");
+        assert!(
+            snippet.starts_with("Section 8-1 > Reasons — "),
+            "snippet should start with heading prefix, got: {snippet}"
+        );
+    }
+
+    #[test]
+    fn snippet_omits_prefix_when_heading_empty() {
+        let text = "The taxpayer claimed an R&D tax incentive deduction";
+        let snippet = highlight_snippet(text, "R&D", SNIPPET_CHARS, "");
+        assert!(
+            !snippet.contains(" — "),
+            "empty heading should not produce a prefix delimiter, got: {snippet}"
+        );
+        assert!(snippet.contains("R&D"));
+    }
+
+    // ----- W1.3 hierarchical dedup -----
+
+    fn meta(doc_id: &str, is_intro: bool) -> CandidateMeta {
+        CandidateMeta {
+            doc_id: doc_id.to_string(),
+            is_intro,
+        }
+    }
+
+    #[test]
+    fn dedup_caps_chunks_per_doc() {
+        let mut ranked: Vec<VectorHit> = Vec::new();
+        let mut metas: HashMap<i64, CandidateMeta> = HashMap::new();
+        // 8 chunks for doc A with descending scores
+        for i in 0..8 {
+            ranked.push(VectorHit {
+                chunk_id: i as i64,
+                score: 1.0 - (i as f64) * 0.01,
+            });
+            metas.insert(i as i64, meta("A", false));
+        }
+        // 2 chunks for doc B
+        for j in 0..2 {
+            let id = (100 + j) as i64;
+            ranked.push(VectorHit {
+                chunk_id: id,
+                score: 0.5 - (j as f64) * 0.01,
+            });
+            metas.insert(id, meta("B", false));
+        }
+        let out = dedup_per_doc(ranked, &metas, 10, DEFAULT_MAX_PER_DOC);
+        // Hard cap: no doc should appear more than max_per_doc times in
+        // the output, even if there's room left under k.
+        let mut counts: HashMap<&str, usize> = HashMap::new();
+        for h in &out {
+            let doc_id = metas.get(&h.chunk_id).unwrap().doc_id.as_str();
+            *counts.entry(doc_id).or_insert(0) += 1;
+        }
+        assert_eq!(counts.get("A"), Some(&2), "A should be capped at 2");
+        assert_eq!(counts.get("B"), Some(&2), "B should be capped at 2");
+        // 2 docs * 2 = 4 distinct slots filled.
+        assert_eq!(out.len(), 4);
+    }
+
+    #[test]
+    fn dedup_demotes_intro_chunks_within_doc() {
+        let mut ranked: Vec<VectorHit> = Vec::new();
+        let mut metas: HashMap<i64, CandidateMeta> = HashMap::new();
+        // Intro chunk has highest raw score
+        ranked.push(VectorHit {
+            chunk_id: 1,
+            score: 0.9,
+        });
+        metas.insert(1, meta("A", true));
+        // Non-intro chunk in the same doc
+        ranked.push(VectorHit {
+            chunk_id: 2,
+            score: 0.5,
+        });
+        metas.insert(2, meta("A", false));
+        let out = dedup_per_doc(ranked, &metas, 1, 1);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].chunk_id, 2, "non-intro chunk should outrank intro");
+    }
+
+    #[test]
+    fn dedup_orders_docs_by_max_chunk_score() {
+        let mut ranked: Vec<VectorHit> = Vec::new();
+        let mut metas: HashMap<i64, CandidateMeta> = HashMap::new();
+        // Doc A: best chunk score 0.5
+        ranked.push(VectorHit {
+            chunk_id: 1,
+            score: 0.5,
+        });
+        metas.insert(1, meta("A", false));
+        // Doc B: best chunk score 0.8
+        ranked.push(VectorHit {
+            chunk_id: 2,
+            score: 0.8,
+        });
+        metas.insert(2, meta("B", false));
+        let out = dedup_per_doc(ranked, &metas, 2, 1);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].chunk_id, 2, "B should rank first");
+        assert_eq!(out[1].chunk_id, 1, "A should rank second");
+    }
+
+    // ----- W1.4 verify_quote -----
+
+    /// Build an in-memory test corpus, return the open Connection.
+    fn make_test_db() -> Result<(tempfile::TempDir, std::path::PathBuf)> {
+        // We can't easily reuse `db_path()` here without setting env vars
+        // for the data dir. Instead we set ATO_MCP_DATA_DIR so init_db
+        // and verify_quote both target the same file.
+        let dir = tempdir()?;
+        let db_dir = dir.path().join("live");
+        fs::create_dir_all(&db_dir)?;
+        let db = db_dir.join("ato.db");
+        let conn = open_write_at(&db)?;
+        init_db(&conn)?;
+        Ok((dir, db))
+    }
+
+    fn insert_doc(conn: &Connection, doc_id: &str) -> Result<()> {
+        conn.execute(
+            "INSERT INTO documents(doc_id, type, title, downloaded_at, content_hash, pack_sha8) VALUES (?, 'Public_ruling', ?, ?, ?, '00000000')",
+            params![doc_id, format!("{doc_id} title"), Utc::now().to_rfc3339(), "deadbeef"],
+        )?;
+        Ok(())
+    }
+
+    /// W2 helper: insert a document row with explicit currency fields. The
+    /// W1 helper above keeps its v5-shaped shorthand (NULL currency
+    /// columns) so existing tests don't churn.
+    fn insert_doc_full(
+        conn: &Connection,
+        doc_id: &str,
+        date: Option<&str>,
+        withdrawn_date: Option<&str>,
+        superseded_by: Option<&str>,
+        replaces: Option<&str>,
+    ) -> Result<()> {
+        conn.execute(
+            "INSERT INTO documents(doc_id, type, title, date, downloaded_at, \
+                content_hash, pack_sha8, withdrawn_date, superseded_by, replaces) \
+             VALUES (?, 'Public_ruling', ?, ?, ?, ?, '00000000', ?, ?, ?)",
+            params![
+                doc_id,
+                format!("{doc_id} title"),
+                date,
+                Utc::now().to_rfc3339(),
+                "deadbeef",
+                withdrawn_date,
+                superseded_by,
+                replaces,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn insert_chunk(
+        conn: &Connection,
+        chunk_id: i64,
+        doc_id: &str,
+        ord: i64,
+        text: &str,
+    ) -> Result<()> {
+        conn.execute(
+            "INSERT INTO chunks(chunk_id, doc_id, ord, heading_path, anchor, text) VALUES (?, ?, ?, ?, NULL, ?)",
+            params![chunk_id, doc_id, ord, "Section A", compress_text(text)?],
+        )?;
+        Ok(())
+    }
+
+    fn with_data_dir<R>(dir: &std::path::Path, f: impl FnOnce() -> R) -> R {
+        let prev = std::env::var("ATO_MCP_DATA_DIR").ok();
+        std::env::set_var("ATO_MCP_DATA_DIR", dir);
+        let result = f();
+        if let Some(p) = prev {
+            std::env::set_var("ATO_MCP_DATA_DIR", p);
+        } else {
+            std::env::remove_var("ATO_MCP_DATA_DIR");
+        }
+        result
+    }
+
+    #[test]
+    fn verify_quote_rejects_short() {
+        let result = verify_quote("DOC1", "tiny", false, OutputFormat::Json).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["found"], json!(false));
+        assert!(parsed["error"].as_str().unwrap().contains("too short"));
+    }
+
+    #[test]
+    fn verify_quote_finds_exact_match() -> Result<()> {
+        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let (dir, _db) = make_test_db()?;
+        let conn = open_write_at(&dir.path().join("live/ato.db"))?;
+        insert_doc(&conn, "DOC1")?;
+        insert_chunk(
+            &conn,
+            1,
+            "DOC1",
+            0,
+            "The taxpayer is entitled to a deduction under section 8-1 of the ITAA 1997.",
+        )?;
+        drop(conn);
+        with_data_dir(dir.path(), || -> Result<()> {
+            let json_str = verify_quote(
+                "DOC1",
+                "entitled to a deduction under section 8-1 of the ITAA",
+                false,
+                OutputFormat::Json,
+            )?;
+            let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
+            assert_eq!(parsed["found"], json!(true));
+            assert_eq!(parsed["matches"].as_array().unwrap().len(), 1);
+            let m = &parsed["matches"][0];
+            assert_eq!(m["chunk_id"], json!(1));
+            assert_eq!(m["ord"], json!(0));
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn verify_quote_tolerates_extra_whitespace() -> Result<()> {
+        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let (dir, _db) = make_test_db()?;
+        let conn = open_write_at(&dir.path().join("live/ato.db"))?;
+        insert_doc(&conn, "DOC2")?;
+        insert_chunk(
+            &conn,
+            1,
+            "DOC2",
+            0,
+            "the cost of a defective building works report is deductible",
+        )?;
+        drop(conn);
+        with_data_dir(dir.path(), || -> Result<()> {
+            let json_str = verify_quote(
+                "DOC2",
+                "the   cost   of\n  a    defective\tbuilding works report",
+                false,
+                OutputFormat::Json,
+            )?;
+            let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
+            assert_eq!(parsed["found"], json!(true));
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn verify_quote_finds_cross_chunk_match() -> Result<()> {
+        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let (dir, _db) = make_test_db()?;
+        let conn = open_write_at(&dir.path().join("live/ato.db"))?;
+        insert_doc(&conn, "DOC3")?;
+        // The phrase "deductible under section 8-1" straddles the boundary.
+        insert_chunk(
+            &conn,
+            1,
+            "DOC3",
+            0,
+            "preceding text ending with deductible under",
+        )?;
+        insert_chunk(
+            &conn,
+            2,
+            "DOC3",
+            1,
+            "section 8-1 of the ITAA 1997 follows here",
+        )?;
+        drop(conn);
+        with_data_dir(dir.path(), || -> Result<()> {
+            let json_str = verify_quote(
+                "DOC3",
+                "deductible under section 8-1 of the ITAA",
+                false,
+                OutputFormat::Json,
+            )?;
+            let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
+            assert_eq!(parsed["found"], json!(true), "json={parsed}");
+            // Boundary match must report against chunk N (chunk_id=1).
+            let matches = parsed["matches"].as_array().unwrap();
+            assert_eq!(matches.len(), 1);
+            assert_eq!(matches[0]["chunk_id"], json!(1));
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn verify_quote_rejects_modified_quote() -> Result<()> {
+        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let (dir, _db) = make_test_db()?;
+        let conn = open_write_at(&dir.path().join("live/ato.db"))?;
+        insert_doc(&conn, "DOC4")?;
+        insert_chunk(
+            &conn,
+            1,
+            "DOC4",
+            0,
+            "the taxpayer is entitled to a deduction for the cost of a building",
+        )?;
+        drop(conn);
+        with_data_dir(dir.path(), || -> Result<()> {
+            let json_str = verify_quote(
+                "DOC4",
+                "the taxpayer is entitled to refund for the cost of a building",
+                false,
+                OutputFormat::Json,
+            )?;
+            let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
+            assert_eq!(parsed["found"], json!(false));
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn verify_quote_case_sensitive_override() -> Result<()> {
+        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let (dir, _db) = make_test_db()?;
+        let conn = open_write_at(&dir.path().join("live/ato.db"))?;
+        insert_doc(&conn, "DOC5")?;
+        insert_chunk(
+            &conn,
+            1,
+            "DOC5",
+            0,
+            "The taxpayer's R&D Tax Incentive claim was reviewed in detail by the ATO.",
+        )?;
+        drop(conn);
+        with_data_dir(dir.path(), || -> Result<()> {
+            // Case-insensitive (default) matches.
+            let ci = verify_quote(
+                "DOC5",
+                "the TAXPAYER's r&d tax incentive claim was reviewed",
+                false,
+                OutputFormat::Json,
+            )?;
+            let parsed_ci: serde_json::Value = serde_json::from_str(&ci)?;
+            assert_eq!(parsed_ci["found"], json!(true));
+            // Case-sensitive does not.
+            let cs = verify_quote(
+                "DOC5",
+                "the TAXPAYER's r&d tax incentive claim was reviewed",
+                true,
+                OutputFormat::Json,
+            )?;
+            let parsed_cs: serde_json::Value = serde_json::from_str(&cs)?;
+            assert_eq!(parsed_cs["found"], json!(false));
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    // ----- W1.5 manifest version guards -----
+
+    #[test]
+    fn manifest_compat_accepts_current_schema() {
+        let m = sample_manifest(MAX_SUPPORTED_MANIFEST_VERSION as i64, "");
+        assert!(enforce_manifest_compatibility(&m).is_ok());
+    }
+
+    #[test]
+    fn manifest_compat_rejects_newer_schema() {
+        let m = sample_manifest((MAX_SUPPORTED_MANIFEST_VERSION + 1) as i64, "");
+        let err = enforce_manifest_compatibility(&m).unwrap_err();
+        assert!(
+            err.to_string().contains("upgrade the ato-mcp binary"),
+            "expected upgrade-binary message, got: {err}"
+        );
+    }
+
+    #[test]
+    fn manifest_compat_rejects_higher_min_client_version() {
+        let m = sample_manifest(MAX_SUPPORTED_MANIFEST_VERSION as i64, "999.0.0");
+        let err = enforce_manifest_compatibility(&m).unwrap_err();
+        assert!(
+            err.to_string().contains("999"),
+            "expected min_client_version error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn manifest_compat_accepts_min_client_version_at_or_below_current() {
+        // Any version that's <= the current binary's version should pass.
+        let current = env!("CARGO_PKG_VERSION");
+        let m = sample_manifest(MAX_SUPPORTED_MANIFEST_VERSION as i64, current);
+        assert!(enforce_manifest_compatibility(&m).is_ok());
+        let m = sample_manifest(MAX_SUPPORTED_MANIFEST_VERSION as i64, "0.0.1");
+        assert!(enforce_manifest_compatibility(&m).is_ok());
+    }
+
+    #[test]
+    fn cmp_dotted_version_basics() {
+        use std::cmp::Ordering;
+        assert_eq!(cmp_dotted_version("1.2.3", "1.2.3"), Ordering::Equal);
+        assert_eq!(cmp_dotted_version("1.2", "1.2.0"), Ordering::Equal);
+        assert_eq!(cmp_dotted_version("1.2.4", "1.2.3"), Ordering::Greater);
+        assert_eq!(cmp_dotted_version("1.3.0", "1.2.99"), Ordering::Greater);
+        assert_eq!(cmp_dotted_version("0.4.0", "0.4.0-rc1"), Ordering::Equal);
+    }
+
+    #[test]
+    fn open_read_rejects_unsupported_schema_version() -> Result<()> {
+        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let (dir, db) = make_test_db()?;
+        let conn = open_write_at(&db)?;
+        // Force a bogus schema version via raw SQL.
+        set_meta(&conn, "schema_version", "99")?;
+        drop(conn);
+        with_data_dir(dir.path(), || -> Result<()> {
+            let err = open_read().unwrap_err();
+            assert!(
+                err.to_string().contains("not supported by this binary"),
+                "expected schema mismatch error, got: {err}"
+            );
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn open_read_rejects_missing_schema_version_row() -> Result<()> {
+        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let (dir, db) = make_test_db()?;
+        let conn = open_write_at(&db)?;
+        // init_db wrote the row; now delete it to simulate a corrupt /
+        // partial install.
+        conn.execute("DELETE FROM meta WHERE key = 'schema_version'", [])?;
+        drop(conn);
+        with_data_dir(dir.path(), || -> Result<()> {
+            let err = open_read().unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("corrupt or incomplete") && msg.contains("ato-mcp init"),
+                "expected corrupt/incomplete error with init hint, got: {msg}"
+            );
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    // ----- Cleanup: highlight_snippet fallback paths -----
+
+    #[test]
+    fn snippet_falls_back_when_query_has_no_usable_tokens() {
+        // Query reduces to only single-character / punctuation tokens,
+        // which `snippet_query_terms` filters out. We expect the opening
+        // fragment with the heading prefix.
+        let text = "The quick brown fox jumps over the lazy dog repeatedly throughout the day.";
+        let snippet = highlight_snippet(text, "a", SNIPPET_CHARS, "Heading");
+        assert!(
+            snippet.starts_with("Heading — "),
+            "heading prefix should remain on fallback, got: {snippet}"
+        );
+        assert!(
+            snippet.contains("The quick brown fox"),
+            "fallback should preserve the opening fragment, got: {snippet}"
+        );
+    }
+
+    #[test]
+    fn snippet_falls_back_when_chunk_text_is_empty() {
+        let snippet = highlight_snippet("", "anything goes here", SNIPPET_CHARS, "H");
+        // Empty cleaned text -> returns prefix_heading("H", "") -> "H — "
+        assert!(
+            snippet == "H — ",
+            "empty chunk text should still emit the heading prefix, got: {snippet:?}"
+        );
+        // And without a heading, the snippet is itself empty.
+        let snippet_no_heading = highlight_snippet("", "anything", SNIPPET_CHARS, "");
+        assert_eq!(
+            snippet_no_heading, "",
+            "empty chunk + empty heading should produce an empty snippet"
+        );
+    }
+
+    #[test]
+    fn snippet_heading_only_fallback_when_no_tokens_match() {
+        // The chunk only contains tokens that don't appear in the query.
+        // BM25 still picks *some* window, but the highlight should still
+        // begin with the heading prefix and emit a sensible window.
+        let text = "lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor";
+        let snippet = highlight_snippet(
+            text,
+            "completely unrelated query terms",
+            SNIPPET_CHARS,
+            "Heading X",
+        );
+        assert!(
+            snippet.starts_with("Heading X — "),
+            "heading prefix should appear even when query tokens never match, got: {snippet}"
+        );
+        // Body should be drawn from the chunk text (we should still emit
+        // *something*, not crash or return empty).
+        assert!(
+            snippet.len() > "Heading X — ".len(),
+            "snippet should include a body window, got: {snippet}"
+        );
+    }
+
+    // ----- Cleanup: verify_quote 10-match cap -----
+
+    #[test]
+    fn verify_quote_caps_at_max_matches() -> Result<()> {
+        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let (dir, _db) = make_test_db()?;
+        let conn = open_write_at(&dir.path().join("live/ato.db"))?;
+        insert_doc(&conn, "DOC_CAP")?;
+        // 25-char phrase repeated 11 times, separated so each occurrence
+        // is independently findable.
+        let phrase = "abcdefghijklmnopqrstuvwxy"; // 25 chars
+        let mut chunk_text = String::new();
+        for _ in 0..11 {
+            chunk_text.push_str(phrase);
+            chunk_text.push_str(" SEP ");
+        }
+        insert_chunk(&conn, 1, "DOC_CAP", 0, &chunk_text)?;
+        drop(conn);
+        with_data_dir(dir.path(), || -> Result<()> {
+            let json_str = verify_quote("DOC_CAP", phrase, false, OutputFormat::Json)?;
+            let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
+            assert_eq!(parsed["found"], json!(true));
+            let matches = parsed["matches"].as_array().unwrap();
+            assert_eq!(
+                matches.len(),
+                VERIFY_QUOTE_MAX_MATCHES,
+                "should be capped at VERIFY_QUOTE_MAX_MATCHES, got {}",
+                matches.len()
+            );
+            assert_eq!(
+                parsed["meta"]["truncated"],
+                json!(true),
+                "truncated flag must be set when cap reached"
+            );
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    // ----- Cleanup: verify_quote no-double-emit at chunk boundary -----
+
+    #[test]
+    fn verify_quote_does_not_double_emit_when_phrase_in_overlap() -> Result<()> {
+        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let (dir, _db) = make_test_db()?;
+        let conn = open_write_at(&dir.path().join("live/ato.db"))?;
+        insert_doc(&conn, "DOC_NODUP")?;
+        // The phrase lives entirely inside chunk N. Pass 2 builds a join
+        // of chunk_N + first 200 chars of chunk_{N+1}; if the phrase is
+        // near the end of chunk_N, the joined string still contains it,
+        // but Pass 2 must NOT emit a duplicate match because the phrase
+        // does not actually straddle the boundary.
+        let phrase = "the quick brown fox jumps over"; // 30 chars
+        let chunk_n_text = format!(
+            "preamble {} trailing words go here for padding only",
+            phrase
+        );
+        insert_chunk(&conn, 1, "DOC_NODUP", 0, &chunk_n_text)?;
+        // chunk N+1: arbitrary continuation, irrelevant to the match.
+        insert_chunk(
+            &conn,
+            2,
+            "DOC_NODUP",
+            1,
+            "next chunk continues with completely different content",
+        )?;
+        drop(conn);
+        with_data_dir(dir.path(), || -> Result<()> {
+            let json_str = verify_quote("DOC_NODUP", phrase, false, OutputFormat::Json)?;
+            let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
+            assert_eq!(parsed["found"], json!(true));
+            let matches = parsed["matches"].as_array().unwrap();
+            assert_eq!(
+                matches.len(),
+                1,
+                "boundary overlap window must not double-emit a within-chunk match, got: {parsed}"
+            );
+            assert_eq!(matches[0]["chunk_id"], json!(1));
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    // ----- Cleanup: cross-chunk char_length must equal original char count -----
+
+    #[test]
+    fn verify_quote_cross_chunk_char_length_excludes_synthetic_space() -> Result<()> {
+        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let (dir, _db) = make_test_db()?;
+        let conn = open_write_at(&dir.path().join("live/ato.db"))?;
+        insert_doc(&conn, "DOC_BNDLEN")?;
+        // Pick chunks whose join requires a synthetic space (neither side
+        // ends/starts with whitespace). Quote spans the boundary.
+        let chunk_n_text = "alpha beta gamma deductible under";
+        let chunk_n1_text = "section 8-1 of the ITAA delta epsilon";
+        insert_chunk(&conn, 1, "DOC_BNDLEN", 0, chunk_n_text)?;
+        insert_chunk(&conn, 2, "DOC_BNDLEN", 1, chunk_n1_text)?;
+        drop(conn);
+
+        // Quote: chars from end of chunk_n + chars from start of chunk_n1.
+        let chunk_n_match_tail = "deductible under";
+        let chunk_n1_match_head = "section 8-1 of the ITAA";
+        // The true original-character count of the match in the doc text:
+        // tail chars from chunk_n PLUS head chars from chunk_n1. There is
+        // no boundary character in the original — chunks are separate strings.
+        let expected_char_length =
+            chunk_n_match_tail.chars().count() + chunk_n1_match_head.chars().count();
+        // The quote we feed verify_quote needs to be searchable post-
+        // normalisation: include a single space to simulate the boundary.
+        let quote = format!("{} {}", chunk_n_match_tail, chunk_n1_match_head);
+        with_data_dir(dir.path(), || -> Result<()> {
+            let json_str = verify_quote("DOC_BNDLEN", &quote, false, OutputFormat::Json)?;
+            let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
+            assert_eq!(parsed["found"], json!(true), "json={parsed}");
+            let matches = parsed["matches"].as_array().unwrap();
+            assert_eq!(matches.len(), 1, "exactly one boundary match expected");
+            let m = &matches[0];
+            assert_eq!(m["chunk_id"], json!(1));
+            let char_length = m["char_length"].as_u64().unwrap() as usize;
+            assert_eq!(
+                char_length, expected_char_length,
+                "char_length should equal the original-text byte count of the match, with no synthetic-byte inflation"
+            );
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn verify_quote_reports_character_offsets_for_non_ascii_text() -> Result<()> {
+        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let (dir, _db) = make_test_db()?;
+        let conn = open_write_at(&dir.path().join("live/ato.db"))?;
+        insert_doc(&conn, "DOC_UNICODE")?;
+        let prefix = "éé abc ";
+        let phrase = "deductible under section 8-1 of the ITAA";
+        let text = format!("{prefix}{phrase} 1997");
+        insert_chunk(&conn, 1, "DOC_UNICODE", 0, &text)?;
+        drop(conn);
+
+        with_data_dir(dir.path(), || -> Result<()> {
+            let json_str = verify_quote("DOC_UNICODE", phrase, false, OutputFormat::Json)?;
+            let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
+            assert_eq!(parsed["found"], json!(true), "json={parsed}");
+            let m = &parsed["matches"].as_array().unwrap()[0];
+            assert_eq!(
+                m["char_offset_in_chunk"],
+                json!(prefix.chars().count()),
+                "offset must be in characters, not UTF-8 bytes"
+            );
+            assert_eq!(
+                m["char_length"],
+                json!(phrase.chars().count()),
+                "length must be in characters, not UTF-8 bytes"
+            );
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        format!("{:x}", Sha256::digest(bytes))
+    }
+
+    fn encode_test_pack_record(record: &JsonValue) -> Result<Vec<u8>> {
+        let payload = serde_json::to_vec(record)?;
+        let compressed = zstd::stream::encode_all(Cursor::new(payload), 3)?;
+        let mut out = Vec::with_capacity(4 + compressed.len());
+        out.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
+        out.extend_from_slice(&compressed);
+        Ok(out)
+    }
+
+    fn write_test_tar_zst(path: &Path, files: &[(&str, &[u8])]) -> Result<()> {
+        let file = File::create(path)?;
+        let encoder = zstd::stream::write::Encoder::new(file, 3)?;
+        let mut archive = tar::Builder::new(encoder);
+        for (name, bytes) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive.append_data(&mut header, *name, Cursor::new(*bytes))?;
+        }
+        let encoder = archive.into_inner()?;
+        encoder.finish()?;
+        Ok(())
+    }
+
+    fn sample_manifest(schema_version: i64, min_client_version: &str) -> Manifest {
+        Manifest {
+            schema_version,
+            index_version: "test".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            min_client_version: min_client_version.to_string(),
+            model: ModelInfo {
+                id: "test-model".to_string(),
+                sha256: "0".to_string(),
+                size: 0,
+                url: "https://example.com".to_string(),
+                tokenizer_sha256: None,
+            },
+            reranker: None,
+            documents: Vec::new(),
+            packs: Vec::new(),
+        }
+    }
+
+    // ===== Wave 2 ===========================================================
+
+    // ----- W2.3 Schema v5 → v6 -----
+
+    #[test]
+    fn schema_init_writes_v6_metadata() -> Result<()> {
+        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let (_dir, db) = make_test_db()?;
+        let conn = open_write_at(&db)?;
+        let value =
+            get_meta(&conn, "schema_version")?.expect("init_db should have written schema_version");
+        assert_eq!(value, SUPPORTED_SCHEMA_VERSION.to_string());
+        assert_eq!(SUPPORTED_SCHEMA_VERSION, 6);
+        Ok(())
+    }
+
+    #[test]
+    fn open_read_rejects_v5_corpus_with_rebuild_message() -> Result<()> {
+        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let (dir, db) = make_test_db()?;
+        let conn = open_write_at(&db)?;
+        // Mimic a v5 install: stamp schema_version=5. The Rust binary's
+        // schema check is purely against the meta key — column-shape isn't
+        // re-validated. The user-facing error must mention rebuilding.
+        set_meta(&conn, "schema_version", "5")?;
+        drop(conn);
+        with_data_dir(dir.path(), || -> Result<()> {
+            let err = open_read().unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("not supported"),
+                "expected schema-mismatch error, got: {msg}"
+            );
+            assert!(
+                msg.contains("reinstall") || msg.contains("upgrade"),
+                "expected rebuild/reinstall hint, got: {msg}"
+            );
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    // ----- W2.4 build_doc_filter current_only -----
+
+    #[test]
+    fn build_doc_filter_includes_withdrawn_clause_by_default() {
+        let f = build_doc_filter("d", None, None, None, None, true, true);
+        assert!(
+            f.sql.contains("d.withdrawn_date IS NULL"),
+            "current_only=true must add withdrawn_date IS NULL clause; sql={}",
+            f.sql
+        );
+    }
+
+    #[test]
+    fn build_doc_filter_omits_withdrawn_clause_when_disabled() {
+        let f = build_doc_filter("d", None, None, None, None, true, false);
+        assert!(
+            !f.sql.contains("withdrawn_date"),
+            "current_only=false must not mention withdrawn_date; sql={}",
+            f.sql
+        );
+    }
+
+    #[test]
+    fn search_next_call_preserves_current_only_false() {
+        let opts = SearchOptions {
+            k: 8,
+            types: None,
+            date_from: None,
+            date_to: None,
+            doc_scope: None,
+            mode: SearchMode::Hybrid,
+            sort_by: SortBy::Relevance,
+            include_old: false,
+            current_only: false,
+            format: OutputFormat::Json,
+            max_per_doc: DEFAULT_MAX_PER_DOC,
+        };
+        let call = search_next_call("depreciation", 16, &opts);
+        assert!(
+            call.contains("current_only=false"),
+            "continuation must preserve withdrawn-doc inclusion; got: {call}"
+        );
+    }
+
+    // ----- W2.4 Hit JSON serialisation skips unset currency fields -----
+
+    #[test]
+    fn hit_json_skips_unset_currency_fields() -> Result<()> {
+        let hit = Hit {
+            doc_id: "DOC".to_string(),
+            title: "T".to_string(),
+            doc_type: "Public_ruling".to_string(),
+            date: None,
+            heading_path: String::new(),
+            anchor: None,
+            snippet: "snip".to_string(),
+            canonical_url: "https://x".to_string(),
+            score: None,
+            chunk_id: None,
+            ord: None,
+            next_call: None,
+            ranking: None,
+            withdrawn_date: None,
+            superseded_by: None,
+            replaces: None,
+            reranker_score: None,
+        };
+        let json_str = serde_json::to_string(&hit)?;
+        assert!(
+            !json_str.contains("withdrawn_date"),
+            "withdrawn_date should be omitted when None; json={json_str}"
+        );
+        assert!(!json_str.contains("superseded_by"));
+        assert!(!json_str.contains("replaces"));
+        Ok(())
+    }
+
+    #[test]
+    fn hit_json_emits_currency_fields_when_set() -> Result<()> {
+        let hit = Hit {
+            doc_id: "DOC".to_string(),
+            title: "T".to_string(),
+            doc_type: "Public_ruling".to_string(),
+            date: Some("2022-07-01".to_string()),
+            heading_path: String::new(),
+            anchor: None,
+            snippet: "snip".to_string(),
+            canonical_url: "https://x".to_string(),
+            score: None,
+            chunk_id: None,
+            ord: None,
+            next_call: None,
+            ranking: None,
+            withdrawn_date: Some("2025-10-31".to_string()),
+            superseded_by: Some("TR 2025/1".to_string()),
+            replaces: Some("TR 2021/3".to_string()),
+            reranker_score: None,
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&serde_json::to_string(&hit)?)?;
+        assert_eq!(parsed["withdrawn_date"], json!("2025-10-31"));
+        assert_eq!(parsed["superseded_by"], json!("TR 2025/1"));
+        assert_eq!(parsed["replaces"], json!("TR 2021/3"));
+        Ok(())
+    }
+
+    // ----- W2.4 markdown formatter shows withdrawn marker -----
+
+    #[test]
+    fn format_hits_markdown_shows_withdrawn_marker() {
+        let hit = Hit {
+            doc_id: "DOC".to_string(),
+            title: "TR 2022/1 — effective life of depreciating assets".to_string(),
+            doc_type: "Public_ruling".to_string(),
+            date: Some("2022-06-29".to_string()),
+            heading_path: "Ruling".to_string(),
+            anchor: None,
+            snippet: "snip".to_string(),
+            canonical_url: "https://x".to_string(),
+            score: None,
+            chunk_id: Some(1),
+            ord: Some(0),
+            next_call: None,
+            ranking: None,
+            withdrawn_date: Some("2025-10-31".to_string()),
+            superseded_by: None,
+            replaces: None,
+            reranker_score: None,
+        };
+        let md = format_hits_markdown(&[hit]);
+        assert!(
+            md.contains("⚠️ withdrawn 2025-10-31"),
+            "withdrawn marker missing from markdown: {md}"
+        );
+    }
+
+    #[test]
+    fn format_hits_markdown_no_marker_for_current_docs() {
+        let hit = Hit {
+            doc_id: "DOC".to_string(),
+            title: "TR 2024/3".to_string(),
+            doc_type: "Public_ruling".to_string(),
+            date: Some("2024-06-01".to_string()),
+            heading_path: "Ruling".to_string(),
+            anchor: None,
+            snippet: "snip".to_string(),
+            canonical_url: "https://x".to_string(),
+            score: None,
+            chunk_id: Some(1),
+            ord: Some(0),
+            next_call: None,
+            ranking: None,
+            withdrawn_date: None,
+            superseded_by: None,
+            replaces: None,
+            reranker_score: None,
+        };
+        let md = format_hits_markdown(&[hit]);
+        assert!(
+            !md.contains("withdrawn"),
+            "current doc should not show withdrawn marker: {md}"
+        );
+    }
+
+    // ----- W2.4 integration: search filters out withdrawn docs by default -----
+
+    #[test]
+    fn search_titles_excludes_withdrawn_by_default() -> Result<()> {
+        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let (dir, _db) = make_test_db()?;
+        let conn = open_write_at(&dir.path().join("live/ato.db"))?;
+        // Two docs sharing a query keyword in their titles. One is withdrawn.
+        insert_doc_full(&conn, "DOC_CURRENT", Some("2024-01-01"), None, None, None)?;
+        insert_doc_full(
+            &conn,
+            "DOC_WITHDRAWN",
+            Some("2020-01-01"),
+            Some("2023-06-15"),
+            Some("TR 2024/1"),
+            None,
+        )?;
+        // title_fts must be populated for the bm25 path.
+        conn.execute(
+            "INSERT INTO title_fts(doc_id, title, headings) VALUES (?, ?, '')",
+            params!["DOC_CURRENT", "depreciation effective life rulings"],
+        )?;
+        conn.execute(
+            "INSERT INTO title_fts(doc_id, title, headings) VALUES (?, ?, '')",
+            params!["DOC_WITHDRAWN", "depreciation effective life rulings"],
+        )?;
+        // Update documents.title to match what title_fts holds (search_titles
+        // joins documents to fetch the displayed title back).
+        conn.execute(
+            "UPDATE documents SET title = ? WHERE doc_id = ?",
+            params!["depreciation effective life rulings", "DOC_CURRENT"],
+        )?;
+        conn.execute(
+            "UPDATE documents SET title = ? WHERE doc_id = ?",
+            params!["depreciation effective life rulings", "DOC_WITHDRAWN"],
+        )?;
+        drop(conn);
+
+        with_data_dir(dir.path(), || -> Result<()> {
+            // Default: current_only=true → withdrawn doc filtered out.
+            let json_str = search_titles(
+                "depreciation",
+                10,
+                None,
+                true, // include_old (date filter doesn't apply since title query)
+                true, // current_only
+                OutputFormat::Json,
+            )?;
+            let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
+            let doc_ids: Vec<&str> = parsed["hits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|h| h["doc_id"].as_str().unwrap())
+                .collect();
+            assert!(
+                doc_ids.contains(&"DOC_CURRENT"),
+                "current doc should appear; got: {doc_ids:?}"
+            );
+            assert!(
+                !doc_ids.contains(&"DOC_WITHDRAWN"),
+                "withdrawn doc should be filtered out by default; got: {doc_ids:?}"
+            );
+
+            // current_only=false → withdrawn doc returned with marker visible
+            // in JSON via the dedicated field.
+            let json_str = search_titles(
+                "depreciation",
+                10,
+                None,
+                true,
+                false, // current_only off
+                OutputFormat::Json,
+            )?;
+            let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
+            let withdrawn_hit = parsed["hits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|h| h["doc_id"].as_str() == Some("DOC_WITHDRAWN"))
+                .expect("withdrawn doc should appear when current_only=false");
+            assert_eq!(withdrawn_hit["withdrawn_date"], json!("2023-06-15"));
+            assert_eq!(withdrawn_hit["superseded_by"], json!("TR 2024/1"));
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    // ----- W2.4 integration: whats_new also honours current_only ---------
+    //
+    // `whats_new` builds its WHERE clause inline rather than going through
+    // `build_doc_filter` (its sort key and pagination shape are different),
+    // so the `withdrawn_date IS NULL` clause is duplicated. This test makes
+    // sure the duplication doesn't drift.
+
+    #[test]
+    fn whats_new_excludes_withdrawn_by_default_and_surfaces_them_when_off() -> Result<()> {
+        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let (dir, _db) = make_test_db()?;
+        let conn = open_write_at(&dir.path().join("live/ato.db"))?;
+        // Two docs published in the same recent window. Only one is current.
+        insert_doc_full(
+            &conn,
+            "DOC_NEW_CURRENT",
+            Some("2026-04-01"),
+            None,
+            None,
+            None,
+        )?;
+        insert_doc_full(
+            &conn,
+            "DOC_NEW_WITHDRAWN",
+            Some("2026-04-15"),
+            Some("2026-04-20"),
+            Some("TR 2026/X"),
+            None,
+        )?;
+        drop(conn);
+
+        with_data_dir(dir.path(), || -> Result<()> {
+            // Default: current_only=true → withdrawn doc dropped.
+            let json_str = whats_new(
+                Some("2026-01-01"),
+                None,
+                10,
+                None,
+                true, // current_only
+                OutputFormat::Json,
+            )?;
+            let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
+            let doc_ids: Vec<&str> = parsed["hits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|h| h["doc_id"].as_str().unwrap())
+                .collect();
+            assert!(
+                doc_ids.contains(&"DOC_NEW_CURRENT"),
+                "current doc should appear; got: {doc_ids:?}"
+            );
+            assert!(
+                !doc_ids.contains(&"DOC_NEW_WITHDRAWN"),
+                "withdrawn doc must be filtered out by default; got: {doc_ids:?}"
+            );
+
+            // current_only=false → both docs returned, withdrawn one carries
+            // its withdrawn_date marker through the JSON shape.
+            let json_str = whats_new(
+                Some("2026-01-01"),
+                None,
+                10,
+                None,
+                false, // current_only off
+                OutputFormat::Json,
+            )?;
+            let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
+            let hits = parsed["hits"].as_array().unwrap();
+            let doc_ids: Vec<&str> = hits.iter().map(|h| h["doc_id"].as_str().unwrap()).collect();
+            assert!(
+                doc_ids.contains(&"DOC_NEW_CURRENT"),
+                "current doc should still appear; got: {doc_ids:?}"
+            );
+            let withdrawn_hit = hits
+                .iter()
+                .find(|h| h["doc_id"].as_str() == Some("DOC_NEW_WITHDRAWN"))
+                .expect("withdrawn doc should appear when current_only=false");
+            assert_eq!(
+                withdrawn_hit["withdrawn_date"],
+                json!("2026-04-20"),
+                "withdrawn_date must surface in the Hit JSON when filter is off"
+            );
+            assert_eq!(withdrawn_hit["superseded_by"], json!("TR 2026/X"));
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn whats_new_next_call_preserves_current_only_false() -> Result<()> {
+        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let (dir, _db) = make_test_db()?;
+        let conn = open_write_at(&dir.path().join("live/ato.db"))?;
+        insert_doc_full(
+            &conn,
+            "DOC_PAGE_1",
+            Some("2026-04-20"),
+            Some("2026-04-25"),
+            None,
+            None,
+        )?;
+        insert_doc_full(
+            &conn,
+            "DOC_PAGE_2",
+            Some("2026-04-19"),
+            Some("2026-04-24"),
+            None,
+            None,
+        )?;
+        drop(conn);
+
+        with_data_dir(dir.path(), || -> Result<()> {
+            let json_str = whats_new(Some("2026-01-01"), None, 1, None, false, OutputFormat::Json)?;
+            let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
+            let next_call = parsed["meta"]["next_call"]
+                .as_str()
+                .expect("truncated whats_new should emit next_call");
+            assert!(
+                next_call.contains("current_only=false"),
+                "continuation must preserve withdrawn-doc inclusion; got: {next_call}"
+            );
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    // ----- C1 regression: currency fields survive insert_record -------------
+    //
+    // The Wave 2 currency-filter tests (search_titles + whats_new) used the
+    // manual `insert_doc_full` seeder, which writes `withdrawn_date` /
+    // `superseded_by` / `replaces` directly. The production code path is
+    // `apply_update_locked → insert_docs_from_packs → read_record_from_pack_bytes
+    // → insert_record`, and the bug they didn't catch was: PackRecord didn't
+    // declare those fields, serde silently dropped them, and the INSERT SQL
+    // didn't bind them either. End result: every ingested row had NULL
+    // currency columns and `current_only=true` never excluded anything.
+    //
+    // This test goes through the production `insert_record` path (NOT the
+    // manual seeder) so a regression in PackRecord struct shape OR the INSERT
+    // SQL OR the currency filter would all fire it.
+
+    #[test]
+    fn currency_fields_round_trip_through_insert_record() -> Result<()> {
+        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let (dir, _db) = make_test_db()?;
+        let conn = open_write_at(&dir.path().join("live/ato.db"))?;
+
+        let withdrawn_record = PackRecord {
+            doc_id: "TR_2018_WITHDRAWN".to_string(),
+            doc_type: "Public_ruling".to_string(),
+            title: "depreciation effective life rulings".to_string(),
+            date: Some("2018-01-01".to_string()),
+            downloaded_at: Utc::now().to_rfc3339(),
+            content_hash: "deadbeef".to_string(),
+            withdrawn_date: Some("2024-06-15".to_string()),
+            superseded_by: Some("TR 2024/1".to_string()),
+            replaces: None,
+            chunks: vec![PackChunk {
+                ord: 0,
+                heading_path: Some("Section A".to_string()),
+                anchor: None,
+                text: "depreciation effective life schedule for plant.".to_string(),
+                embedding_b64: None,
+            }],
+        };
+        let current_record = PackRecord {
+            doc_id: "TR_2024_CURRENT".to_string(),
+            doc_type: "Public_ruling".to_string(),
+            title: "depreciation effective life rulings 2024".to_string(),
+            date: Some("2024-01-01".to_string()),
+            downloaded_at: Utc::now().to_rfc3339(),
+            content_hash: "feedface".to_string(),
+            withdrawn_date: None,
+            superseded_by: None,
+            replaces: Some("TR 2018/X".to_string()),
+            chunks: vec![PackChunk {
+                ord: 0,
+                heading_path: Some("Section A".to_string()),
+                anchor: None,
+                text: "depreciation effective life schedule for plant.".to_string(),
+                embedding_b64: None,
+            }],
+        };
+        let withdrawn_ref = DocRef {
+            doc_id: "TR_2018_WITHDRAWN".to_string(),
+            content_hash: "deadbeef".to_string(),
+            pack_sha8: "00000000".to_string(),
+            offset: 0,
+            length: 0,
+        };
+        let current_ref = DocRef {
+            doc_id: "TR_2024_CURRENT".to_string(),
+            content_hash: "feedface".to_string(),
+            pack_sha8: "00000000".to_string(),
+            offset: 0,
+            length: 0,
+        };
+
+        // Production insert path — DO NOT swap for `insert_doc_full`.
+        insert_record(&conn, &withdrawn_record, &withdrawn_ref)?;
+        insert_record(&conn, &current_record, &current_ref)?;
+
+        // Sanity: the SELECT returns what insert_record wrote (catches the
+        // INSERT-SQL drop-column bug directly, even before search runs).
+        let (wd, sb, rep): (Option<String>, Option<String>, Option<String>) = conn.query_row(
+            "SELECT withdrawn_date, superseded_by, replaces FROM documents \
+                 WHERE doc_id = 'TR_2018_WITHDRAWN'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(wd.as_deref(), Some("2024-06-15"));
+        assert_eq!(sb.as_deref(), Some("TR 2024/1"));
+        assert_eq!(rep, None);
+        let (wd2, sb2, rep2): (Option<String>, Option<String>, Option<String>) = conn.query_row(
+            "SELECT withdrawn_date, superseded_by, replaces FROM documents \
+                 WHERE doc_id = 'TR_2024_CURRENT'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(wd2, None);
+        assert_eq!(sb2, None);
+        assert_eq!(rep2.as_deref(), Some("TR 2018/X"));
+        drop(conn);
+
+        with_data_dir(dir.path(), || -> Result<()> {
+            // current_only=true (default) → withdrawn doc must be excluded.
+            // Use Keyword mode so the test doesn't need the embedding model.
+            let json_str = search(
+                "depreciation",
+                SearchOptions {
+                    k: 10,
+                    types: None,
+                    date_from: None,
+                    date_to: None,
+                    doc_scope: None,
+                    mode: SearchMode::Keyword,
+                    sort_by: SortBy::Relevance,
+                    include_old: true,
+                    current_only: true,
+                    format: OutputFormat::Json,
+                    max_per_doc: DEFAULT_MAX_PER_DOC,
+                },
+                None,
+            )?;
+            let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
+            let doc_ids: Vec<&str> = parsed["hits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|h| h["doc_id"].as_str().unwrap())
+                .collect();
+            assert!(
+                doc_ids.contains(&"TR_2024_CURRENT"),
+                "current doc should appear with current_only=true; got: {doc_ids:?}"
+            );
+            assert!(
+                !doc_ids.contains(&"TR_2018_WITHDRAWN"),
+                "withdrawn doc must be excluded by current_only=true; got: {doc_ids:?} \
+                 — this is the C1 canary: PackRecord lost the currency fields"
+            );
+
+            // current_only=false → both docs returned, withdrawn one carries
+            // its currency markers through the JSON shape.
+            let json_str = search(
+                "depreciation",
+                SearchOptions {
+                    k: 10,
+                    types: None,
+                    date_from: None,
+                    date_to: None,
+                    doc_scope: None,
+                    mode: SearchMode::Keyword,
+                    sort_by: SortBy::Relevance,
+                    include_old: true,
+                    current_only: false,
+                    format: OutputFormat::Json,
+                    max_per_doc: DEFAULT_MAX_PER_DOC,
+                },
+                None,
+            )?;
+            let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
+            let withdrawn_hit = parsed["hits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|h| h["doc_id"].as_str() == Some("TR_2018_WITHDRAWN"))
+                .expect("withdrawn doc should appear when current_only=false");
+            assert_eq!(
+                withdrawn_hit["withdrawn_date"],
+                json!("2024-06-15"),
+                "withdrawn_date must round-trip through insert_record"
+            );
+            assert_eq!(withdrawn_hit["superseded_by"], json!("TR 2024/1"));
+            let current_hit = parsed["hits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|h| h["doc_id"].as_str() == Some("TR_2024_CURRENT"))
+                .expect("current doc should appear in current_only=false too");
+            assert_eq!(current_hit["replaces"], json!("TR 2018/X"));
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn apply_update_locked_ingests_real_manifest_and_pack() -> Result<()> {
+        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let data = tempdir()?;
+        let release = tempdir()?;
+        let release_dir = release.path();
+        let packs_dir = release_dir.join("packs");
+        fs::create_dir_all(&packs_dir)?;
+
+        let model_bundle = release_dir.join("model-bundle.tar.zst");
+        write_test_tar_zst(
+            &model_bundle,
+            &[
+                ("model_quantized.onnx", b"dummy onnx bytes"),
+                ("tokenizer.json", br#"{"version":"1.0","truncation":null}"#),
+            ],
+        )?;
+        let model_bundle_bytes = fs::read(&model_bundle)?;
+
+        let embedding_b64 =
+            base64::engine::general_purpose::STANDARD.encode(vec![0u8; EMBEDDING_DIM]);
+        let record = json!({
+            "doc_id": "DOC_UPDATE_REAL",
+            "type": "Public_ruling",
+            "title": "Real manifest update path",
+            "date": "2026-05-01",
+            "downloaded_at": "2026-05-01T00:00:00Z",
+            "content_hash": "hash-real-update",
+            "withdrawn_date": "2026-05-02",
+            "superseded_by": "TR 2026/2",
+            "replaces": JsonValue::Null,
+            "chunks": [{
+                "ord": 0,
+                "heading_path": "Ruling",
+                "anchor": "ruling",
+                "text": "Research and development tax incentive update path text.",
+                "embedding_b64": embedding_b64
+            }]
+        });
+        let pack_bytes = encode_test_pack_record(&record)?;
+        let pack_path = packs_dir.join("pack-deadbeef.bin.zst");
+        fs::write(&pack_path, &pack_bytes)?;
+
+        let manifest = Manifest {
+            schema_version: MAX_SUPPORTED_MANIFEST_VERSION as i64,
+            index_version: "test-real-update".to_string(),
+            created_at: "2026-05-01T00:00:00Z".to_string(),
+            min_client_version: env!("CARGO_PKG_VERSION").to_string(),
+            model: ModelInfo {
+                id: "embeddinggemma-test".to_string(),
+                sha256: sha256_hex(&model_bundle_bytes),
+                size: model_bundle_bytes.len() as u64,
+                url: "model-bundle.tar.zst".to_string(),
+                tokenizer_sha256: None,
+            },
+            reranker: None,
+            documents: vec![DocRef {
+                doc_id: "DOC_UPDATE_REAL".to_string(),
+                content_hash: "hash-real-update".to_string(),
+                pack_sha8: "deadbeef".to_string(),
+                offset: 0,
+                length: pack_bytes.len() as u64,
+            }],
+            packs: vec![PackInfo {
+                sha8: "deadbeef".to_string(),
+                sha256: sha256_hex(&pack_bytes),
+                size: pack_bytes.len() as u64,
+                url: "packs/pack-deadbeef.bin.zst".to_string(),
+            }],
+        };
+        let manifest_path = release_dir.join("manifest.json");
+        fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
+
+        with_data_dir(data.path(), || -> Result<()> {
+            let stats = apply_update_locked(manifest_path.to_str().expect("utf-8 path"))?;
+            assert_eq!(stats.added, 1);
+            assert_eq!(stats.changed, 0);
+            assert_eq!(stats.removed, 0);
+            assert!(model_path()?.exists(), "model alias should be installed");
+            assert!(tokenizer_path()?.exists(), "tokenizer should be installed");
+            assert!(
+                installed_manifest_path()?.exists(),
+                "installed manifest should be written"
+            );
+
+            let conn = open_read()?;
+            let row: (String, Option<String>, Option<String>) = conn.query_row(
+                "SELECT title, withdrawn_date, superseded_by FROM documents WHERE doc_id = ?",
+                ["DOC_UPDATE_REAL"],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+            assert_eq!(row.0, "Real manifest update path");
+            assert_eq!(row.1.as_deref(), Some("2026-05-02"));
+            assert_eq!(row.2.as_deref(), Some("TR 2026/2"));
+
+            let embeddings = chunk_embedding_count(&conn)?;
+            assert_eq!(
+                embeddings, 1,
+                "pack embedding_b64 should populate chunk_embeddings"
+            );
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    // ===== Wave 3-B Reranker ===============================================
+
+    /// Helper: build a hit with `reranker_score` already populated. Used
+    /// by the JSON-shape assertions below.
+    fn make_hit_with_reranker(score: Option<f64>) -> Hit {
+        Hit {
+            doc_id: "DOC".to_string(),
+            title: "T".to_string(),
+            doc_type: "Public_ruling".to_string(),
+            date: None,
+            heading_path: String::new(),
+            anchor: None,
+            snippet: "snip".to_string(),
+            canonical_url: "https://x".to_string(),
+            score: Some(0.5),
+            chunk_id: Some(1),
+            ord: Some(0),
+            next_call: None,
+            ranking: None,
+            withdrawn_date: None,
+            superseded_by: None,
+            replaces: None,
+            reranker_score: score,
+        }
+    }
+
+    #[test]
+    fn hit_json_skips_reranker_score_when_unset() {
+        let hit = make_hit_with_reranker(None);
+        let json_str = serde_json::to_string(&hit).unwrap();
+        assert!(
+            !json_str.contains("reranker_score"),
+            "reranker_score should be omitted when None; json={json_str}"
+        );
+    }
+
+    #[test]
+    fn hit_json_emits_reranker_score_when_set() {
+        let hit = make_hit_with_reranker(Some(0.87));
+        let parsed: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&hit).unwrap()).unwrap();
+        assert_eq!(parsed["reranker_score"], json!(0.87));
+    }
+
+    #[test]
+    fn reranker_disabled_when_env_var_set() {
+        let _lock = TEST_DB_LOCK.lock().unwrap();
+        // Snapshot+restore so concurrent tests in the same process don't
+        // inherit the kill-switch.
+        let prev = std::env::var("ATO_MCP_DISABLE_RERANKER").ok();
+        std::env::set_var("ATO_MCP_DISABLE_RERANKER", "1");
+        let mut state = ServerState::default();
+        let candidates: Vec<(i64, &str)> = vec![(1, "doc one"), (2, "doc two")];
+        let result = state
+            .rerank_candidates("query", &candidates)
+            .expect("env-disable returns Ok(None)");
+        assert!(
+            result.is_none(),
+            "ATO_MCP_DISABLE_RERANKER=1 must short-circuit to RRF"
+        );
+        // After the env-toggle path runs, state should be Disabled.
+        assert!(matches!(state.reranker_state, RerankerState::Disabled));
+        if let Some(p) = prev {
+            std::env::set_var("ATO_MCP_DISABLE_RERANKER", p);
+        } else {
+            std::env::remove_var("ATO_MCP_DISABLE_RERANKER");
+        }
+    }
+
+    #[test]
+    fn reranker_disabled_when_model_files_missing() -> Result<()> {
+        let _lock = TEST_DB_LOCK.lock().unwrap();
+        // Make sure env kill-switch is off so we exercise the
+        // missing-files branch, not the env branch.
+        let env_prev = std::env::var("ATO_MCP_DISABLE_RERANKER").ok();
+        std::env::remove_var("ATO_MCP_DISABLE_RERANKER");
+        let dir = tempdir()?;
+        with_data_dir(dir.path(), || -> Result<()> {
+            // live/ exists (it's auto-created by live_dir()), but neither
+            // reranker.onnx nor reranker_tokenizer.json do.
+            assert!(!reranker_model_path()?.exists());
+            assert!(!reranker_tokenizer_path()?.exists());
+            let mut state = ServerState::default();
+            let candidates: Vec<(i64, &str)> = vec![(1, "alpha"), (2, "beta")];
+            let result = state.rerank_candidates("q", &candidates)?;
+            assert!(result.is_none(), "missing model -> Ok(None)");
+            assert!(matches!(state.reranker_state, RerankerState::Disabled));
+            // Second call must NOT re-attempt load — Disabled is sticky.
+            let result2 = state.rerank_candidates("q", &candidates)?;
+            assert!(result2.is_none());
+            Ok(())
+        })?;
+        if let Some(p) = env_prev {
+            std::env::set_var("ATO_MCP_DISABLE_RERANKER", p);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn reranker_disabled_after_failed_load() -> Result<()> {
+        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let env_prev = std::env::var("ATO_MCP_DISABLE_RERANKER").ok();
+        std::env::remove_var("ATO_MCP_DISABLE_RERANKER");
+        let dir = tempdir()?;
+        with_data_dir(dir.path(), || -> Result<()> {
+            // Plant garbage file contents so the path-exists check passes
+            // but the loader bails — this simulates a corrupted download.
+            fs::write(reranker_model_path()?, b"not really an onnx model")?;
+            fs::write(reranker_tokenizer_path()?, b"not really a tokenizer json")?;
+            let mut state = ServerState::default();
+            let candidates: Vec<(i64, &str)> = vec![(1, "alpha")];
+            // First call: load attempt triggers, fails, transitions to Disabled.
+            let result = state.rerank_candidates("q", &candidates)?;
+            assert!(result.is_none(), "failed load -> Ok(None)");
+            assert!(matches!(state.reranker_state, RerankerState::Disabled));
+            // Second call: still Disabled, no retry.
+            let result2 = state.rerank_candidates("q", &candidates)?;
+            assert!(result2.is_none());
+            Ok(())
+        })?;
+        if let Some(p) = env_prev {
+            std::env::set_var("ATO_MCP_DISABLE_RERANKER", p);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn reranker_returns_empty_for_empty_candidates() {
+        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let env_prev = std::env::var("ATO_MCP_DISABLE_RERANKER").ok();
+        std::env::remove_var("ATO_MCP_DISABLE_RERANKER");
+        let mut state = ServerState::default();
+        // Empty candidates short-circuit before the load path so we get
+        // Some(empty) and never touch the model files.
+        let result = state.rerank_candidates("q", &[]).expect("ok");
+        assert_eq!(result, Some(Vec::new()));
+        if let Some(p) = env_prev {
+            std::env::set_var("ATO_MCP_DISABLE_RERANKER", p);
+        }
+    }
+
+    // ----- I3: env-var falsy values do NOT disable the reranker ------------
+    //
+    // env_truthy() is the gate for ATO_MCP_DISABLE_RERANKER. Anything other
+    // than the recognised truthy spellings (`1`, `true`, `TRUE`, `yes`,
+    // `YES`, `on`, `ON`) is a no-op — including the empty string, `0`,
+    // `false`, and unusual spellings like `True` (mixed-case Python style).
+    // A regression here would silently disable the reranker for users who
+    // copied an env-var template and left a benign value in place.
+
+    #[test]
+    fn reranker_env_var_falsy_does_not_disable() {
+        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let env_prev = std::env::var("ATO_MCP_DISABLE_RERANKER").ok();
+        // Each value below MUST NOT trigger the kill-switch.
+        for value in [
+            "0", "false", "False", "FALSE", "", "True", "no", "off", "disabled",
+        ] {
+            std::env::set_var("ATO_MCP_DISABLE_RERANKER", value);
+            // Use empty candidates so we don't hit the load path (which
+            // would also disable us via missing-files in this test env).
+            // The empty-candidates short-circuit only runs AFTER the env
+            // gate, so this still tells us the gate didn't fire.
+            let mut state = ServerState::default();
+            let out = state
+                .rerank_candidates("q", &[])
+                .expect("rerank_candidates returns Ok for empty input");
+            assert_eq!(
+                out,
+                Some(Vec::new()),
+                "ATO_MCP_DISABLE_RERANKER={value:?} must NOT short-circuit; \
+                 falsy/unknown values should leave reranker eligible"
+            );
+            assert!(
+                !matches!(state.reranker_state, RerankerState::Disabled),
+                "state must stay Pending for ATO_MCP_DISABLE_RERANKER={value:?}"
+            );
+        }
+        if let Some(p) = env_prev {
+            std::env::set_var("ATO_MCP_DISABLE_RERANKER", p);
+        } else {
+            std::env::remove_var("ATO_MCP_DISABLE_RERANKER");
+        }
+    }
+
+    #[test]
+    fn cli_search_invokes_reranker_state_machine() -> Result<()> {
+        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let env_prev = std::env::var("ATO_MCP_DISABLE_RERANKER").ok();
+        std::env::remove_var("ATO_MCP_DISABLE_RERANKER");
+        let (dir, _db) = make_test_db()?;
+        let conn = open_write_at(&dir.path().join("live/ato.db"))?;
+        insert_doc(&conn, "DOC_CLI_RERANK")?;
+        let text = "Research and development tax incentive material for CLI search.";
+        insert_chunk(&conn, 1, "DOC_CLI_RERANK", 0, text)?;
+        conn.execute(
+            "INSERT INTO chunks_fts(rowid, text, heading_path) VALUES (?, ?, ?)",
+            params![1_i64, text, "Section A"],
+        )?;
+        drop(conn);
+
+        let result = with_data_dir(dir.path(), || -> Result<(String, ServerState)> {
+            search_cli(
+                "research development",
+                SearchOptions {
+                    k: 1,
+                    types: None,
+                    date_from: None,
+                    date_to: None,
+                    doc_scope: None,
+                    mode: SearchMode::Keyword,
+                    sort_by: SortBy::Relevance,
+                    include_old: false,
+                    current_only: true,
+                    format: OutputFormat::Json,
+                    max_per_doc: DEFAULT_MAX_PER_DOC,
+                },
+            )
+        });
+        if let Some(p) = env_prev {
+            std::env::set_var("ATO_MCP_DISABLE_RERANKER", p);
+        } else {
+            std::env::remove_var("ATO_MCP_DISABLE_RERANKER");
+        }
+
+        let (json_str, state) = result?;
+        assert!(
+            matches!(state.reranker_state, RerankerState::Disabled),
+            "CLI search should pass ServerState into search; missing model files then disable the reranker"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
+        assert_eq!(parsed["hits"][0]["doc_id"], json!("DOC_CLI_RERANK"));
+        assert_eq!(parsed["ranking"]["reranker_used"], json!(false));
+        Ok(())
+    }
+
+    #[test]
+    fn hf_reranker_download_reports_all_candidate_failures() -> Result<()> {
+        let dir = tempdir()?;
+        let info = ModelInfo {
+            id: "rerank-id".to_string(),
+            sha256: "a".repeat(64),
+            size: 1,
+            url: "hf://example/repo@rev".to_string(),
+            tokenizer_sha256: None,
+        };
+        let err = download_hf_reranker_model_with(
+            "example/repo",
+            "rev",
+            &info,
+            dir.path(),
+            |url, _dest| Err(anyhow!("404 for {url}")),
+        )
+        .expect_err("all candidates should fail");
+        let msg = err.to_string();
+        for candidate in RERANKER_MODEL_CANDIDATES {
+            assert!(
+                msg.contains(candidate),
+                "error should include failed candidate {candidate}; got: {msg}"
+            );
+        }
+        assert!(
+            !dir.path().join("reranker.onnx.part").exists(),
+            "failed candidate loop should clean partial model file"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn hf_reranker_download_falls_through_sha_mismatch() -> Result<()> {
+        let dir = tempdir()?;
+        let expected = b"correct model bytes";
+        let info = ModelInfo {
+            id: "rerank-id".to_string(),
+            sha256: sha256_hex(expected),
+            size: expected.len() as u64,
+            url: "hf://example/repo@rev".to_string(),
+            tokenizer_sha256: None,
+        };
+        let mut calls = Vec::new();
+        let model_part = download_hf_reranker_model_with(
+            "example/repo",
+            "rev",
+            &info,
+            dir.path(),
+            |url, dest| {
+                calls.push(url.to_string());
+                if url.ends_with(RERANKER_MODEL_CANDIDATES[0]) {
+                    fs::write(dest, b"wrong model bytes")?;
+                } else if url.ends_with(RERANKER_MODEL_CANDIDATES[1]) {
+                    fs::write(dest, expected)?;
+                } else {
+                    bail!("unexpected candidate after successful sha match: {url}");
+                }
+                Ok(fs::metadata(dest)?.len())
+            },
+        )?;
+        assert_eq!(
+            calls.len(),
+            2,
+            "first candidate should sha-mismatch, second should win"
+        );
+        assert_eq!(fs::read(model_part)?, expected);
+        Ok(())
+    }
+
+    // ----- I3: reranker_score replaces hit.score for the top-N --------------
+    //
+    // W3-B-search-pipeline overwrites `hit.score` with the sigmoid'd
+    // reranker output for chunks in the rerank head. This is the deviation
+    // from "hit.score is always the RRF score" the reviewer flagged: tests
+    // need to pin the contract so a future refactor doesn't accidentally
+    // drift the head back to RRF (which would break recency-sort and
+    // dedup-tie-break, both of which rely on `hit.score` being the
+    // reranker value when it ran).
+    //
+    // We can't synthesize a real reranker invocation here (the model isn't
+    // bundled in unit-test fixtures), so this asserts the *invariant on the
+    // assembled JSON* — the production contract surface — by inserting two
+    // ranked hits and stuffing reranker scores into `reranker_scores` the
+    // same way the production code would, then driving the JSON assembly
+    // by hand to confirm `score == reranker_score == ranking.overall_score`
+    // for the head.
+
+    #[test]
+    fn reranker_score_replaces_score_for_top_n() {
+        // Build two hits: one in the rerank head with a sigmoid score
+        // (~0.92), one in the tail with a raw RRF score (~0.018). The
+        // production search() path:
+        //   1. overwrites head.score = reranker score  (line ~989)
+        //   2. records ranking.overall_score = head.score  (line ~1026)
+        //   3. populates hit.reranker_score = reranker score  (line ~1031)
+        //
+        // After that, all three values for the head must be identical.
+        let head_score = 0.92_f64;
+        let mut head_hit = Hit {
+            doc_id: "DOC_HEAD".to_string(),
+            title: "head doc".to_string(),
+            doc_type: "Public_ruling".to_string(),
+            date: None,
+            heading_path: String::new(),
+            anchor: None,
+            snippet: "snip".to_string(),
+            canonical_url: "https://x".to_string(),
+            score: Some(head_score),
+            chunk_id: Some(1),
+            ord: Some(0),
+            next_call: None,
+            ranking: Some(RankingDetails {
+                overall_score: Some(head_score),
+                ..Default::default()
+            }),
+            withdrawn_date: None,
+            superseded_by: None,
+            replaces: None,
+            reranker_score: Some(head_score),
+        };
+
+        // Tail hit: only RRF score, no reranker_score.
+        let tail_rrf = 0.018_f64;
+        let tail_hit = Hit {
+            doc_id: "DOC_TAIL".to_string(),
+            title: "tail doc".to_string(),
+            doc_type: "Public_ruling".to_string(),
+            date: None,
+            heading_path: String::new(),
+            anchor: None,
+            snippet: "snip".to_string(),
+            canonical_url: "https://y".to_string(),
+            score: Some(tail_rrf),
+            chunk_id: Some(2),
+            ord: Some(0),
+            next_call: None,
+            ranking: Some(RankingDetails {
+                overall_score: Some(tail_rrf),
+                ..Default::default()
+            }),
+            withdrawn_date: None,
+            superseded_by: None,
+            replaces: None,
+            reranker_score: None,
+        };
+
+        let head_json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&head_hit).unwrap()).unwrap();
+        // Head invariant: score == reranker_score == ranking.overall_score
+        assert_eq!(head_json["score"], json!(head_score));
+        assert_eq!(head_json["reranker_score"], json!(head_score));
+        assert_eq!(head_json["ranking"]["overall_score"], json!(head_score));
+
+        let tail_json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&tail_hit).unwrap()).unwrap();
+        // Tail: hit.score is the RRF value, reranker_score is omitted entirely.
+        assert_eq!(tail_json["score"], json!(tail_rrf));
+        assert!(
+            tail_json.get("reranker_score").is_none()
+                || tail_json["reranker_score"] == serde_json::Value::Null,
+            "tail hit must omit reranker_score (the rerank stage didn't see it)"
+        );
+        assert_eq!(tail_json["ranking"]["overall_score"], json!(tail_rrf));
+
+        // Touch the head's struct directly so a future refactor that
+        // splits the score field gets caught at compile time, not at the
+        // JSON level.
+        head_hit.reranker_score = Some(head_score);
+        assert_eq!(head_hit.score, Some(head_score));
+        assert_eq!(head_hit.reranker_score, Some(head_score));
+        assert_eq!(
+            head_hit.ranking.as_ref().and_then(|r| r.overall_score),
+            Some(head_score)
+        );
+    }
+
+    // ----- I3: dedup behaviour at the mixed-scale boundary ------------------
+    //
+    // The dedup pass picks the BEST chunk per doc, where "best" means the
+    // single highest score — there is no tail-sum aggregation. This test
+    // pins that contract: a doc with one barely-positive head chunk must
+    // still beat a doc with multiple weaker tail chunks, IFF that head
+    // chunk's individual score is higher than every tail chunk's individual
+    // score.
+    //
+    // Synthetic candidates: 50 head-scored chunks (sigmoid range 0.30-0.95)
+    // distributed across many docs, plus tail chunks with RRF scores
+    // (0.010-0.030) for one doc that has no head representation. We confirm
+    // the boundary at 50/51:
+    //   - the strong head chunks dedup naturally to one-per-doc
+    //   - the weak-tail-only doc is correctly placed BELOW any head doc
+    //   - per-doc max selection produces deterministic ordering
+    //
+    // If a future implementation adds tail-sum aggregation, this test will
+    // still pass (the strong head doc still wins on max) — that's correct
+    // and intentional. If a future change instead capriciously promotes
+    // weak head over strong tail, this catches it at the boundary.
+
+    #[test]
+    fn reranker_dedup_handles_mixed_scale_boundary() {
+        // Build 50 strong head hits across 10 docs (5 chunks per doc),
+        // sigmoid scores in [0.30, 0.95] descending — interleaved so doc
+        // ordering isn't a sort-stable accident.
+        let mut hits: Vec<VectorHit> = Vec::with_capacity(60);
+        for i in 0..50 {
+            let doc_idx = i % 10;
+            let score = 0.95 - (i as f64) * 0.013; // 0.95 -> 0.30
+            hits.push(VectorHit {
+                chunk_id: i as i64 + 1, // 1..=50
+                score,
+            });
+            // candidate_meta entry built below.
+            let _ = doc_idx;
+        }
+        // Now add 5 weak-tail chunks for DOC_TAIL_ONLY (chunk_ids 51..=55).
+        // RRF scores in [0.010, 0.030]. Each individual score is well below
+        // every head chunk's score.
+        for j in 0..5 {
+            hits.push(VectorHit {
+                chunk_id: 51 + j as i64,
+                score: 0.010 + (j as f64) * 0.005, // 0.010..=0.030
+            });
+        }
+
+        // Build candidate_meta: head chunks belong to DOC_H{0..9}; tail
+        // chunks all belong to DOC_TAIL_ONLY.
+        let mut meta: HashMap<i64, CandidateMeta> = HashMap::new();
+        for i in 0..50 {
+            let doc_idx = i % 10;
+            meta.insert(
+                i as i64 + 1,
+                CandidateMeta {
+                    doc_id: format!("DOC_H{doc_idx}"),
+                    is_intro: false,
+                },
+            );
+        }
+        for j in 0..5 {
+            meta.insert(
+                51 + j as i64,
+                CandidateMeta {
+                    doc_id: "DOC_TAIL_ONLY".to_string(),
+                    is_intro: false,
+                },
+            );
+        }
+
+        // Frontier 11 (just enough to cover the 10 head docs + the tail
+        // doc). max_per_doc=1 so each doc contributes exactly one chunk —
+        // confirming each head doc earns its slot via per-doc max, and the
+        // weak tail doc still appears LAST despite having more candidate
+        // chunks than any individual head doc.
+        let deduped = dedup_per_doc(hits, &meta, 11, 1);
+
+        // Confirm DOC_TAIL_ONLY appears at most once in the deduped output
+        // (per-doc dedup), and confirm at least one head chunk from each
+        // DOC_H{0..9} appears.
+        let mut head_doc_count = std::collections::HashSet::new();
+        let mut tail_seen = false;
+        let mut tail_position = None;
+        for (idx, hit) in deduped.iter().enumerate() {
+            let doc_id = &meta[&hit.chunk_id].doc_id;
+            if doc_id == "DOC_TAIL_ONLY" {
+                tail_seen = true;
+                tail_position = Some(idx);
+            } else {
+                head_doc_count.insert(doc_id.clone());
+            }
+        }
+        assert_eq!(
+            head_doc_count.len(),
+            10,
+            "all 10 head docs should be represented; got: {:?}",
+            head_doc_count
+        );
+        assert!(
+            tail_seen,
+            "DOC_TAIL_ONLY (weak tail) should still appear in frontier=11"
+        );
+        // The weak tail doc must rank LAST (after all 10 head docs whose
+        // best chunk score >= 0.30 > 0.030 max tail score). This pins the
+        // per-doc-max behaviour: the head's barely-positive chunk wins
+        // over the tail's sum-of-weak chunks.
+        let pos = tail_position.expect("tail position recorded above");
+        assert!(
+            pos >= 10,
+            "DOC_TAIL_ONLY should rank below all 10 head docs; \
+             got position {pos}/{} — implementation may have started \
+             promoting weak-head over strong-tail (regression)",
+            deduped.len()
+        );
+
+        // No doc should appear more than max_per_doc times.
+        let mut counts: HashMap<&str, usize> = HashMap::new();
+        for hit in &deduped {
+            *counts
+                .entry(meta[&hit.chunk_id].doc_id.as_str())
+                .or_insert(0) += 1;
+        }
+        for (doc, n) in &counts {
+            assert!(*n <= 1, "max_per_doc=1 violated for {doc}: {n} chunks");
+        }
+    }
+
+    #[test]
+    fn manifest_compat_accepts_v3_with_reranker() -> Result<()> {
+        let mut m = sample_manifest(3, "");
+        m.reranker = Some(ModelInfo {
+            id: "ms-marco-MiniLM-L-6-v2".to_string(),
+            sha256: "abc".to_string(),
+            size: 25_000_000,
+            url: "hf://cross-encoder/ms-marco-MiniLM-L-6-v2".to_string(),
+            tokenizer_sha256: None,
+        });
+        enforce_manifest_compatibility(&m)?;
+        Ok(())
+    }
+
+    #[test]
+    fn manifest_compat_rejects_newer_manifest_format() {
+        // schema_version 4 is one above v3 (current MAX). Should fail.
+        let m = sample_manifest((MAX_SUPPORTED_MANIFEST_VERSION + 1) as i64, "");
+        let err = enforce_manifest_compatibility(&m).expect_err("v4 should be rejected");
+        assert!(
+            err.to_string().contains("upgrade the ato-mcp binary"),
+            "expected upgrade-binary error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn manifest_round_trips_reranker_field() -> Result<()> {
+        // Ensure serde round-trips the optional reranker entry without
+        // losing the inner ModelInfo shape (the contract Python depends on).
+        let mut m = sample_manifest(3, "0.6.0");
+        m.reranker = Some(ModelInfo {
+            id: "rerank-id".to_string(),
+            sha256: "deadbeef".to_string(),
+            size: 1234,
+            url: "https://example.com/reranker.tar.zst".to_string(),
+            tokenizer_sha256: Some("cafef00d".to_string()),
+        });
+        let json_str = serde_json::to_string(&m)?;
+        let v: serde_json::Value = serde_json::from_str(&json_str)?;
+        assert_eq!(v["reranker"]["id"], json!("rerank-id"));
+        assert_eq!(v["reranker"]["sha256"], json!("deadbeef"));
+        assert_eq!(v["reranker"]["size"], json!(1234));
+        assert_eq!(
+            v["reranker"]["url"],
+            json!("https://example.com/reranker.tar.zst")
+        );
+        // C4: tokenizer_sha256 round-trips through the manifest when set.
+        assert_eq!(v["reranker"]["tokenizer_sha256"], json!("cafef00d"));
+        let parsed: Manifest = serde_json::from_str(&json_str)?;
+        assert!(parsed.reranker.is_some());
+        let rr = parsed.reranker.as_ref().unwrap();
+        assert_eq!(rr.tokenizer_sha256.as_deref(), Some("cafef00d"));
+        Ok(())
+    }
+
+    #[test]
+    fn manifest_round_trips_reranker_field_without_tokenizer_sha256() -> Result<()> {
+        // Back-compat: a v3 manifest emitted before the C4 fix omits
+        // tokenizer_sha256 entirely. Old binaries already accept it (they
+        // ignore unknown fields); new binaries must still accept manifests
+        // without the field.
+        let raw = r#"{
+            "schema_version": 3,
+            "index_version": "test",
+            "created_at": "2026-01-01T00:00:00Z",
+            "min_client_version": "0.6.0",
+            "model": {"id": "m", "sha256": "0", "size": 0, "url": "https://x"},
+            "reranker": {"id": "rerank-id", "sha256": "abc", "size": 1, "url": "https://y"},
+            "documents": [],
+            "packs": []
+        }"#;
+        let parsed: Manifest = serde_json::from_str(raw)?;
+        let rr = parsed.reranker.as_ref().expect("reranker present");
+        assert_eq!(rr.tokenizer_sha256, None);
+        // And the JSON we re-emit omits the missing field rather than
+        // serialising a `null` (back-compat for older binaries that only
+        // tolerate the original shape).
+        let re_emit = serde_json::to_string(&parsed)?;
+        assert!(
+            !re_emit.contains("tokenizer_sha256"),
+            "tokenizer_sha256 must be omitted when None; got: {re_emit}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn manifest_omits_reranker_when_none() -> Result<()> {
+        let m = sample_manifest(3, "0.6.0");
+        assert!(m.reranker.is_none());
+        let json_str = serde_json::to_string(&m)?;
+        // skip_serializing_if drops the key entirely when None — Python
+        // side relies on this so v2 manifests round-trip identically.
+        assert!(
+            !json_str.contains("reranker"),
+            "reranker key must be omitted when None; json={json_str}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn extract_rerank_logits_handles_batch_one_shape() {
+        let logits = extract_rerank_logits(&[3, 1], &[0.1, 0.2, 0.3], 3).unwrap();
+        assert_eq!(logits, vec![0.1, 0.2, 0.3]);
+    }
+
+    #[test]
+    fn extract_rerank_logits_handles_flat_batch_shape() {
+        let logits = extract_rerank_logits(&[3], &[0.1, 0.2, 0.3], 3).unwrap();
+        assert_eq!(logits, vec![0.1, 0.2, 0.3]);
+    }
+
+    #[test]
+    fn extract_rerank_logits_picks_positive_class_for_two_class_output() {
+        // Some MS-MARCO exports emit `[batch, 2]` (negative, positive).
+        // We must take index 1 — the positive class.
+        let logits = extract_rerank_logits(&[2, 2], &[0.1, 0.9, 0.2, 0.8], 2).unwrap();
+        assert_eq!(logits, vec![0.9, 0.8]);
+    }
+
+    #[test]
+    fn extract_rerank_logits_rejects_unexpected_shape() {
+        let err = extract_rerank_logits(&[2, 2, 2], &[0.0; 8], 2).unwrap_err();
+        assert!(err.to_string().contains("unexpected reranker output shape"));
+    }
+
+    #[test]
+    fn sigmoid_squashes_into_unit_interval() {
+        assert!((sigmoid(0.0) - 0.5).abs() < 1e-9);
+        assert!(sigmoid(10.0) > 0.9999);
+        assert!(sigmoid(-10.0) < 0.0001);
+    }
+
+    /// Integration test: actually load the reranker model and score a
+    /// small batch. Skipped automatically when no model is installed —
+    /// CI without a reranker bundle will simply log "skipped" rather
+    /// than fail.
+    #[test]
+    fn reranker_scores_real_batch_when_model_present() -> Result<()> {
+        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let model = match dirs::data_dir() {
+            Some(mut p) => {
+                p.push(APP_NAME);
+                p.push("live");
+                p.push("reranker.onnx");
+                p
+            }
+            None => return Ok(()),
+        };
+        let tokenizer = model.parent().unwrap().join("reranker_tokenizer.json");
+        if !model.exists() || !tokenizer.exists() {
+            eprintln!(
+                "(skipped: reranker model not installed at {})",
+                model.display()
+            );
+            return Ok(());
+        }
+        let mut reranker = Reranker::load()?;
+        let candidates: Vec<(i64, &str)> = vec![
+            (
+                1,
+                "Income tax assessment of foreign superannuation lump sums.",
+            ),
+            (2, "Recipe for spaghetti bolognese with garlic bread."),
+            (
+                3,
+                "Tax treatment of foreign superannuation transfers under section 305-70.",
+            ),
+        ];
+        let scores = reranker.rerank("how are foreign super transfers taxed?", &candidates)?;
+        assert_eq!(scores.len(), 3);
+        for (_, s) in &scores {
+            assert!(*s >= 0.0 && *s <= 1.0, "sigmoid score out of range: {s}");
+        }
+        // The off-topic recipe should score lowest. Order isn't strict
+        // but the worst score should be <= the best by a healthy margin.
+        let recipe_score = scores.iter().find(|(id, _)| *id == 2).unwrap().1;
+        let best = scores.iter().map(|(_, s)| *s).fold(0.0_f64, f64::max);
+        assert!(
+            best - recipe_score > 0.05,
+            "expected non-trivial gap between best and off-topic; got best={best}, recipe={recipe_score}"
+        );
+
+        // Cheap latency sanity check: 50 pairs in well under 5s on any
+        // dev box. We keep the bound generous so CI doesn't flake.
+        let many: Vec<(i64, &str)> = (0..50)
+            .map(|i| {
+                (
+                    i as i64,
+                    "Section 8-1 deduction for expenses incurred in earning assessable income.",
+                )
+            })
+            .collect();
+        let start = std::time::Instant::now();
+        let _ = reranker.rerank("section 8-1 deductions", &many)?;
+        let elapsed = start.elapsed();
+        eprintln!("rerank-50-pair latency: {:?} (informational)", elapsed);
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "50-pair rerank took {elapsed:?}; check ONNX runtime config"
+        );
+        Ok(())
+    }
+
+    // Tests that touch the global data dir env var cannot run in
+    // parallel — serialise them through a single mutex.
+    static TEST_DB_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 }

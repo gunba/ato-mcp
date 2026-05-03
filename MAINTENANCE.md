@@ -34,6 +34,8 @@ ATO_MCP_MODE=catch_up \
 ATO_MCP_REPO_DIR="$PWD" \
 ATO_MCP_PAGES_DIR="/path/to/ato_pages" \
 ATO_MCP_MODEL_DIR="$PWD/models/embeddinggemma" \
+ATO_MCP_RERANKER_BUNDLE="$PWD/models/reranker" \
+ATO_MCP_RERANKER_URL="hf://cross-encoder/ms-marco-MiniLM-L-6-v2-onnx-int8@<revision-sha>" \
 ATO_MCP_GH_REPO=gunba/ato-mcp \
 scripts/maintainer-sync.sh
 ```
@@ -44,8 +46,16 @@ scripts/maintainer-sync.sh
 2. Build `release/<tag>/ato.db`, packs, and `manifest.json`.
 3. Write the pinned Hugging Face EmbeddingGemma source into the manifest,
    unless `ATO_MCP_MODEL_URL` points at an approved mirror.
-4. Upload the corpus assets with `.venv/bin/ato-mcp release`.
-5. Mark the release latest.
+4. Add the optional reranker manifest entry when `ATO_MCP_RERANKER_BUNDLE`
+   or the explicit `ATO_MCP_RERANKER_*` env vars are set.
+5. Upload the corpus assets with `.venv/bin/ato-mcp release`.
+6. Mark the release latest.
+
+The script skips rebuilds when the refreshed `index.jsonl` hash is unchanged,
+except in `ATO_MCP_MODE=full`. Set `ATO_MCP_FORCE_REBUILD=1` for schema,
+model, or reranker-only publications. After a successful publication,
+`release/.latest` points at the whole release directory so the next
+incremental run can reuse both `manifest.json` and prior `packs/`.
 
 The script requires `nvidia-smi`/CUDA to be available through the local
 Python ONNX Runtime install. If CUDA is unavailable, fix the environment
@@ -100,6 +110,101 @@ The offline bundle script runs the Rust installer against a local mirror of
 the manifest, packs, and model bundle, then packages the resulting data
 directory. Do not build offline bundles by copying `release/ato.db` directly.
 
+## Reranker model preparation
+
+Wave 3 (0.6.0+) introduces an optional cross-encoder reranker that the Rust
+runtime applies to the top-N hybrid candidates. The model is
+`cross-encoder/ms-marco-MiniLM-L-6-v2`, quantized to int8 ONNX (~25 MB on
+disk after quantization).
+
+The reranker is **optional**. A release built without `--reranker-bundle`
+leaves the manifest's `reranker` field `null` and the runtime falls back to
+the un-reranked hybrid score. End-user binaries continue to work; only the
+result quality drops.
+
+### One-off: build the bundle
+
+```bash
+pip install optimum[onnxruntime]==1.21.* onnx onnxruntime
+optimum-cli export onnx \
+    --model cross-encoder/ms-marco-MiniLM-L-6-v2 \
+    --task text-classification \
+    --quantization int8 \
+    ./reranker_bundle/
+```
+
+The output directory contains:
+
+- `model_quantized.onnx` (~25 MB) — the quantized weights
+- `tokenizer.json` (~700 KB) — the WordPiece tokenizer
+- `config.json` — model architecture metadata
+
+### Hosting
+
+Mirror the EmbeddingGemma pattern: pin to a specific Hugging Face revision
+URL so the Rust client always fetches the same artifact bytes. The manifest
+records this URL via `--reranker-url`. Format:
+
+```
+hf://cross-encoder/ms-marco-MiniLM-L-6-v2-onnx-int8@<revision-sha>
+```
+
+The Rust client tries the following filenames in order under that revision
+(first one whose download matches the manifest's `reranker.sha256` wins):
+
+1. `onnx/model.onnx` (the canonical optimum-cli output path)
+2. `onnx/model_quantized.onnx` (older quantized variants)
+3. `model_quantized.onnx` (root-level alias)
+4. `model.onnx` (root-level alias)
+
+This means you can host the bundle's `model_quantized.onnx` under any of
+those names — the Python `_resolve_reranker_info` helper hashes whichever
+one exists in your local bundle, and the Rust runtime walks the same list
+on download. **Critical:** if you re-quantize with a different optimum-cli
+version that produces a different filename, just upload it under one of
+the recognised names and re-run `ato-mcp release`. Do **not** rename the
+file — the sha will diverge from the manifest.
+
+The Rust client also downloads `tokenizer.json` from the same revision and
+renames the pair to `live/reranker.onnx` and `live/reranker_tokenizer.json`
+on disk. When `--reranker-bundle` includes a `tokenizer.json`, its sha256
+is auto-derived into `reranker.tokenizer_sha256` so the runtime can
+verify it byte-for-byte. Manifests built before this field landed (or
+publishers who omit `tokenizer.json` from the bundle) skip tokenizer
+verification with a one-line warning.
+
+When publishing a new revision, update the URL revision sha and re-run
+`ato-mcp release` with the new bundle so the manifest's sha256 advances.
+
+### Release CLI invocation
+
+```bash
+ato-mcp release \
+    --out-dir ./release \
+    --tag index-2026.05.06 \
+    --repo gunba/ato-mcp \
+    --model-dir ./models/embeddinggemma \
+    --reranker-bundle ./reranker_bundle \
+    --reranker-url 'hf://cross-encoder/ms-marco-MiniLM-L-6-v2-onnx-int8@<revision-sha>' \
+    --overwrite
+```
+
+The `--reranker-bundle` flag computes sha256 + size from
+`reranker_bundle/model_quantized.onnx` (or any of the recognised filenames
+listed above) automatically; pass `--reranker-sha256` / `--reranker-size`
+only to override the auto-computed values (rare — used when re-packaging
+the bundle).
+
+If your bundle includes `tokenizer.json`, its sha256 is also auto-derived
+and embedded into `reranker.tokenizer_sha256`. Pass
+`--reranker-tokenizer-sha256` to override or to set it explicitly when the
+manifest points at an HF revision whose tokenizer you've vetted out of
+band.
+
+The bundle itself is **not** uploaded to GitHub Releases; only its
+fingerprint goes into `manifest.json`. The Rust runtime fetches the actual
+ONNX from the Hugging Face URL on first use.
+
 ## Health Checks
 
 ```bash
@@ -115,6 +220,19 @@ Watch for:
 - Growing failed rows in `ato_pages/index.jsonl`.
 - `ato-mcp doctor` failures after update.
 - Missing `CUDAExecutionProvider` before a release build.
+
+### CLI search mirrors the MCP server pipeline
+
+`ato-mcp search "..."` from the CLI runs the same `search()` code path the
+MCP server does, including the cross-encoder reranker when its model files
+are installed under `live/`. JSON output reports `ranking.reranker_used:
+true` in that case (and `false` otherwise — typically when `--release` was
+shipped without `--reranker-bundle`, or when `ATO_MCP_DISABLE_RERANKER=1`
+is set in the environment).
+
+This means CLI latency benchmarks reflect production behaviour. To
+A/B compare RRF-only vs. reranker-on, run the same query twice with and
+without `ATO_MCP_DISABLE_RERANKER=1` in the environment.
 
 ## Do Not
 

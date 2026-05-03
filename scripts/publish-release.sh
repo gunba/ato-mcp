@@ -9,6 +9,7 @@
 #   - build-index has finished; release/ contains packs/ and manifest.json
 #   - model at models/embeddinggemma/
 #   - optional ATO_MCP_MODEL_URL for an approved model mirror
+#   - optional ATO_MCP_RERANKER_BUNDLE / ATO_MCP_RERANKER_URL for the reranker
 #   - gh authenticated for the maintainer account
 #
 # Usage:
@@ -27,6 +28,31 @@ MODEL_URL_ARG=()
 if [ -n "$MODEL_URL" ]; then
   MODEL_URL_ARG=(--model-url "$MODEL_URL")
 fi
+RERANKER_BUNDLE="${ATO_MCP_RERANKER_BUNDLE:-}"
+RERANKER_ID="${ATO_MCP_RERANKER_ID:-}"
+RERANKER_URL="${ATO_MCP_RERANKER_URL:-}"
+RERANKER_SHA256="${ATO_MCP_RERANKER_SHA256:-}"
+RERANKER_SIZE="${ATO_MCP_RERANKER_SIZE:-}"
+RERANKER_TOKENIZER_SHA256="${ATO_MCP_RERANKER_TOKENIZER_SHA256:-}"
+RERANKER_ARGS=()
+if [ -n "$RERANKER_BUNDLE" ]; then
+  RERANKER_ARGS+=(--reranker-bundle "$RERANKER_BUNDLE")
+fi
+if [ -n "$RERANKER_ID" ]; then
+  RERANKER_ARGS+=(--reranker-id "$RERANKER_ID")
+fi
+if [ -n "$RERANKER_URL" ]; then
+  RERANKER_ARGS+=(--reranker-url "$RERANKER_URL")
+fi
+if [ -n "$RERANKER_SHA256" ]; then
+  RERANKER_ARGS+=(--reranker-sha256 "$RERANKER_SHA256")
+fi
+if [ -n "$RERANKER_SIZE" ]; then
+  RERANKER_ARGS+=(--reranker-size "$RERANKER_SIZE")
+fi
+if [ -n "$RERANKER_TOKENIZER_SHA256" ]; then
+  RERANKER_ARGS+=(--reranker-tokenizer-sha256 "$RERANKER_TOKENIZER_SHA256")
+fi
 
 echo "=> uploading manifest and packs"
 "$VENV/bin/ato-mcp" release \
@@ -35,6 +61,7 @@ echo "=> uploading manifest and packs"
   --repo      "$REPO" \
   --model-dir "$MODEL_DIR" \
   "${MODEL_URL_ARG[@]}" \
+  "${RERANKER_ARGS[@]}" \
   --overwrite
 
 echo "=> promoting $TAG to latest"

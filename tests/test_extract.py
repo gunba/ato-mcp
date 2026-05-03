@@ -1,7 +1,7 @@
 """HTML -> markdown extraction edge cases."""
 from __future__ import annotations
 
-from ato_mcp.indexer.extract import extract
+from ato_mcp.indexer.extract import CurrencyInfo, extract, extract_currency
 
 
 def test_extract_law_contents_div() -> None:
@@ -79,3 +79,221 @@ def test_compose_title_from_leading_headings() -> None:
     assert doc.title == "Class Ruling — CR 2024/3 — Scrip for scrip rollover"
     # Background is a body section, not part of the title.
     assert "Background" not in (doc.title or "")
+
+
+# ---------------------------------------------------------------------------
+# W2.2 — currency / supersession extraction
+
+
+def test_extract_currency_no_markers_returns_all_none() -> None:
+    """Pages with no withdrawal markers yield an empty CurrencyInfo."""
+    html = """
+    <div id="LawContent">
+        <div id="LawBody">
+            <h1>Taxation Ruling</h1>
+            <h2>TR 2024/3</h2>
+            <p>The Commissioner rules on income tax matters.</p>
+        </div>
+    </div>
+    """
+    info = extract_currency(html)
+    assert info == CurrencyInfo()
+
+
+def test_extract_currency_handles_empty_html() -> None:
+    assert extract_currency("") == CurrencyInfo()
+    assert extract_currency("   ") == CurrencyInfo()
+
+
+def test_extract_currency_withdrawal_prose_with_full_date() -> None:
+    """Notice-of-Withdrawal page with prose 'withdrawn with effect from <date>'."""
+    html = """
+    <div id="LawContent">
+        <div id="LawBody">
+            <h3>Notice of Withdrawal</h3>
+            <p class="indentlevel0">Taxation Ruling TR 2022/1 is withdrawn with effect from 31 October 2025.</p>
+            <p class="indentlevel0">1. TR 2022/1 discusses the methodology used by the Commissioner.</p>
+        </div>
+    </div>
+    """
+    info = extract_currency(html)
+    assert info.withdrawn_date == "2025-10-31"
+
+
+def test_extract_currency_withdrawal_prose_with_short_form() -> None:
+    """Cross-referenced withdrawal date in a 'replaces' sentence MUST NOT
+    be attributed to the current ruling.
+
+    Sentence: "This Ruling replaces TR 2021/3, which is withdrawn from
+    1 July 2022." The 1 July 2022 date applies to TR 2021/3, the predecessor.
+    The current ruling is the REPLACEMENT, so its withdrawn_date is None.
+    Sentence-aware extraction in `_extract_self_withdrawn_date` skips the
+    fragment because it contains a replacement verb without a self-anchor.
+    """
+    html = """
+    <div id="LawBody">
+        <p>This Ruling replaces Taxation Ruling TR 2021/3, which is withdrawn from 1 July 2022.</p>
+    </div>
+    """
+    info = extract_currency(html)
+    assert info.withdrawn_date is None
+    assert info.replaces == "TR 2021/3"
+
+
+def test_extract_currency_self_withdrawn_clear_sentence() -> None:
+    """Plain self-withdrawal sentence — no replacement verb anywhere."""
+    html = """
+    <div id="LawBody">
+        <p>Taxation Ruling TR 2024/1 is withdrawn with effect from 31 December 2024.</p>
+    </div>
+    """
+    info = extract_currency(html)
+    assert info.withdrawn_date == "2024-12-31"
+
+
+def test_extract_currency_this_ruling_anchor_overrides_replacement_verb() -> None:
+    """A 'this Ruling' subject means the date applies to the current doc."""
+    html = """
+    <div id="LawBody">
+        <p>This Ruling is withdrawn from 1 January 2025.</p>
+    </div>
+    """
+    info = extract_currency(html)
+    assert info.withdrawn_date == "2025-01-01"
+
+
+def test_extract_currency_negative_mixed_sentence() -> None:
+    """Sentence has a 'withdrawn ... date' clause AND a 'replaces' verb but
+    no 'this Ruling' anchor on the withdrawn clause — date belongs to the
+    referenced predecessor, not the current doc.
+    """
+    html = """
+    <div id="LawBody">
+        <p>This Ruling replaces TR 2021/3 (which was withdrawn from 1 July 2022) and applies from 1 July 2022.</p>
+    </div>
+    """
+    info = extract_currency(html)
+    assert info.withdrawn_date is None
+    assert info.replaces == "TR 2021/3"
+
+
+def test_extract_currency_replaced_by_in_alert_panel() -> None:
+    """Status panel says 'Replaced by TR 98/17'."""
+    html = """
+    <div id="LawContent">
+        <div class="alert alert-block alert-warning" data-icon="w">This document has been Withdrawn.</div>
+        <div class="alert alert-block alert-warning" data-icon="w">Replaced by TR 98/17 with effect from 14 April 1994.</div>
+        <div id="LawBody">
+            <h3>Notice of Withdrawal</h3>
+            <p>IT 2607 is withdrawn with effect from 14 April 1994.</p>
+        </div>
+    </div>
+    """
+    info = extract_currency(html)
+    assert info.withdrawn_date == "1994-04-14"
+    assert info.superseded_by == "TR 98/17"
+
+
+def test_extract_currency_superseded_by_phrasing() -> None:
+    """'superseded by TR 94/13' synonym."""
+    html = """
+    <div id="LawBody">
+        <p>Taxation Ruling IT 2150 has been superseded by TR 94/13.</p>
+        <p>IT 2150 is withdrawn with effect from 14 April 1994.</p>
+    </div>
+    """
+    info = extract_currency(html)
+    assert info.superseded_by == "TR 94/13"
+    assert info.withdrawn_date == "1994-04-14"
+
+
+def test_extract_currency_withdrawn_by_sets_superseded_by() -> None:
+    html = """
+    <div id="LawBody">
+        <p>Notice of withdrawal: TR 2024/3 was withdrawn on 5 March 2024 by TR 2025/1.</p>
+    </div>
+    """
+    info = extract_currency(html)
+    assert info.withdrawn_date == "2024-03-05"
+    assert info.superseded_by == "TR 2025/1"
+
+
+def test_extract_currency_predecessor_withdrawn_by_is_not_self() -> None:
+    html = """
+    <div id="LawBody">
+        <p>This Ruling replaces TR 2021/3, which was withdrawn on 5 March 2024 by TR 2025/1.</p>
+    </div>
+    """
+    info = extract_currency(html)
+    assert info.withdrawn_date is None
+    assert info.superseded_by is None
+    assert info.replaces == "TR 2021/3"
+
+
+def test_extract_currency_replaces_in_alert_panel() -> None:
+    """Live ruling page shows 'This Ruling, which applies from ..., replaces TR 2021/3'."""
+    html = """
+    <div id="LawContent">
+        <div class="alert alert-block alert-warning" data-icon="w">
+            This Ruling, which applies from 1 July 2022, replaces TR 2021/3.
+        </div>
+        <div id="LawBody">
+            <h3>Ruling</h3>
+            <p>The Commissioner rules ...</p>
+        </div>
+    </div>
+    """
+    info = extract_currency(html)
+    assert info.replaces == "TR 2021/3"
+    # Not withdrawn — this is the replacement ruling.
+    assert info.withdrawn_date is None
+
+
+def test_extract_currency_date_format_dd_slash_mm_slash_yyyy() -> None:
+    """Australian DD/MM/YYYY format."""
+    html = """
+    <div id="LawBody">
+        <p>The ruling is withdrawn with effect from 31/10/2025.</p>
+    </div>
+    """
+    info = extract_currency(html)
+    assert info.withdrawn_date == "2025-10-31"
+
+
+def test_extract_currency_date_format_iso() -> None:
+    html = """
+    <div id="LawBody">
+        <p>This ruling is withdrawn with effect from 2025-10-31.</p>
+    </div>
+    """
+    info = extract_currency(html)
+    assert info.withdrawn_date == "2025-10-31"
+
+
+def test_extract_currency_history_table_fallback() -> None:
+    """When prose form is missing, fall back to the timeline table."""
+    html = """
+    <div id="LawContent">
+        <div id="LawBody"><p>Some unrelated text.</p></div>
+        <div class="panel">
+            <div class="panel-heading"><a name="LawTimeLine"></a>
+                <strong>TR 2007/D10W2 - Notice of Withdrawal history</strong>
+            </div>
+            <div class="panel-body">
+                <table>
+                    <tr>
+                        <td class="date-right2">7 December 2016</td>
+                        <td class="main"><a href="/foo">Withdrawal</a></td>
+                    </tr>
+                    <tr>
+                        <td class="date-right2">15 November 2023</td>
+                        <td class="main"><a href="/foo">Updated withdrawal</a></td>
+                    </tr>
+                </table>
+            </div>
+        </div>
+    </div>
+    """
+    info = extract_currency(html)
+    # Latest withdrawal entry wins — 15 November 2023.
+    assert info.withdrawn_date == "2023-11-15"

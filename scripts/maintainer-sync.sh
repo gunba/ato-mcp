@@ -7,6 +7,10 @@
 #   ATO_MCP_MODEL_DIR  absolute path to a dir holding model_quantized.onnx,
 #                      model_quantized.onnx_data, tokenizer.json
 #   ATO_MCP_MODEL_URL  optional approved model mirror URL
+#   ATO_MCP_RERANKER_BUNDLE optional dir holding reranker ONNX + tokenizer.json
+#   ATO_MCP_RERANKER_URL optional pinned hf:// source for the reranker
+#   ATO_MCP_RERANKER_ID / SHA256 / SIZE / TOKENIZER_SHA256 optional overrides
+#   ATO_MCP_FORCE_REBUILD set to 1/true/yes/on to rebuild even when source did not change
 #   ATO_MCP_RELEASE_TAG  tag prefix (default: index)
 #   ATO_MCP_GH_REPO    owner/name (default: gunba/ato-mcp)
 #   ATO_MCP_MODE       incremental | catch_up | full (default: incremental)
@@ -29,8 +33,46 @@ MODEL_URL_ARG=()
 if [ -n "$MODEL_URL" ]; then
     MODEL_URL_ARG=(--model-url "$MODEL_URL")
 fi
+RERANKER_BUNDLE="${ATO_MCP_RERANKER_BUNDLE:-}"
+RERANKER_ID="${ATO_MCP_RERANKER_ID:-}"
+RERANKER_URL="${ATO_MCP_RERANKER_URL:-}"
+RERANKER_SHA256="${ATO_MCP_RERANKER_SHA256:-}"
+RERANKER_SIZE="${ATO_MCP_RERANKER_SIZE:-}"
+RERANKER_TOKENIZER_SHA256="${ATO_MCP_RERANKER_TOKENIZER_SHA256:-}"
+RERANKER_BUILD_ARGS=()
+RERANKER_RELEASE_ARGS=()
+if [ -n "$RERANKER_BUNDLE" ]; then
+    RERANKER_RELEASE_ARGS+=(--reranker-bundle "$RERANKER_BUNDLE")
+fi
+if [ -n "$RERANKER_ID" ]; then
+    RERANKER_RELEASE_ARGS+=(--reranker-id "$RERANKER_ID")
+fi
+if [ -n "$RERANKER_URL" ]; then
+    RERANKER_RELEASE_ARGS+=(--reranker-url "$RERANKER_URL")
+fi
+if [ -n "$RERANKER_SHA256" ]; then
+    RERANKER_RELEASE_ARGS+=(--reranker-sha256 "$RERANKER_SHA256")
+fi
+if [ -n "$RERANKER_SIZE" ]; then
+    RERANKER_RELEASE_ARGS+=(--reranker-size "$RERANKER_SIZE")
+fi
+if [ -n "$RERANKER_TOKENIZER_SHA256" ]; then
+    RERANKER_RELEASE_ARGS+=(--reranker-tokenizer-sha256 "$RERANKER_TOKENIZER_SHA256")
+fi
+if [ -n "$RERANKER_ID" ] && [ -n "$RERANKER_URL" ] && [ -n "$RERANKER_SHA256" ] && [ -n "$RERANKER_SIZE" ]; then
+    RERANKER_BUILD_ARGS=(
+        --reranker-id "$RERANKER_ID"
+        --reranker-url "$RERANKER_URL"
+        --reranker-sha256 "$RERANKER_SHA256"
+        --reranker-size "$RERANKER_SIZE"
+    )
+    if [ -n "$RERANKER_TOKENIZER_SHA256" ]; then
+        RERANKER_BUILD_ARGS+=(--reranker-tokenizer-sha256 "$RERANKER_TOKENIZER_SHA256")
+    fi
+fi
 GH_REPO="${ATO_MCP_GH_REPO:-gunba/ato-mcp}"
 MODE="${ATO_MCP_MODE:-incremental}"
+FORCE_REBUILD="${ATO_MCP_FORCE_REBUILD:-}"
 TAG_PREFIX="${ATO_MCP_RELEASE_TAG:-index}"
 
 cd "$REPO_DIR"
@@ -52,6 +94,18 @@ exec > >(tee -a "$LOG") 2>&1
 echo "== $(date -u +%FT%TZ) maintainer sync ($MODE) =="
 
 BEFORE_COUNT=$(wc -l < "$PAGES_DIR/index.jsonl" 2>/dev/null || echo 0)
+index_hash() {
+    if [[ ! -f "$PAGES_DIR/index.jsonl" ]]; then
+        echo "missing"
+        return
+    fi
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$PAGES_DIR/index.jsonl" | awk '{print $1}'
+    else
+        shasum -a 256 "$PAGES_DIR/index.jsonl" | awk '{print $1}'
+    fi
+}
+BEFORE_HASH=$(index_hash)
 
 case "$MODE" in
     incremental)
@@ -70,10 +124,17 @@ case "$MODE" in
 esac
 
 AFTER_COUNT=$(wc -l < "$PAGES_DIR/index.jsonl" 2>/dev/null || echo 0)
+AFTER_HASH=$(index_hash)
 echo "index.jsonl rows: $BEFORE_COUNT -> $AFTER_COUNT"
+echo "index.jsonl sha256: $BEFORE_HASH -> $AFTER_HASH"
 
-if (( AFTER_COUNT == BEFORE_COUNT )); then
-    echo "no new rows; skipping rebuild+release"
+FORCE=false
+case "$FORCE_REBUILD" in
+    1|true|TRUE|yes|YES|on|ON) FORCE=true ;;
+esac
+
+if [[ "$FORCE" != true && "$MODE" != "full" && "$AFTER_HASH" == "$BEFORE_HASH" ]]; then
+    echo "no source index changes; skipping rebuild+release"
     exit 0
 fi
 
@@ -94,7 +155,8 @@ fi
     --model-path "$MODEL_DIR/model_quantized.onnx" \
     --tokenizer-path "$MODEL_DIR/tokenizer.json" \
     --gpu \
-    "${PREV_ARG[@]}"
+    "${PREV_ARG[@]}" \
+    "${RERANKER_BUILD_ARGS[@]}"
 
 "$ATO_MCP" release \
     --out-dir "$RELEASE_DIR" \
@@ -102,13 +164,15 @@ fi
     --repo "$GH_REPO" \
     --model-dir "$MODEL_DIR" \
     "${MODEL_URL_ARG[@]}" \
+    "${RERANKER_RELEASE_ARGS[@]}" \
     --overwrite
 
 # Promote to "latest" so /releases/latest/download resolves to this tag.
 gh release edit "$TAG" --repo "$GH_REPO" --latest --prerelease=false
 
-# Remember this manifest so the next incremental build can reuse packs.
-mkdir -p "$REPO_DIR/release/.latest"
-cp "$RELEASE_DIR/manifest.json" "$REPO_DIR/release/.latest/manifest.json"
+# Remember this whole release so the next incremental build can reuse prior
+# pack bytes, not just the manifest's offsets.
+rm -rf "$REPO_DIR/release/.latest"
+ln -s "$RELEASE_DIR" "$REPO_DIR/release/.latest"
 
 echo "== done: released $TAG ($(( AFTER_COUNT - BEFORE_COUNT )) new rows) =="

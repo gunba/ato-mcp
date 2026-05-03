@@ -138,6 +138,28 @@ def build_index(
     tokenizer_path: Optional[Path] = typer.Option(None, help="Path to tokenizer.json."),
     model_id: str = typer.Option("embeddinggemma-300m-int8-256d"),
     model_url: Optional[str] = typer.Option(None),
+    reranker_id: Optional[str] = typer.Option(
+        None,
+        help="Optional reranker model id; combined with --reranker-url to populate "
+             "the manifest's `reranker` ModelInfo. Leave unset to publish a manifest "
+             "without a reranker entry (Rust runtime falls back to un-reranked).",
+    ),
+    reranker_url: Optional[str] = typer.Option(
+        None,
+        help="Optional reranker source URL (e.g. hf://cross-encoder/ms-marco-MiniLM-L-6-v2-onnx-int8@<sha>).",
+    ),
+    reranker_sha256: Optional[str] = typer.Option(
+        None, help="sha256 of the externally hosted reranker ONNX file."
+    ),
+    reranker_size: Optional[int] = typer.Option(
+        None, help="Size in bytes of the externally hosted reranker ONNX file."
+    ),
+    reranker_tokenizer_sha256: Optional[str] = typer.Option(
+        None,
+        help="Optional sha256 of the externally hosted reranker tokenizer.json. "
+             "When provided, the Rust runtime verifies the downloaded tokenizer "
+             "byte-for-byte; otherwise it logs a one-line warning and skips.",
+    ),
     previous_manifest: Optional[Path] = typer.Option(None, help="Previous manifest for incremental reuse."),
     limit: Optional[int] = typer.Option(None, help="Cap documents processed (for testing)."),
     embedder: str = typer.Option(
@@ -182,6 +204,11 @@ def build_index(
         model_url=model_url,
         model_sha256=model_sha,
         model_size=model_size,
+        reranker_id=reranker_id,
+        reranker_url=reranker_url,
+        reranker_sha256=reranker_sha256,
+        reranker_size=reranker_size,
+        reranker_tokenizer_sha256=reranker_tokenizer_sha256,
         previous_manifest=previous_manifest,
         limit=limit,
         embedder=embedder,  # type: ignore[arg-type]
@@ -220,6 +247,33 @@ def release(
     ),
     model_sha256: Optional[str] = typer.Option(None, help="sha256 of an externally hosted model bundle."),
     model_size: Optional[int] = typer.Option(None, help="Size in bytes of an externally hosted model bundle."),
+    reranker_bundle: Optional[Path] = typer.Option(
+        None,
+        help="Directory containing model_quantized.onnx + tokenizer.json (+ optional config.json) "
+             "for the cross-encoder reranker. The bundle is NOT uploaded to GitHub; only its "
+             "sha256/size are recorded in the manifest's `reranker` ModelInfo. The Rust runtime "
+             "fetches the actual ONNX from --reranker-url (default: pinned Hugging Face revision).",
+    ),
+    reranker_id: Optional[str] = typer.Option(
+        None,
+        help="Reranker model id stored in the manifest (default: ms-marco-minilm-l6-v2-int8).",
+    ),
+    reranker_url: Optional[str] = typer.Option(
+        None,
+        help="External (HF) URL the Rust runtime fetches the reranker ONNX from.",
+    ),
+    reranker_sha256: Optional[str] = typer.Option(
+        None, help="Override the bundle's computed sha256 (rare — use when hosting a re-packed bundle)."
+    ),
+    reranker_size: Optional[int] = typer.Option(
+        None, help="Override the bundle's computed size (rare — see --reranker-sha256)."
+    ),
+    reranker_tokenizer_sha256: Optional[str] = typer.Option(
+        None,
+        help="Override the auto-derived tokenizer.json sha256 (rare — set when "
+             "publishing a manifest pointing at an HF revision whose tokenizer "
+             "you've vetted out-of-band).",
+    ),
 ) -> None:
     """Maintainer: upload the build artifacts to a GitHub release.
 
@@ -241,6 +295,12 @@ def release(
         model_url=model_url,
         model_sha256=model_sha256,
         model_size=model_size,
+        reranker_bundle=reranker_bundle,
+        reranker_id=reranker_id,
+        reranker_url=reranker_url,
+        reranker_sha256=reranker_sha256,
+        reranker_size=reranker_size,
+        reranker_tokenizer_sha256=reranker_tokenizer_sha256,
     ))
     typer.echo(f"release {tag} published with manifest + packs")
 

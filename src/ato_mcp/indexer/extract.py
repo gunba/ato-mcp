@@ -42,6 +42,28 @@ class ExtractedDoc:
     anchors: list[tuple[str, str]] = field(default_factory=list)  # (heading_text, anchor_id)
 
 
+@dataclass(frozen=True)
+class CurrencyInfo:
+    """Currency / supersession metadata derived from the page HTML.
+
+    All fields default to ``None`` when no relevant marker is found. ATO pages
+    are inconsistent (rule body prose vs. status-alert panels vs. timeline
+    tables vs. dedicated withdrawal-notice pages), so each field is filled
+    independently — a missing field never blocks others.
+
+    - ``withdrawn_date``: ISO ``yyyy-mm-dd`` if the page indicates the doc was
+      withdrawn / superseded as of a specific date.
+    - ``superseded_by``: short citation of the doc that replaces this one,
+      when the page links/quotes one (e.g. ``"TR 2022/1"``).
+    - ``replaces``: short citation of the doc that THIS doc replaces (the
+      converse of ``superseded_by``), when stated.
+    """
+
+    withdrawn_date: str | None = None
+    superseded_by: str | None = None
+    replaces: str | None = None
+
+
 def extract(html: str) -> ExtractedDoc:
     if not html or not html.strip():
         return ExtractedDoc(markdown="", title=None, html_title=None)
@@ -213,3 +235,310 @@ def _collect_anchors(node: Node) -> list[tuple[str, str]]:
 
 def heading_outline(headings: Iterable[str]) -> str:
     return " › ".join(h for h in headings if h)
+
+
+# ---------------------------------------------------------------------------
+# Currency / supersession extraction (W2.2)
+#
+# ATO publishes withdrawal and supersession status across several surfaces on a
+# document page:
+#   1. A status panel (``div.alert.alert-warning``) at the top of the doc:
+#        "This document has been Withdrawn." [+ link to "Withdrawal notice"]
+#        "This Ruling, which applies from 1 July 2022, replaces TR 2021/3"
+#   2. Body prose on the doc itself or its Notice-of-Withdrawal sibling page:
+#        "TR 2022/1 is withdrawn with effect from 31 October 2025."
+#        "Draft Taxation Ruling TR 2007/D10 was withdrawn with effect from
+#         7 December 2016."
+#        "This Ruling replaces Taxation Ruling TR 2021/3"
+#   3. A history/timeline panel near the bottom of the page with a
+#        ``<td class="date-right2">7 December 2016</td>`` row whose neighbour
+#        cell links to "Withdrawal" / "Updated withdrawal".
+#
+# These surfaces are noisy: dates appear in multiple formats ("31 October 2025"
+# vs. "31/10/2025" vs. "2025-10-31"); the citation in "replaces TR 2021/3" can
+# embed a series prefix or appear as a hyperlink with a slightly different
+# label. The extractor therefore captures whichever marker fires first per
+# field — never blocking the other fields if one is absent.
+
+_RULING_SERIES_FOR_CURRENCY = (
+    "SMSFRB|SMSFR|SMSFD|GSTR|GSTD|FBTR|WETR|WETD|"
+    "LCR|SGR|FTR|PCG|LCG|PRR|CLR|COG|TXD|TPA|"
+    "FBT|GII|CR|PR|TR|TD|MT|TA|LI|LG|WT|IT"
+)
+_CITATION_PATTERN = (
+    rf"(?:{_RULING_SERIES_FOR_CURRENCY}|ATO\s+ID|PS\s+LA|SMSFRB)"
+    r"\s+\d{1,4}/D?\d+[A-Z0-9]*"
+)
+_DATE_PROSE_PATTERN = (
+    r"\d{1,2}\s+(?:January|February|March|April|May|June|July|August|"
+    r"September|October|November|December)\s+\d{4}|"
+    r"\d{1,2}/\d{1,2}/\d{4}|\d{4}-\d{2}-\d{2}"
+)
+_WITHDRAWN_DATE_PREFIX_PATTERN = (
+    r"\b(?:was|is|were|are|been|being|has\s+been|have\s+been)?\s*withdrawn"
+    r"(?:\s+(?:with\s+effect)?\s*(?:from|on|as\s+of))?\s+"
+)
+# Matches "withdrawn with effect from 7 December 2016", "withdrawn from
+# 1 July 2022", "withdrawn on 6 October 2022", "is withdrawn with effect from
+# 31 October 2025." The verb "withdrawn" comes first, then optionally
+# "with effect", "on", "from", "as of"; the date follows.
+_RE_WITHDRAWN_PROSE = re.compile(
+    _WITHDRAWN_DATE_PREFIX_PATTERN + rf"(?P<date>{_DATE_PROSE_PATTERN})",
+    re.IGNORECASE,
+)
+_RE_WITHDRAWN_BY_PROSE = re.compile(
+    _WITHDRAWN_DATE_PREFIX_PATTERN
+    + rf"(?P<date>{_DATE_PROSE_PATTERN})"
+    + r"\s+by\b(?:\s+(?:draft\s+)?(?:Taxation|Class|Product|Practical|GST)?\s*"
+    + r"(?:Ruling|Determination|Guideline|Practice\s+Statement)?)?\s+"
+    + rf"(?P<cite>{_CITATION_PATTERN})",
+    re.IGNORECASE,
+)
+# Sentences containing any of these verbs describe the relationship between
+# two rulings (this one and a predecessor/successor); a "withdrawn ... date"
+# clause inside such a sentence almost always belongs to the OTHER ruling.
+# We use a "this Ruling/Determination/..." anchor as the override signal —
+# when the subject of the sentence is THIS document, the withdrawal date
+# belongs to it even if the sentence also mentions replacement.
+_RE_REPLACEMENT_VERB = re.compile(
+    r"\b(replaces|replaced\s+by|supersed(?:e|es|ed|ing)|in\s+lieu\s+of)\b",
+    re.IGNORECASE,
+)
+_RE_SELF_ANCHOR = re.compile(
+    r"\bthis\s+(?:Ruling|Determination|Guideline|Practice\s+Statement)\b",
+    re.IGNORECASE,
+)
+# Sentence boundary split — periods, semicolons, and newlines all break
+# clauses cleanly enough for this heuristic. We deliberately keep it crude
+# (no NLP) — over-splitting is harmless because each fragment is independently
+# scanned.
+_RE_SENTENCE_SPLIT = re.compile(r"[.;\n]+")
+# Matches "replaces Taxation Ruling TR 2021/3", "replaces TR 2021/3",
+# "Replaced by TR 98/17", "superseded by TR 94/13".
+_RE_REPLACES_PROSE = re.compile(
+    rf"\b(?:this\s+(?:Ruling|Determination|Guideline|Practice\s+Statement)\s+)?"
+    rf"replaces\b(?:\s+(?:draft\s+)?(?:Taxation|Class|Product|Practical|GST)?\s*"
+    rf"(?:Ruling|Determination|Guideline|Practice\s+Statement)?)?\s+"
+    rf"(?P<cite>{_CITATION_PATTERN})",
+    re.IGNORECASE,
+)
+_RE_SUPERSEDED_BY_PROSE = re.compile(
+    rf"\b(?:replaced|superseded)\s+by\b(?:\s+(?:draft\s+)?(?:Taxation|Class|Product|"
+    rf"Practical|GST)?\s*(?:Ruling|Determination|Guideline|Practice\s+Statement)?)?"
+    rf"\s+(?P<cite>{_CITATION_PATTERN})",
+    re.IGNORECASE,
+)
+_MONTHS = {
+    name.lower(): idx
+    for idx, name in enumerate(
+        [
+            "January", "February", "March", "April", "May", "June",
+            "July", "August", "September", "October", "November", "December",
+        ],
+        1,
+    )
+}
+
+
+def _normalise_date(raw: str | None) -> str | None:
+    """Normalise an ATO-formatted date to ISO ``yyyy-mm-dd``.
+
+    Handles three observed formats:
+      - ``"31 October 2025"`` (the usual prose form).
+      - ``"31/10/2025"`` (DD/MM/YYYY — Australian convention).
+      - ``"2025-10-31"`` (already ISO).
+    Returns ``None`` for unparseable input.
+    """
+    if raw is None:
+        return None
+    s = " ".join(raw.split())
+    m = re.fullmatch(r"(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})", s)
+    if m:
+        day, month_name, year = m.group(1), m.group(2).lower(), m.group(3)
+        month = _MONTHS.get(month_name)
+        if month is None:
+            return None
+        return f"{int(year):04d}-{month:02d}-{int(day):02d}"
+    m = re.fullmatch(r"(\d{1,2})/(\d{1,2})/(\d{4})", s)
+    if m:
+        day, month, year = m.group(1), m.group(2), m.group(3)
+        return f"{int(year):04d}-{int(month):02d}-{int(day):02d}"
+    m = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", s)
+    if m:
+        return s
+    return None
+
+
+def _normalise_citation(raw: str | None) -> str | None:
+    """Collapse internal whitespace and trim a citation token."""
+    if raw is None:
+        return None
+    return " ".join(raw.split()) or None
+
+
+def _withdrawal_fragment_is_self(fragment: str, withdrawn_start: int) -> bool:
+    if _RE_REPLACEMENT_VERB.search(fragment) is None:
+        return True
+    anchor = _RE_SELF_ANCHOR.search(fragment)
+    if anchor is None:
+        return False
+    # The window between the anchor's end and the withdrawn keyword must be
+    # free of replacement verbs; otherwise the anchor's subject is that other
+    # verb rather than "withdrawn".
+    between = fragment[anchor.end():withdrawn_start]
+    return _RE_REPLACEMENT_VERB.search(between) is None
+
+
+def _extract_self_withdrawn_date(text: str) -> str | None:
+    """Pick a withdrawal date that applies to THIS document, not a referenced one.
+
+    The naive `_RE_WITHDRAWN_PROSE.search(text)` approach trips on sentences
+    like "This Ruling replaces TR 2021/3, which is withdrawn from 1 July
+    2022" — the date there belongs to TR 2021/3, not to the current ruling.
+
+    Strategy: split into sentence-ish fragments. For each fragment that
+    matches `_RE_WITHDRAWN_PROSE`:
+      - If the fragment contains NO replacement verb, it's a clean
+        self-withdrawal — keep the date.
+      - If the fragment DOES contain a replacement verb, only keep the date
+        when the "this Ruling/Determination/..." anchor sits immediately
+        before the `withdrawn` keyword (within a short character window).
+        This covers "This Ruling is withdrawn from ..." (anchor → withdrawn,
+        no other verbs between) but NOT "This Ruling replaces TR X, which
+        is withdrawn from ..." (the anchor's subject is `replaces`, not
+        `withdrawn`).
+    Returns the first surviving date as ISO ``yyyy-mm-dd``.
+    """
+    for fragment in _RE_SENTENCE_SPLIT.split(text):
+        m = _RE_WITHDRAWN_PROSE.search(fragment)
+        if m is None:
+            continue
+        if _withdrawal_fragment_is_self(fragment, m.start()):
+            return _normalise_date(m.group("date"))
+    return None
+
+
+def _extract_self_withdrawn_by(text: str) -> str | None:
+    """Return the successor citation in "withdrawn ... by TR X" self clauses."""
+    for fragment in _RE_SENTENCE_SPLIT.split(text):
+        m = _RE_WITHDRAWN_BY_PROSE.search(fragment)
+        if m is None:
+            continue
+        if _withdrawal_fragment_is_self(fragment, m.start()):
+            return _normalise_citation(m.group("cite"))
+    return None
+
+
+def _container_text_for_currency(html: str) -> str:
+    """Combine the status-alert panel text and body prose into one search
+    string so a single regex pass can pick up either surface.
+
+    We intentionally include the alert panel verbatim (including links) — the
+    panel text on a still-current doc that has been ADDENDUM'd reads "This
+    document has been Withdrawn" only on actually-withdrawn rulings, so the
+    `_RE_WITHDRAWN_PROSE` pattern (which requires a date alongside) won't fire
+    spuriously.
+    """
+    tree = HTMLParser(html)
+    chunks: list[str] = []
+    for el in tree.css("div.alert"):
+        chunks.append(el.text(deep=True, separator=" ", strip=True) or "")
+    body = tree.css_first("#LawBody") or tree.css_first("#LawContent") or tree.body
+    if body is not None:
+        chunks.append(body.text(deep=True, separator=" ", strip=True) or "")
+    return " \n ".join(c for c in chunks if c)
+
+
+def _date_from_history_table(html: str) -> str | None:
+    """Pull the most recent withdrawal date from the timeline/history table.
+
+    The history panel renders as ``<td class="date-right2">7 December
+    2016</td>`` followed by a sibling cell with link text "Withdrawal" /
+    "Updated withdrawal". When present, this is the most authoritative
+    date — but it's optional (older docs lack the table).
+    """
+    tree = HTMLParser(html)
+    timeline = tree.css_first("a[name='LawTimeLine']")
+    if timeline is None:
+        return None
+    # Walk up to the enclosing panel that holds the timeline rows. The anchor
+    # nests inside ``panel-heading``; the rows live in a sibling
+    # ``panel-body``. Walking to the first ancestor whose class contains the
+    # whole word ``panel`` (and not ``panel-heading`` / ``panel-body``)
+    # picks the panel root deterministically.
+    panel = timeline
+    for _ in range(8):
+        if panel.parent is None:
+            break
+        panel = panel.parent
+        classes = (panel.attributes.get("class") or "").split()
+        if (panel.tag or "").lower() == "table":
+            break
+        if "panel" in classes:
+            break
+    rows = panel.css("tr")
+    latest: str | None = None
+    for row in rows:
+        cells = row.css("td")
+        if len(cells) < 2:
+            continue
+        date_cell = None
+        label_cell = None
+        for cell in cells:
+            cls = (cell.attributes.get("class") or "").lower()
+            text = cell.text(deep=True, separator=" ", strip=True) or ""
+            if "date" in cls and date_cell is None:
+                date_cell = text
+            elif date_cell is not None and label_cell is None:
+                label_cell = text.lower()
+        if date_cell is None:
+            continue
+        if label_cell is None:
+            label_cell = (cells[-1].text(deep=True, separator=" ", strip=True) or "").lower()
+        if "withdraw" not in label_cell:
+            continue
+        iso = _normalise_date(date_cell)
+        if iso is not None:
+            # Latest entry wins (timeline is chronological, last row is most
+            # recent).
+            latest = iso
+    return latest
+
+
+def extract_currency(html: str) -> CurrencyInfo:
+    """Best-effort currency / supersession extraction from raw page HTML.
+
+    Returns ``CurrencyInfo()`` (all None) on empty input or when no markers
+    are present. Each field is filled independently — see ``CurrencyInfo``.
+    """
+    if not html or not html.strip():
+        return CurrencyInfo()
+    text = _container_text_for_currency(html)
+    if not text:
+        return CurrencyInfo()
+
+    withdrawn_date: str | None = None
+    superseded_by: str | None = None
+    replaces: str | None = None
+
+    withdrawn_date = _extract_self_withdrawn_date(text)
+
+    if withdrawn_date is None:
+        # Fall back to the timeline table if the prose form didn't fire.
+        withdrawn_date = _date_from_history_table(html)
+
+    superseded_by = _extract_self_withdrawn_by(text)
+
+    m = _RE_SUPERSEDED_BY_PROSE.search(text)
+    if m and superseded_by is None:
+        superseded_by = _normalise_citation(m.group("cite"))
+
+    m = _RE_REPLACES_PROSE.search(text)
+    if m:
+        replaces = _normalise_citation(m.group("cite"))
+
+    return CurrencyInfo(
+        withdrawn_date=withdrawn_date,
+        superseded_by=superseded_by,
+        replaces=replaces,
+    )

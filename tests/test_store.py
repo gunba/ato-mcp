@@ -19,13 +19,23 @@ from ato_mcp.store.queries import (
 )
 
 
-def _seed_doc(conn, doc_id: str, title: str, text: str) -> int:
+def _seed_doc(
+    conn,
+    doc_id: str,
+    title: str,
+    text: str,
+    *,
+    withdrawn_date: str | None = None,
+    superseded_by: str | None = None,
+    replaces: str | None = None,
+) -> int:
     conn.execute(
         INSERT_DOCUMENT,
         (
             doc_id, "Public_rulings", title, "2024-07-01",
             "2026-04-18T00:00:00Z",
             "sha256:" + "0" * 64, "deadbeef",
+            withdrawn_date, superseded_by, replaces,
         ),
     )
     conn.execute(INSERT_TITLE_FTS, (doc_id, title, ""))
@@ -43,9 +53,18 @@ def test_schema_inserts_and_queries(tmp_path: Path) -> None:
               "Research and development activities definition.")
     _seed_doc(conn, "TXR/TR9725/NAT/ATO/00001", "TR 97/25 — Capital works deductions",
               "Division 43 applies to buildings.")
+    # W2.2 currency columns should accept values and round-trip.
+    _seed_doc(
+        conn,
+        "TXR/TR20221/NAT/ATO/00001",
+        "TR 2022/1 — withdrawn",
+        "Effective life of depreciating assets.",
+        withdrawn_date="2025-10-31",
+        superseded_by="TR 2025/1",
+    )
 
     docs = conn.execute("SELECT COUNT(*) AS n FROM documents").fetchone()["n"]
-    assert docs == 2
+    assert docs == 3
 
     rows = conn.execute(
         "SELECT doc_id FROM title_fts WHERE title_fts MATCH ?",
@@ -59,5 +78,48 @@ def test_schema_inserts_and_queries(tmp_path: Path) -> None:
     ).fetchall()
     assert len(rows) == 1
 
+    # Currency columns round-trip.
+    row = conn.execute(
+        "SELECT withdrawn_date, superseded_by, replaces FROM documents WHERE doc_id = ?",
+        ("TXR/TR20221/NAT/ATO/00001",),
+    ).fetchone()
+    assert row["withdrawn_date"] == "2025-10-31"
+    assert row["superseded_by"] == "TR 2025/1"
+    assert row["replaces"] is None
+
+    # And rulings without markers stay NULL.
+    row = conn.execute(
+        "SELECT withdrawn_date FROM documents WHERE doc_id = ?",
+        ("TXR/TR20243/NAT/ATO/00001",),
+    ).fetchone()
+    assert row["withdrawn_date"] is None
+
     assert store_db.get_meta(conn, "schema_version") == store_db.SCHEMA_VERSION
+    assert store_db.SCHEMA_VERSION == "6"
     conn.close()
+
+
+def test_migrate_rejects_pre_v6(tmp_path: Path) -> None:
+    """W2.3: a v5 DB (missing currency columns) must be rejected with a
+    rebuild-prompt rather than silently upgraded.
+    """
+    import sqlite3
+    db_path = tmp_path / "ato.db"
+    # Build a minimal v5-shaped documents table by hand and stamp meta.
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        "CREATE TABLE documents ("
+        "doc_id TEXT PRIMARY KEY, type TEXT NOT NULL, title TEXT NOT NULL, date TEXT, "
+        "downloaded_at TEXT NOT NULL, content_hash TEXT NOT NULL, pack_sha8 TEXT NOT NULL)"
+    )
+    conn.execute("CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    conn.execute("INSERT INTO meta(key, value) VALUES ('schema_version', '5')")
+    conn.commit()
+    conn.close()
+
+    import pytest
+    with pytest.raises(RuntimeError) as excinfo:
+        store_db.init_db(db_path)
+    msg = str(excinfo.value)
+    assert "rebuild" in msg.lower() or "v6" in msg.lower(), f"expected rebuild/v6 in error, got: {msg}"

@@ -10,19 +10,44 @@ from ato_mcp.indexer.release import (
     EMBEDDINGGEMMA_HF_FINGERPRINT,
     EMBEDDINGGEMMA_HF_SIZE,
     EMBEDDINGGEMMA_HF_URL,
+    RERANKER_MODEL_CANDIDATES,
     ReleaseArgs,
     ReleaseError,
+    _resolve_reranker_info,
     publish,
     rewrite_manifest_urls,
 )
 from ato_mcp.store.manifest import (
+    DEFAULT_MIN_CLIENT_VERSION,
     DocRef,
+    MANIFEST_SCHEMA_VERSION,
     Manifest,
     ModelInfo,
     PackInfo,
     load_manifest,
     save_manifest,
 )
+
+
+def test_freshly_built_manifest_pins_min_client_version() -> None:
+    """A freshly-constructed Manifest must default `min_client_version` to
+    "0.6.0" so older binaries refuse to ingest a v3 corpus.
+
+    The Rust enforce_manifest_compatibility check compares this field to
+    `CARGO_PKG_VERSION`; without this default the gate is dormant and a
+    pre-Wave-3 binary would silently download a v3 corpus and only fail
+    AFTER the install via the schema-version DB check.
+    """
+    manifest = Manifest(
+        index_version="2026.05.03",
+        created_at="2026-05-03T00:00:00+00:00",
+        model=ModelInfo(id="m", sha256="0" * 64, size=1, url="model/m.onnx.zst"),
+    )
+    assert manifest.min_client_version == "0.6.0"
+    assert DEFAULT_MIN_CLIENT_VERSION == "0.6.0"
+    # And the manifest format version is bumped to v3 (Wave 3 boundary).
+    assert manifest.schema_version == MANIFEST_SCHEMA_VERSION
+    assert MANIFEST_SCHEMA_VERSION == 3
 
 
 def test_rewrite_manifest_urls_flattens_asset_names(tmp_path: Path) -> None:
@@ -223,3 +248,247 @@ def test_publish_rejects_github_model_url(tmp_path: Path) -> None:
                 model_url="https://github.com/gunba/ato-mcp/releases/download/index-2026.04.18/embeddinggemma-bundle.tar.zst",
             )
         )
+
+
+def _seed_release_dir(tmp_path: Path) -> tuple[Path, Path]:
+    """Set up an `out_dir` containing the minimum needed to call publish().
+
+    Returns (out_dir, manifest_path).
+    """
+    out_dir = tmp_path / "release"
+    packs_dir = out_dir / "packs"
+    packs_dir.mkdir(parents=True)
+    pack = packs_dir / "pack-deadbeef.bin.zst"
+    pack.write_bytes(b"pack")
+    manifest_path = out_dir / "manifest.json"
+    save_manifest(
+        Manifest(
+            index_version="2026.05.03",
+            created_at="2026-05-03T00:00:00+00:00",
+            model=ModelInfo(
+                id="embeddinggemma-300m-int8-256d",
+                sha256="",
+                size=0,
+                url="model/embeddinggemma-300m-int8-256d.onnx.zst",
+            ),
+            documents=[],
+            packs=[PackInfo(sha8="deadbeef", sha256="0" * 64, size=4, url=str(pack))],
+        ),
+        manifest_path,
+    )
+    return out_dir, manifest_path
+
+
+def test_release_cli_accepts_reranker_bundle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Passing `--reranker-bundle` populates the manifest's `reranker` field
+    with a sha256/size derived from the bundle's `model_quantized.onnx`.
+
+    The bundle itself is NOT uploaded to GitHub (only its fingerprint goes
+    into the manifest), and the reranker URL records the external HF mirror
+    the Rust runtime fetches from.
+    """
+    out_dir, manifest_path = _seed_release_dir(tmp_path)
+
+    bundle = tmp_path / "reranker_bundle"
+    bundle.mkdir()
+    onnx_bytes = b"ONNX" + b"\x00" * 1024
+    (bundle / "model_quantized.onnx").write_bytes(onnx_bytes)
+    (bundle / "tokenizer.json").write_text('{"tok":"json"}')
+    (bundle / "config.json").write_text('{"model_type":"bert"}')
+
+    commands: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):  # type: ignore[no-untyped-def]
+        commands.append([str(part) for part in cmd])
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    publish(
+        ReleaseArgs(
+            out_dir=out_dir,
+            tag="index-2026.05.03",
+            repo="gunba/ato-mcp",
+            reranker_bundle=bundle,
+            reranker_url="hf://cross-encoder/ms-marco-MiniLM-L-6-v2-onnx-int8@deadbeef",
+            overwrite=True,
+        )
+    )
+
+    out = load_manifest(manifest_path)
+    assert out.reranker is not None
+    # Bundle sha256 + size were computed from model_quantized.onnx.
+    import hashlib as _hashlib
+    expected_sha = _hashlib.sha256(onnx_bytes).hexdigest()
+    assert out.reranker.sha256 == expected_sha
+    assert out.reranker.size == len(onnx_bytes)
+    assert out.reranker.url == "hf://cross-encoder/ms-marco-MiniLM-L-6-v2-onnx-int8@deadbeef"
+    assert out.reranker.id == "ms-marco-minilm-l6-v2-int8"
+
+    # Bundle bytes never make it to gh upload — the Rust runtime fetches
+    # them from the HF URL on first use.
+    upload = next(cmd for cmd in commands if "upload" in cmd)
+    joined = " ".join(upload)
+    assert "model_quantized.onnx" not in joined
+    assert "reranker_bundle" not in joined
+
+
+def test_release_cli_without_reranker_leaves_field_none(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A release without any --reranker-* flag publishes a manifest whose
+    `reranker` is None — the runtime falls back to the un-reranked hybrid
+    score in that case."""
+    out_dir, manifest_path = _seed_release_dir(tmp_path)
+
+    def fake_run(cmd, **kwargs):  # type: ignore[no-untyped-def]
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    publish(
+        ReleaseArgs(
+            out_dir=out_dir,
+            tag="index-2026.05.03",
+            repo="gunba/ato-mcp",
+            overwrite=True,
+        )
+    )
+
+    out = load_manifest(manifest_path)
+    assert out.reranker is None
+
+
+def test_release_cli_rejects_github_reranker_url(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reranker URLs hosted on GitHub Releases are rejected — Wave 3 pins
+    the reranker source to Hugging Face the same way EmbeddingGemma is
+    pinned."""
+    out_dir, _ = _seed_release_dir(tmp_path)
+
+    bundle = tmp_path / "reranker_bundle"
+    bundle.mkdir()
+    (bundle / "model_quantized.onnx").write_bytes(b"ONNX")
+
+    def fake_run(cmd, **kwargs):  # type: ignore[no-untyped-def]
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(ReleaseError, match="must not be hosted on GitHub"):
+        publish(
+            ReleaseArgs(
+                out_dir=out_dir,
+                tag="index-2026.05.03",
+                repo="gunba/ato-mcp",
+                reranker_bundle=bundle,
+                reranker_url="https://github.com/gunba/ato-mcp/releases/download/x/reranker.onnx",
+            )
+        )
+
+
+# ----- C2: filename-fallback matrix --------------------------------------
+#
+# Background: Python computes the manifest sha against `model_quantized.onnx`.
+# Rust originally only tried `onnx/model.onnx` and `model.onnx` on HF — meaning
+# the maintainer had to either rename the file at upload time or the runtime
+# would fail sha verification. C2 widens the candidate list on both sides.
+#
+# These tests pin both halves of the contract:
+#   - the Python helper picks whichever filename is in the bundle
+#   - the candidate list is shared with Rust via RERANKER_MODEL_CANDIDATES
+#     (Rust mirrors the same order in `install_hf_reranker`)
+
+
+@pytest.mark.parametrize("filename", list(RERANKER_MODEL_CANDIDATES))
+def test_resolve_reranker_info_finds_each_candidate_filename(
+    tmp_path: Path,
+    filename: str,
+) -> None:
+    """The Python helper computes sha against whichever recognised ONNX
+    filename actually exists in the bundle. Critically: the resulting
+    sha256 must match the file the Rust runtime will end up downloading
+    when it walks the same candidate list — otherwise the first-time
+    install breaks for every user."""
+    import hashlib as _hashlib
+
+    bundle = tmp_path / "bundle"
+    (bundle / Path(filename).parent).mkdir(parents=True, exist_ok=True)
+    onnx_bytes = b"ONNX-" + filename.encode() + b"-payload"
+    onnx_file = bundle / filename
+    onnx_file.write_bytes(onnx_bytes)
+    # Tokenizer is part of the C4 path; populate it so the auto-derived
+    # sha lights up in the same call.
+    tokenizer_bytes = b'{"tok":"json"}'
+    (bundle / "tokenizer.json").write_bytes(tokenizer_bytes)
+
+    args = ReleaseArgs(
+        out_dir=tmp_path / "out",
+        tag="index-test",
+        reranker_bundle=bundle,
+        reranker_url="hf://test/test@abc",
+    )
+    info = _resolve_reranker_info(args, current_reranker=None)
+    assert info is not None
+    expected_sha = _hashlib.sha256(onnx_bytes).hexdigest()
+    assert info.sha256 == expected_sha, (
+        f"helper hashed wrong file for filename={filename}: "
+        f"expected sha256 of {filename}, got {info.sha256}"
+    )
+    assert info.size == len(onnx_bytes)
+    # C4: tokenizer sha auto-populates from the bundle.
+    assert info.tokenizer_sha256 == _hashlib.sha256(tokenizer_bytes).hexdigest()
+
+
+def test_resolve_reranker_info_rejects_bundle_without_recognised_onnx(
+    tmp_path: Path,
+) -> None:
+    """A bundle that contains no recognised ONNX filename surfaces a clear
+    error rather than silently producing a manifest the Rust runtime will
+    later fail to install."""
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    (bundle / "tokenizer.json").write_bytes(b"{}")
+    (bundle / "config.json").write_bytes(b"{}")
+
+    args = ReleaseArgs(
+        out_dir=tmp_path / "out",
+        tag="index-test",
+        reranker_bundle=bundle,
+        reranker_url="hf://test/test@abc",
+    )
+    with pytest.raises(ReleaseError, match="missing a recognised ONNX model"):
+        _resolve_reranker_info(args, current_reranker=None)
+
+
+def test_resolve_reranker_info_threads_explicit_tokenizer_sha(
+    tmp_path: Path,
+) -> None:
+    """`--reranker-tokenizer-sha256` overrides the auto-derived value."""
+    import hashlib as _hashlib
+
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    (bundle / "model_quantized.onnx").write_bytes(b"ONNX")
+    (bundle / "tokenizer.json").write_bytes(b'{"tok":"json"}')
+
+    explicit = "f" * 64
+    args = ReleaseArgs(
+        out_dir=tmp_path / "out",
+        tag="index-test",
+        reranker_bundle=bundle,
+        reranker_url="hf://test/test@abc",
+        reranker_tokenizer_sha256=explicit,
+    )
+    info = _resolve_reranker_info(args, current_reranker=None)
+    assert info is not None
+    # Explicit override wins over the bundle's tokenizer.json.
+    assert info.tokenizer_sha256 == explicit
+    # And the model sha still hashes the bundle's onnx.
+    assert info.sha256 == _hashlib.sha256(b"ONNX").hexdigest()

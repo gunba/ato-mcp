@@ -17,6 +17,16 @@ import pytest
 ATO_PAGES = Path(os.environ.get("ATO_MCP_TEST_PAGES_DIR", "ato_pages"))
 
 
+def test_embedding_input_includes_heading_between_title_and_text() -> None:
+    from ato_mcp.indexer.build import _embedding_input
+
+    assert (
+        _embedding_input("Example title", "Section 8-1 > Reasons", "Body text")
+        == "Example title\nSection 8-1 > Reasons\nBody text"
+    )
+    assert _embedding_input("", "", "Body text") == "Body text"
+
+
 @pytest.fixture()
 def sample_pages_dir(tmp_path: Path) -> Path:
     if not (ATO_PAGES / "index.jsonl").exists():
@@ -53,13 +63,17 @@ def test_build_small_index(sample_pages_dir: Path, tmp_path: Path, monkeypatch) 
     import ato_mcp.indexer.build as build_module
     from ato_mcp.store import db as store_db
 
+    captured_texts: list[str] = []
+
     class StubModel:
         def __init__(self, *a, **kw) -> None:
             pass
 
         def encode(self, texts, *, is_query, batch_size: int = 16):
             from ato_mcp.embed.model import EncodedBatch
-            n = len(list(texts))
+            texts_list = list(texts)
+            captured_texts.extend(texts_list)
+            n = len(texts_list)
             return EncodedBatch(
                 vectors_int8=np.zeros((n, store_db.EMBEDDING_DIM), dtype=np.int8),
                 tokens_seen=0,
@@ -93,5 +107,41 @@ def test_build_small_index(sample_pages_dir: Path, tmp_path: Path, monkeypatch) 
         assert row["n"] == len(manifest.documents)
         row = conn.execute("SELECT COUNT(*) AS n FROM chunks").fetchone()
         assert row["n"] >= 0
+
+        # W2.1: the embedder must receive title + heading_path + text, not
+        # bare chunk text. We inspect at least one captured input string and
+        # check that it carries the document title (which is also stored in
+        # documents.title) somewhere in its prefix.
+        if captured_texts:
+            titles = {row[0] for row in conn.execute("SELECT title FROM documents").fetchall()}
+            hits = sum(
+                1
+                for txt in captured_texts
+                for title in titles
+                if title and txt.startswith(title)
+            )
+            assert hits > 0, (
+                "expected at least one embedder input to start with a stored document title; "
+                f"first 3 captured: {captured_texts[:3]!r}"
+            )
+            headed_rows = conn.execute(
+                """
+                SELECT d.title, c.heading_path, c.text
+                FROM chunks c
+                JOIN documents d ON d.doc_id = c.doc_id
+                WHERE c.heading_path <> ''
+                LIMIT 20
+                """
+            ).fetchall()
+            if headed_rows:
+                expected = {
+                    build_module._embedding_input(row["title"], row["heading_path"], row["text"])
+                    for row in headed_rows
+                }
+                assert expected.intersection(captured_texts), (
+                    "expected at least one embedder input to exactly preserve "
+                    "title\\nheading_path\\ntext; "
+                    f"expected sample: {list(expected)[:1]!r}, first 3 captured: {captured_texts[:3]!r}"
+                )
     finally:
         conn.close()

@@ -1,6 +1,7 @@
--- ato-mcp SQLite schema v5
--- Minimal field set: doc_id PK, type, title, date + 3 build-time columns.
--- [SL-01] Pre-v5 DBs are rejected with a migration prompt rather than transparently upgraded — schema is intentionally narrow.
+-- ato-mcp SQLite schema v6
+-- Minimal field set: doc_id PK, type, title, date + 3 build-time columns +
+-- 3 currency columns (W2.2) — withdrawn_date, superseded_by, replaces.
+-- [SL-01] Pre-v6 DBs are rejected with a migration prompt rather than transparently upgraded — schema is intentionally narrow.
 --
 -- Design notes:
 --   doc_id   The full ATO docid path, slashes included. The canonical URL
@@ -14,23 +15,34 @@
 --            engine produces this; title_fts searches it directly.
 --   date     Best-guess publication date (ISO yyyy-mm-dd). Used only for
 --            filters and recency sort — not presented as authoritative.
+--   withdrawn_date   ISO yyyy-mm-dd when the doc indicates withdrawal /
+--                    supersession. NULL means the doc is currently in
+--                    force. Default search excludes non-NULL rows; pass
+--                    `current_only=false` to include them.
+--   superseded_by    Short citation of the replacing doc (e.g. "TR 2022/1").
+--   replaces         Short citation of the doc this one replaces.
 
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
 PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS documents (
-    doc_id         TEXT PRIMARY KEY,
-    type           TEXT NOT NULL,
-    title          TEXT NOT NULL,
-    date           TEXT,
+    doc_id           TEXT PRIMARY KEY,
+    type             TEXT NOT NULL,
+    title            TEXT NOT NULL,
+    date             TEXT,
     -- build-time internals, never exposed via tools:
-    downloaded_at  TEXT NOT NULL,
-    content_hash   TEXT NOT NULL,
-    pack_sha8      TEXT NOT NULL
+    downloaded_at    TEXT NOT NULL,
+    content_hash     TEXT NOT NULL,
+    pack_sha8        TEXT NOT NULL,
+    -- currency markers (W2.2):
+    withdrawn_date   TEXT,
+    superseded_by    TEXT,
+    replaces         TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_doc_type ON documents(type);
 CREATE INDEX IF NOT EXISTS idx_doc_date ON documents(date);
+CREATE INDEX IF NOT EXISTS idx_doc_withdrawn ON documents(withdrawn_date);
 
 -- Chunks: text is zstd-compressed UTF-8.
 -- [SL-03] chunks.text is zstd-compressed UTF-8 BLOB; heading_path uses ' › ' (U+203A) separator; empty-string == intro chunk.

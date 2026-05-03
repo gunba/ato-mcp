@@ -81,6 +81,21 @@ class BuildArgs:
     model_url: str | None = None
     model_sha256: str | None = None
     model_size: int | None = None
+    # Optional reranker bundle metadata. When all four are set, the build
+    # writes a `reranker: ModelInfo` field into the manifest so the Rust
+    # runtime knows where to fetch the cross-encoder ONNX + tokenizer from.
+    # Leave None to publish a manifest without a reranker entry; the runtime
+    # falls back to the un-reranked hybrid score in that case.
+    reranker_id: str | None = None
+    reranker_url: str | None = None
+    reranker_sha256: str | None = None
+    reranker_size: int | None = None
+    # C4: optional sha256 of the reranker tokenizer file. Threaded from the
+    # release CLI when known; embedded into the manifest's
+    # ``reranker.tokenizer_sha256`` so the Rust runtime can verify the
+    # downloaded ``tokenizer.json`` byte-for-byte. Older v3 manifests omit
+    # this field; the runtime degrades to a one-line warning.
+    reranker_tokenizer_sha256: str | None = None
     previous_manifest: Path | None = None
     limit: int | None = None  # optional cap for testing
     embedder: Literal["embeddinggemma"] = "embeddinggemma"
@@ -114,6 +129,10 @@ class PreparedDoc:
     headings_text: str
     anchors: list[tuple[str, str]]
     chunks: list[PreparedChunk]
+    # W2.2 currency markers — None when the source page carries no marker.
+    withdrawn_date: str | None = None
+    superseded_by: str | None = None
+    replaces: str | None = None
 
 
 @dataclass
@@ -122,6 +141,11 @@ class EmptyShell:
 
 
 Prepared = PreparedDoc | EmptyShell | None
+
+
+def _embedding_input(title: str, heading_path: str, text: str) -> str:
+    """Compose the passage sent to EmbeddingGemma for a chunk."""
+    return f"{title}\n{heading_path}\n{text}".strip()
 
 
 @dataclass
@@ -202,7 +226,11 @@ def _build_fresh_windowed(args: BuildArgs) -> Manifest:
             doc_chunk_ranges: list[tuple[PreparedDoc, int, int]] = []
             for doc in docs:
                 start = len(texts)
-                texts.extend(c.text for c in doc.chunks)
+                # [W2.1] Embedder input prefixes title + heading_path. Lifts
+                # recall on legal text by giving the model the structural
+                # context EmbeddingGemma was pretrained against. Token budget
+                # (MAX_TOKENS=1024) accommodates the prefix on every chunk.
+                texts.extend(_embedding_input(doc.title, c.heading_path, c.text) for c in doc.chunks)
                 doc_chunk_ranges.append((doc, start, len(texts)))
             chunks_count += len(texts)
 
@@ -267,6 +295,7 @@ def _build_fresh_windowed(args: BuildArgs) -> Manifest:
             size=args.model_size or 0,
             url=args.model_url or f"model/{model_id}.onnx.zst",
         ),
+        reranker=_reranker_model_info(args),
         documents=doc_refs_final,
         packs=packs,
     )
@@ -287,6 +316,7 @@ def _build_fresh_windowed(args: BuildArgs) -> Manifest:
         timings.manifest,
         tokens_seen,
     )
+    _log_currency_summary(conn)
     return manifest
 
 
@@ -369,6 +399,7 @@ def build(args: BuildArgs) -> Manifest:
             markdown = ""
             headings: list[str] = []
             anchors: list[tuple[str, str]] = []
+            html: str | None = None
             if has_content and rec.get("payload_path"):
                 payload_path = args.pages_dir / rec["payload_path"]
                 if payload_path.exists():
@@ -446,18 +477,23 @@ def build(args: BuildArgs) -> Manifest:
                 chunk_mod.chunk_markdown(markdown, root_title=title) if has_content and markdown else []
             )
             if chunks:
-                texts = [c.text for c in chunks]
+                # [W2.1] Heading-aware embedder input — see fresh-build path.
+                texts = [_embedding_input(title, c.heading_path, c.text) for c in chunks]
                 encoded = model.encode(texts, is_query=False, batch_size=args.encode_batch_size)
                 vectors_i8 = encoded.vectors_int8
             else:
                 vectors_i8 = np.empty((0, store_db.EMBEDDING_DIM), dtype=np.int8)
 
-            # Insert document row — v5 columns only.
+            # Insert document row — v6 columns include currency markers (W2.2).
+            currency = extract_mod.extract_currency(html or "")
             conn.execute(
                 INSERT_DOCUMENT,
                 (
                     doc_id, category, derived_title, derived_date,
                     downloaded_at, ch, "PENDING",  # pack_sha8 backfilled below
+                    currency.withdrawn_date,
+                    currency.superseded_by,
+                    currency.replaces,
                 ),
             )
             conn.execute(
@@ -483,6 +519,12 @@ def build(args: BuildArgs) -> Manifest:
                 "downloaded_at": downloaded_at,
                 "content_hash": ch,
                 "anchors": anchors,
+                # W2.2 currency markers are persisted into the pack record so a
+                # later incremental build that reuses this doc can replay the
+                # withdrawn/superseded state without re-extracting from HTML.
+                "withdrawn_date": currency.withdrawn_date,
+                "superseded_by": currency.superseded_by,
+                "replaces": currency.replaces,
                 "chunks": [
                     {
                         "ord": c.ord,
@@ -550,6 +592,7 @@ def build(args: BuildArgs) -> Manifest:
             size=args.model_size or 0,
             url=args.model_url or f"model/{args.model_id}.onnx.zst",
         ),
+        reranker=_reranker_model_info(args),
         documents=doc_refs_final,
         packs=new_packs,
     )
@@ -559,6 +602,7 @@ def build(args: BuildArgs) -> Manifest:
         "Indexed %d docs this session (%d reused); manifest has %d total in %.1fs",
         processed, reused, len(doc_refs_final), dt,
     )
+    _log_currency_summary(conn)
     return manifest
 
 
@@ -604,6 +648,48 @@ def _effective_model_id(args: BuildArgs) -> str:
     return args.model_id
 
 
+def _reranker_model_info(args: BuildArgs) -> ModelInfo | None:
+    """Build the manifest's optional ``reranker`` field from BuildArgs.
+
+    Returns ``None`` unless an explicit reranker id + URL were threaded
+    through. The release CLI is responsible for populating these from a
+    bundle directory or for forwarding them from upstream maintainer
+    flags. A build that doesn't pass them yields ``reranker = None``,
+    which the Rust runtime treats as "no reranker available, fall back
+    to the un-reranked hybrid score".
+    """
+    provided = [
+        args.reranker_id,
+        args.reranker_url,
+        args.reranker_sha256,
+        args.reranker_size,
+        args.reranker_tokenizer_sha256,
+    ]
+    if not any(value for value in provided):
+        return None
+    missing = []
+    if not args.reranker_id:
+        missing.append("reranker_id")
+    if not args.reranker_url:
+        missing.append("reranker_url")
+    if not args.reranker_sha256:
+        missing.append("reranker_sha256")
+    if not args.reranker_size:
+        missing.append("reranker_size")
+    if missing:
+        raise ValueError(
+            "reranker manifest requires id, url, sha256, and size; missing "
+            + ", ".join(missing)
+        )
+    return ModelInfo(
+        id=args.reranker_id,
+        sha256=args.reranker_sha256,
+        size=args.reranker_size,
+        url=args.reranker_url,
+        tokenizer_sha256=args.reranker_tokenizer_sha256,
+    )
+
+
 def _apply_unsafe_fast_sqlite_pragmas(conn) -> None:
     conn.execute("PRAGMA journal_mode = OFF")
     conn.execute("PRAGMA synchronous = OFF")
@@ -639,6 +725,7 @@ def _prepare_one(item: tuple[Path, dict]) -> Prepared:
     headings: list[str] = []
     anchors: list[tuple[str, str]] = []
     title: str | None = None
+    html: str | None = None
 
     if has_content and rec.get("payload_path"):
         payload_path = pages_dir / rec["payload_path"]
@@ -684,6 +771,10 @@ def _prepare_one(item: tuple[Path, dict]) -> Prepared:
         PreparedChunk(c.ord, c.heading_path, c.anchor, c.text)
         for c in chunk_mod.chunk_markdown(markdown, root_title=title)
     ]
+    # W2.2: extract currency markers from the source HTML (alert panels +
+    # body prose + history table). Cheap relative to the extract+chunk pass
+    # already done; runs from the same parse if selectolax cached anything.
+    currency = extract_mod.extract_currency(html or "")
     return PreparedDoc(
         doc_id=doc_id,
         category=category,
@@ -694,6 +785,9 @@ def _prepare_one(item: tuple[Path, dict]) -> Prepared:
         headings_text=" ".join(headings),
         anchors=anchors,
         chunks=chunks,
+        withdrawn_date=currency.withdrawn_date,
+        superseded_by=currency.superseded_by,
+        replaces=currency.replaces,
     )
 
 
@@ -771,6 +865,9 @@ def _write_window(
                 doc.downloaded_at,
                 doc.content_hash,
                 "PENDING",
+                doc.withdrawn_date,
+                doc.superseded_by,
+                doc.replaces,
             )
             for doc, _start, _end in doc_chunk_ranges
         ],
@@ -824,6 +921,11 @@ def _write_window(
             "downloaded_at": doc.downloaded_at,
             "content_hash": doc.content_hash,
             "anchors": doc.anchors,
+            # W2.2 currency markers persist into the pack record so a future
+            # incremental build that reuses this doc can replay the state.
+            "withdrawn_date": doc.withdrawn_date,
+            "superseded_by": doc.superseded_by,
+            "replaces": doc.replaces,
             "chunks": record_chunks,
         }
         pack_builder.add(doc.doc_id, record)
@@ -897,6 +999,16 @@ def _insert_from_previous(
             record["downloaded_at"],
             record["content_hash"],
             prev_ref.pack_sha8,
+            # Carry forward currency markers from the prior pack record. We
+            # do NOT re-read the HTML for content-hash-stable docs, so a
+            # withdrawal-status change without a body edit will be missed
+            # until the next full rebuild. The ATO almost always changes
+            # the alert-panel HTML on withdrawal, which changes content_hash
+            # and forces a re-extract — but a body-stable withdrawal flip
+            # is theoretically possible and would silently miss here.
+            record.get("withdrawn_date"),
+            record.get("superseded_by"),
+            record.get("replaces"),
         ),
     )
     conn.execute(
@@ -1048,3 +1160,32 @@ def _scan_packs_dir(packs_dir: Path) -> list[PackInfo]:
             )
         )
     return out
+
+
+def _log_currency_summary(conn) -> None:
+    """Emit a single-line smoke test of W2.2 currency extraction.
+
+    Reports the count of documents with a non-NULL ``withdrawn_date``. Zero is
+    a red flag — either the corpus genuinely has no withdrawn rulings (likely
+    only on tiny test corpora) or the extractor selectors broke. Either way,
+    the maintainer wants to see this before publishing.
+    """
+    try:
+        withdrawn, superseded, replaces = conn.execute(
+            "SELECT "
+            "COUNT(*) FILTER (WHERE withdrawn_date IS NOT NULL), "
+            "COUNT(*) FILTER (WHERE superseded_by IS NOT NULL), "
+            "COUNT(*) FILTER (WHERE replaces IS NOT NULL) "
+            "FROM documents"
+        ).fetchone()
+    except Exception:
+        # Older DB or fresh-build race — the docs table always exists by now,
+        # but defensively no-op rather than failing the build for telemetry.
+        return
+    LOGGER.info(
+        "currency metadata: %d documents have withdrawn_date set "
+        "(superseded_by=%d, replaces=%d)",
+        withdrawn,
+        superseded,
+        replaces,
+    )

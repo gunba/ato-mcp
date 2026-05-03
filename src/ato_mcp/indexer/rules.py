@@ -98,6 +98,12 @@ class DerivedMetadata:
     and recency sort. Authoritative-looking but not authoritative — we
     surface whatever we could derive, in waterfall order:
     precise body date → scraped ``pub_date`` → year-from-docid.
+
+    Currency markers (W2.2: ``withdrawn_date`` / ``superseded_by`` /
+    ``replaces``) live on the HTML-side ``CurrencyInfo`` rather than here —
+    the rule pipeline doesn't see the raw HTML, and threading them through
+    the rule layer would just mean a no-op pass-through. The build code
+    plumbs ``CurrencyInfo`` directly into the document row.
     """
     title: str | None = None
     date: str | None = None

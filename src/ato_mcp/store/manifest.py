@@ -9,12 +9,26 @@ import hashlib
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import orjson
 from pydantic import BaseModel, Field
 
-MANIFEST_SCHEMA_VERSION = 1
+# Manifest format/schema version. Bump alongside any binary release that
+# adds NEW required fields the older binary doesn't tolerate. v3 (released
+# alongside ato-mcp 0.6.0) adds the optional `reranker: ModelInfo` field;
+# older binaries decoding a v3 manifest still parse fine (Rust's `Manifest`
+# struct uses `#[serde(default)]` on all the new fields), but their separate
+# `schema_version > MAX_SUPPORTED_SCHEMA_VERSION` check catches them earlier.
+MANIFEST_SCHEMA_VERSION = 3
+
+# Default `min_client_version` for newly-built manifests. The Rust binary
+# rejects any manifest whose `min_client_version` is greater than
+# `CARGO_PKG_VERSION`, so this is the actual gate that prevents an older
+# binary from ingesting a newer corpus. Bump in lockstep with binary
+# releases that introduce schema or model changes (Wave 3: 0.6.0 introduces
+# the optional cross-encoder reranker bundle).
+DEFAULT_MIN_CLIENT_VERSION = "0.6.0"
 
 
 class ModelInfo(BaseModel):
@@ -22,6 +36,13 @@ class ModelInfo(BaseModel):
     sha256: str
     size: int
     url: str
+    # C4: optional sha256 of the companion `tokenizer.json`. The Rust HF
+    # download path uses this to harden tokenizer.json to the same
+    # checksum-pinned standard the model file enjoys. Optional for
+    # back-compat: v3 manifests built before this field landed (and the
+    # tar.zst bundle path that hashes the whole archive) leave it as
+    # ``None`` and the runtime logs a one-line warning rather than failing.
+    tokenizer_sha256: str | None = None
 
 
 class DocRef(BaseModel):
@@ -48,8 +69,14 @@ class Manifest(BaseModel):
     schema_version: int = MANIFEST_SCHEMA_VERSION
     index_version: str
     created_at: str
-    min_client_version: str = "0.1.0"
+    min_client_version: str = DEFAULT_MIN_CLIENT_VERSION
     model: ModelInfo
+    # Optional cross-encoder reranker bundle. Wave 3 (0.6.0) introduces a
+    # local int8 ONNX reranker (cross-encoder/ms-marco-MiniLM-L-6-v2) that
+    # the Rust runtime applies to top-N hybrid candidates. The field is
+    # optional: a release built without ``--reranker-bundle`` leaves it as
+    # ``None`` and the runtime falls back to the un-reranked hybrid score.
+    reranker: Optional[ModelInfo] = None
     documents: list[DocRef] = Field(default_factory=list)
     packs: list[PackInfo] = Field(default_factory=list)
 
