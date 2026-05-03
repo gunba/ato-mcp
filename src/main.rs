@@ -54,9 +54,10 @@ const SUPPORTED_SCHEMA_VERSION: u32 = 6;
 /// bumps that older binaries can't decode.
 const MAX_SUPPORTED_MANIFEST_VERSION: u32 = 3;
 /// Maximum number of RRF top-N candidates we feed into the cross-encoder
-/// reranker per query. Reranking is O(N) ONNX inference; 50 keeps p99
-/// latency bounded on CPU even with a quantized cross-encoder.
-const RERANK_CANDIDATE_LIMIT: usize = 50;
+/// reranker per query. Reranking is O(N) ONNX inference; the quantized
+/// ModernBERT cross-encoder is still CPU-expensive, so keep the rerank
+/// head tight and let the RRF tail preserve recall for paging.
+const RERANK_CANDIDATE_LIMIT: usize = 24;
 /// Cross-encoder query side max-token budget. We reserve the remaining
 /// tokens for the document side so a long snippet does not evict the query.
 const RERANK_QUERY_MAX_TOKENS: usize = 64;
@@ -919,6 +920,14 @@ fn dedup_per_doc(
     out
 }
 
+fn rerank_head_count(k: usize, candidate_count: usize) -> usize {
+    let desired = std::cmp::max(k.saturating_mul(5), 12);
+    std::cmp::min(
+        candidate_count,
+        std::cmp::min(RERANK_CANDIDATE_LIMIT, desired),
+    )
+}
+
 fn search(
     query: &str,
     opts: SearchOptions<'_>,
@@ -963,16 +972,15 @@ fn search(
     let candidate_count = ranked_hits.len();
     let mut provenance = rank_provenance(&vector_hits, &lexical_hits);
 
-    // Cross-encoder rerank stage. We rerank only the top
-    // RERANK_CANDIDATE_LIMIT chunks because each ONNX inference is O(N)
-    // and the marginal hit beyond ~50 is dominated by the query
-    // embedding's first-stage recall. Below-50 candidates retain their
-    // RRF order so they can still surface via `next_call` paging or
+    // Cross-encoder rerank stage. We rerank only the top head because
+    // each ONNX inference is O(N) and the marginal hit past the first
+    // few pages is dominated by first-stage recall. Tail candidates retain
+    // their RRF order so they can still surface via `next_call` paging or
     // recency sort.
     let mut reranker_used = false;
     let mut reranker_scores: HashMap<i64, f64> = HashMap::new();
     if let Some(state) = server_state.as_mut() {
-        let head_count = std::cmp::min(RERANK_CANDIDATE_LIMIT, ranked_hits.len());
+        let head_count = rerank_head_count(k, ranked_hits.len());
         if head_count > 0 {
             // Load text for the top-N candidates in one batch. We hold
             // them as `String`s because the tokenizer wants `&str`s and
@@ -5054,6 +5062,14 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].chunk_id, 2, "B should rank first");
         assert_eq!(out[1].chunk_id, 1, "A should rank second");
+    }
+
+    #[test]
+    fn rerank_head_count_bounds_cpu_work() {
+        assert_eq!(rerank_head_count(5, 86), 24);
+        assert_eq!(rerank_head_count(1, 50), 12);
+        assert_eq!(rerank_head_count(8, 10), 10);
+        assert_eq!(rerank_head_count(50, 200), RERANK_CANDIDATE_LIMIT);
     }
 
     // ----- W1.4 verify_quote -----
