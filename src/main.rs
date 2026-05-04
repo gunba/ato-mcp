@@ -2874,6 +2874,19 @@ struct ModelInfo {
     tokenizer_sha256: Option<String>,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+struct UpdateSummary {
+    schema_version: i64,
+    index_version: String,
+    #[serde(default)]
+    min_client_version: String,
+    model: ModelInfo,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reranker: Option<ModelInfo>,
+    document_count: usize,
+    pack_count: usize,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct DocRef {
     doc_id: String,
@@ -3035,8 +3048,11 @@ fn cmp_dotted_version(a: &str, b: &str) -> std::cmp::Ordering {
 
 fn apply_update_locked(manifest_url: &str) -> Result<UpdateStats> {
     // [UM-05] Delta updates mutate SQLite transactionally, verify, then write installed_manifest last.
-    let staging = staging_dir()?;
     let manifest_context = UrlContext::from_manifest_url(manifest_url);
+    if let Some(stats) = try_skip_update_from_summary(manifest_url, &manifest_context)? {
+        return Ok(stats);
+    }
+    let staging = staging_dir()?;
     let manifest_bytes = fetch_bytes(manifest_url, &manifest_context)
         .with_context(|| format!("fetching manifest from {manifest_url}"))?;
     let new_manifest: Manifest = serde_json::from_slice(&manifest_bytes)?;
@@ -3317,7 +3333,11 @@ fn insert_docs_from_packs(
 }
 
 fn semantic_backfill_required(conn: &Connection, manifest: &Manifest) -> Result<bool> {
-    if !manifest.model.id.starts_with("embeddinggemma") {
+    semantic_backfill_required_for_model(conn, &manifest.model.id)
+}
+
+fn semantic_backfill_required_for_model(conn: &Connection, model_id: &str) -> Result<bool> {
+    if !model_id.starts_with("embeddinggemma") {
         return Ok(false);
     }
     let chunks: i64 = conn.query_row("SELECT COUNT(*) FROM chunks", [], |row| row.get(0))?;
@@ -3359,6 +3379,136 @@ fn load_installed_manifest() -> Result<Option<Manifest>> {
         return Ok(None);
     }
     Ok(Some(serde_json::from_slice(&fs::read(path)?)?))
+}
+
+fn update_summary_url_for_manifest(manifest_url: &str) -> String {
+    if let Some(path) = local_path_from_urlish(manifest_url) {
+        return path.with_file_name("update.json").display().to_string();
+    }
+    manifest_url
+        .rsplit_once('/')
+        .map(|(base, _)| format!("{base}/update.json"))
+        .unwrap_or_else(|| "update.json".to_string())
+}
+
+fn try_skip_update_from_summary(
+    manifest_url: &str,
+    context: &UrlContext,
+) -> Result<Option<UpdateStats>> {
+    let Some(installed) = load_installed_manifest()? else {
+        return Ok(None);
+    };
+    let summary_url = update_summary_url_for_manifest(manifest_url);
+    let summary_bytes = match fetch_bytes(&summary_url, context) {
+        Ok(bytes) => bytes,
+        Err(_) => return Ok(None),
+    };
+    let summary: UpdateSummary = match serde_json::from_slice(&summary_bytes) {
+        Ok(summary) => summary,
+        Err(_) => return Ok(None),
+    };
+    enforce_update_summary_compatibility(&summary)?;
+    if !installed_matches_update_summary(&installed, &summary)? {
+        return Ok(None);
+    }
+    Ok(Some(UpdateStats {
+        added: 0,
+        changed: 0,
+        removed: 0,
+        bytes_downloaded: summary_bytes.len() as u64,
+    }))
+}
+
+fn enforce_update_summary_compatibility(summary: &UpdateSummary) -> Result<()> {
+    let manifest = Manifest {
+        schema_version: summary.schema_version,
+        index_version: summary.index_version.clone(),
+        created_at: String::new(),
+        min_client_version: summary.min_client_version.clone(),
+        model: summary.model.clone(),
+        reranker: summary.reranker.clone(),
+        documents: Vec::new(),
+        packs: Vec::new(),
+    };
+    enforce_manifest_compatibility(&manifest)
+}
+
+fn installed_matches_update_summary(installed: &Manifest, summary: &UpdateSummary) -> Result<bool> {
+    if installed.schema_version != summary.schema_version
+        || installed.index_version != summary.index_version
+        || installed.min_client_version != summary.min_client_version
+        || installed.documents.len() != summary.document_count
+        || installed.packs.len() != summary.pack_count
+        || !model_info_matches(&installed.model, &summary.model)
+        || !optional_model_info_matches(installed.reranker.as_ref(), summary.reranker.as_ref())
+    {
+        return Ok(false);
+    }
+
+    let db = db_path()?;
+    if !db.exists() || live_db_requires_rebuild(&db)? {
+        return Ok(false);
+    }
+    if !embedding_model_installed_matches(&summary.model)? {
+        return Ok(false);
+    }
+    if let Some(reranker) = &summary.reranker {
+        if !reranker_installed_matches(reranker)? {
+            return Ok(false);
+        }
+    }
+    let conn = open_read()?;
+    Ok(!semantic_backfill_required_for_model(
+        &conn,
+        &summary.model.id,
+    )?)
+}
+
+fn model_info_matches(left: &ModelInfo, right: &ModelInfo) -> bool {
+    left.id == right.id
+        && left.sha256 == right.sha256
+        && left.size == right.size
+        && left.url == right.url
+        && left.tokenizer_sha256 == right.tokenizer_sha256
+}
+
+fn optional_model_info_matches(left: Option<&ModelInfo>, right: Option<&ModelInfo>) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => model_info_matches(left, right),
+        _ => false,
+    }
+}
+
+fn embedding_model_marker_value(info: &ModelInfo) -> String {
+    if info.sha256.is_empty() && parse_hf_model_url(&info.url).is_some() {
+        EMBEDDINGGEMMA_HF_FINGERPRINT.to_string()
+    } else {
+        info.sha256.clone()
+    }
+}
+
+fn embedding_model_installed_matches(info: &ModelInfo) -> Result<bool> {
+    if !info.id.starts_with("embeddinggemma") {
+        return Ok(false);
+    }
+    let marker_value = embedding_model_marker_value(info);
+    let marker = live_dir()?.join(".model.sha256");
+    Ok(model_path()?.exists()
+        && tokenizer_path()?.exists()
+        && marker.exists()
+        && fs::read_to_string(marker)?.trim() == marker_value)
+}
+
+fn reranker_installed_matches(info: &ModelInfo) -> Result<bool> {
+    if info.sha256.is_empty() {
+        return Ok(false);
+    }
+    let marker = live_dir()?.join(".reranker.sha256");
+    Ok(reranker_model_path()?.exists()
+        && reranker_tokenizer_path()?.exists()
+        && marker.exists()
+        && fs::read_to_string(marker)?.trim() == info.sha256)
 }
 
 fn diff_manifests(
@@ -6420,6 +6570,70 @@ mod tests {
             assert_eq!(
                 embeddings, 1,
                 "pack embedding_b64 should populate chunk_embeddings"
+            );
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn apply_update_locked_skips_full_manifest_when_update_summary_matches() -> Result<()> {
+        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let data = tempdir()?;
+        let release = tempdir()?;
+        let release_dir = release.path();
+        let manifest_path = release_dir.join("manifest.json");
+        let model_sha = "abc123";
+        let manifest = Manifest {
+            schema_version: MAX_SUPPORTED_MANIFEST_VERSION as i64,
+            index_version: "test-summary-fast-path".to_string(),
+            created_at: "2026-05-04T00:00:00Z".to_string(),
+            min_client_version: env!("CARGO_PKG_VERSION").to_string(),
+            model: ModelInfo {
+                id: "embeddinggemma-test".to_string(),
+                sha256: model_sha.to_string(),
+                size: 5,
+                url: "model-bundle.tar.zst".to_string(),
+                tokenizer_sha256: None,
+            },
+            reranker: None,
+            documents: Vec::new(),
+            packs: Vec::new(),
+        };
+        let summary = UpdateSummary {
+            schema_version: manifest.schema_version,
+            index_version: manifest.index_version.clone(),
+            min_client_version: manifest.min_client_version.clone(),
+            model: manifest.model.clone(),
+            reranker: None,
+            document_count: 0,
+            pack_count: 0,
+        };
+        fs::write(
+            release_dir.join("update.json"),
+            serde_json::to_vec_pretty(&summary)?,
+        )?;
+
+        with_data_dir(data.path(), || -> Result<()> {
+            let conn = open_write_at(&db_path()?)?;
+            init_db(&conn)?;
+            drop(conn);
+            fs::write(
+                installed_manifest_path()?,
+                serde_json::to_vec_pretty(&manifest)?,
+            )?;
+            fs::write(live_dir()?.join("model_quantized.onnx"), b"model")?;
+            fs::write(live_dir()?.join("tokenizer.json"), br#"{"version":"1.0"}"#)?;
+            ensure_model_alias()?;
+            fs::write(live_dir()?.join(".model.sha256"), model_sha)?;
+
+            let stats = apply_update_locked(manifest_path.to_str().expect("utf-8 path"))?;
+            assert_eq!(stats.added, 0);
+            assert_eq!(stats.changed, 0);
+            assert_eq!(stats.removed, 0);
+            assert!(
+                stats.bytes_downloaded < 512,
+                "fast path should fetch only update.json, not the full manifest"
             );
             Ok(())
         })?;

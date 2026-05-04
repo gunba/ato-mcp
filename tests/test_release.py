@@ -1,6 +1,7 @@
 """Release helpers — URL rewrite only (gh CLI calls not exercised)."""
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import subprocess
 
@@ -157,9 +158,14 @@ def test_publish_uses_external_model_url_without_uploading_bundle(
     assert out.model.url == "https://models.example.internal/ato-mcp/embeddinggemma-bundle.tar.zst"
     assert len(out.model.sha256) == 64
     assert out.model.size > 0
+    summary = json.loads((out_dir / "update.json").read_text())
+    assert summary["model"]["url"] == out.model.url
+    assert summary["document_count"] == 0
+    assert "documents" not in summary
 
     upload = next(cmd for cmd in commands if "upload" in cmd)
     assert "manifest.json" in " ".join(upload)
+    assert "update.json" in " ".join(upload)
     assert "pack-deadbeef.bin.zst" in " ".join(upload)
     assert "embeddinggemma-bundle.tar.zst" not in " ".join(upload)
 
@@ -213,6 +219,7 @@ def test_publish_defaults_to_pinned_huggingface_model_source(
 
     upload = next(cmd for cmd in commands if "upload" in cmd)
     assert "manifest.json" in " ".join(upload)
+    assert "update.json" in " ".join(upload)
     assert "pack-deadbeef.bin.zst" in " ".join(upload)
     assert "embeddinggemma-bundle.tar.zst" not in " ".join(upload)
 
@@ -332,6 +339,7 @@ def test_release_cli_accepts_reranker_bundle(
     # them from the HF URL on first use.
     upload = next(cmd for cmd in commands if "upload" in cmd)
     joined = " ".join(upload)
+    assert "update.json" in joined
     assert "model_quantized.onnx" not in joined
     assert "reranker_bundle" not in joined
 

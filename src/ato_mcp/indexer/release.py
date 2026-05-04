@@ -23,7 +23,7 @@ from pathlib import Path
 
 import zstandard as zstd
 
-from ..store.manifest import ModelInfo, load_manifest, save_manifest
+from ..store.manifest import ModelInfo, load_manifest, save_manifest, save_update_summary
 from ..util.log import get_logger
 
 LOGGER = get_logger(__name__)
@@ -391,8 +391,11 @@ def publish(args: ReleaseArgs) -> None:
         save_manifest(current, manifest)
 
     rewrite_manifest_urls(manifest, repo, args.tag)
+    current = load_manifest(manifest)
+    summary = args.out_dir / "update.json"
+    save_update_summary(current, summary)
 
-    artifacts: list[Path] = [manifest, *pack_files]
+    artifacts: list[Path] = [manifest, summary, *pack_files]
     if args.sign_key:
         sig = sign_manifest(manifest, args.sign_key)
         artifacts.insert(1, sig)

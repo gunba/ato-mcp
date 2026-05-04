@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # One-shot corpus publication. Binary assets are built by
 # .github/workflows/release-binaries.yml; this script uploads the corpus
-# manifest and packs. Offline bundles are built explicitly
+# manifest, update summary, and packs. Offline bundles are built explicitly
 # with scripts/make-offline-bundle.sh for air-gapped installs; publishing
 # them by default duplicates the pack assets.
 #
@@ -54,7 +54,7 @@ if [ -n "$RERANKER_TOKENIZER_SHA256" ]; then
   RERANKER_ARGS+=(--reranker-tokenizer-sha256 "$RERANKER_TOKENIZER_SHA256")
 fi
 
-echo "=> uploading manifest and packs"
+echo "=> uploading manifest, update summary, and packs"
 "$VENV/bin/ato-mcp" release \
   --out-dir   "$RELEASE_DIR" \
   --tag       "$TAG" \

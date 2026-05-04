@@ -129,7 +129,10 @@ ato-mcp update
 ato-mcp doctor
 ```
 
-The update path diffs the installed manifest against the new manifest,
+The update path first checks the small `update.json` release summary. If the
+installed corpus, schema, model, and reranker already match, it exits without
+downloading the full manifest. When an update is needed, it downloads
+`manifest.json`, diffs the installed manifest against the new manifest,
 downloads only changed pack assets, mutates SQLite in one transaction, and
 writes `installed_manifest.json` last. If an update fails, the previous
 database snapshot is retained:

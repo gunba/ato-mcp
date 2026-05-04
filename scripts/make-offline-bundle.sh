@@ -95,6 +95,18 @@ manifest["model"]["sha256"] = sha256(model_bundle)
 manifest["model"]["size"] = model_bundle.stat().st_size
 
 manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+summary = {
+    "schema_version": manifest["schema_version"],
+    "index_version": manifest["index_version"],
+    "min_client_version": manifest.get("min_client_version", ""),
+    "model": manifest["model"],
+    "reranker": manifest.get("reranker"),
+    "document_count": len(manifest.get("documents", [])),
+    "pack_count": len(manifest.get("packs", [])),
+}
+(manifest_path.parent / "update.json").write_text(
+    json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8"
+)
 PY
 
 ATO_MCP_DATA_DIR="$DATA_DIR" "$BIN" init --manifest-url "$MIRROR/manifest.json"

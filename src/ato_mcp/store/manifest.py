@@ -90,12 +90,41 @@ class Manifest(BaseModel):
         return orjson.dumps(self.model_dump(), option=orjson.OPT_SORT_KEYS | orjson.OPT_INDENT_2)
 
 
+class UpdateSummary(BaseModel):
+    schema_version: int
+    index_version: str
+    min_client_version: str
+    model: ModelInfo
+    reranker: Optional[ModelInfo] = None
+    document_count: int
+    pack_count: int
+
+    def to_bytes(self) -> bytes:
+        return orjson.dumps(self.model_dump(), option=orjson.OPT_SORT_KEYS | orjson.OPT_INDENT_2)
+
+
+def update_summary_from_manifest(manifest: Manifest) -> UpdateSummary:
+    return UpdateSummary(
+        schema_version=manifest.schema_version,
+        index_version=manifest.index_version,
+        min_client_version=manifest.min_client_version,
+        model=manifest.model,
+        reranker=manifest.reranker,
+        document_count=len(manifest.documents),
+        pack_count=len(manifest.packs),
+    )
+
+
 def load_manifest(path: Path) -> Manifest:
     return Manifest.model_validate_json(Path(path).read_bytes())
 
 
 def save_manifest(manifest: Manifest, path: Path) -> None:
     Path(path).write_bytes(manifest.to_bytes())
+
+
+def save_update_summary(manifest: Manifest, path: Path) -> None:
+    Path(path).write_bytes(update_summary_from_manifest(manifest).to_bytes())
 
 
 def sha256_file(path: Path, chunk_size: int = 1 << 20) -> str:

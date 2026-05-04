@@ -31,7 +31,14 @@ import zstandard as zstd
 
 from ..embed.model import EmbeddingModel, vec_to_bytes
 from ..store import db as store_db
-from ..store.manifest import DocRef, Manifest, ModelInfo, PackInfo, load_manifest
+from ..store.manifest import (
+    DocRef,
+    Manifest,
+    ModelInfo,
+    PackInfo,
+    load_manifest,
+    save_update_summary,
+)
 from ..store.queries import (
     INSERT_CHUNK,
     INSERT_CHUNK_FTS,
@@ -348,6 +355,7 @@ def _build_fresh_windowed(args: BuildArgs) -> Manifest:
         packs=packs,
     )
     (args.out_dir / "manifest.json").write_bytes(manifest.to_bytes())
+    save_update_summary(manifest, args.out_dir / "update.json")
     timings.manifest += time.monotonic() - phase
 
     total = time.monotonic() - t0
@@ -653,6 +661,7 @@ def build(args: BuildArgs) -> Manifest:
         packs=new_packs,
     )
     (args.out_dir / "manifest.json").write_bytes(manifest.to_bytes())
+    save_update_summary(manifest, args.out_dir / "update.json")
     dt = time.monotonic() - t0
     LOGGER.info(
         "Indexed %d docs this session (%d reused); manifest has %d total in %.1fs",

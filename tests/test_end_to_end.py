@@ -267,6 +267,7 @@ def test_build_small_index(sample_pages_dir: Path, tmp_path: Path, monkeypatch) 
     manifest = build_module.build(args)
 
     assert (out_dir / "manifest.json").exists()
+    assert (out_dir / "update.json").exists()
     assert len(manifest.documents) >= 1
     assert len(manifest.packs) >= 1
     assert db_path.exists()

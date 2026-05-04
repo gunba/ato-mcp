@@ -17,6 +17,8 @@ from ato_mcp.store.manifest import (
     diff_manifests,
     load_manifest,
     save_manifest,
+    save_update_summary,
+    update_summary_from_manifest,
 )
 
 
@@ -128,11 +130,42 @@ def test_manifest_without_reranker_omits_field_or_defaults_none(tmp_path: Path) 
     save_manifest(m, path)
     loaded = load_manifest(path)
     assert loaded.reranker is None
-
     raw = json.loads(path.read_text())
     # Pydantic emits null when the field is None; the Rust side decodes both
     # null and absent as no-reranker.
     assert raw.get("reranker") is None
+
+
+def test_update_summary_keeps_fast_check_fields(tmp_path: Path) -> None:
+    rer = ModelInfo(
+        id="gte-reranker-modernbert-base-quantized",
+        sha256="b" * 64,
+        size=150_871_837,
+        url="hf://Alibaba-NLP/gte-reranker-modernbert-base@abc123",
+        tokenizer_sha256="c" * 64,
+    )
+    m = Manifest(
+        index_version="2026.05.03",
+        created_at="2026-05-03T00:00:00+00:00",
+        model=ModelInfo(id="embeddinggemma", sha256="a" * 64, size=1, url="model"),
+        reranker=rer,
+        documents=[_doc("a", "h1"), _doc("b", "h2")],
+        packs=[PackInfo(sha8="deadbeef", sha256="0" * 64, size=1, url="p")],
+    )
+
+    summary = update_summary_from_manifest(m)
+    assert summary.index_version == "2026.05.03"
+    assert summary.document_count == 2
+    assert summary.pack_count == 1
+    assert summary.reranker is not None
+    assert summary.reranker.tokenizer_sha256 == "c" * 64
+
+    path = tmp_path / "update.json"
+    save_update_summary(m, path)
+    raw = json.loads(path.read_text())
+    assert "documents" not in raw
+    assert raw["document_count"] == 2
+    assert raw["reranker"]["id"] == "gte-reranker-modernbert-base-quantized"
 
 
 def test_build_reranker_manifest_requires_integrity_fields(tmp_path: Path) -> None:
