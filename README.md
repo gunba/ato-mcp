@@ -90,10 +90,11 @@ Cursor, Continue, and other stdio MCP clients use the same command:
 ato-mcp serve
 ```
 
-`serve` checks the latest published manifest and applies any available corpus
-update before starting the MCP stdio loop. If the update check fails but a
-local corpus is already installed, it serves the installed corpus and writes the
-startup warning to stderr so JSON-RPC stdout stays clean.
+`serve` starts from the installed local corpus and does not check for updates on
+the MCP hot path. This avoids stdio client spawn timeouts on slow or
+TLS-inspecting corporate networks. Use `ato-mcp update` explicitly, or opt in to
+a startup check with `ato-mcp serve --check-update` or `ATO_MCP_AUTO_UPDATE=1`.
+`ATO_MCP_OFFLINE=1` always disables startup update checks.
 
 ## Search Defaults
 
@@ -120,8 +121,8 @@ ato-mcp search "royalties withholding old cases" --include-old --types Cases
 
 ## Updates
 
-`ato-mcp serve` updates on startup. You can still update explicitly whenever
-you want to prefetch the latest published corpus or verify the install:
+Run updates explicitly whenever you want to prefetch the latest published corpus
+or verify the install:
 
 ```bash
 ato-mcp update
@@ -195,7 +196,8 @@ LD_LIBRARY_PATH="$(find .venv/lib*/python3.*/site-packages/nvidia/ -maxdepth 2 -
 Release builds use EmbeddingGemma vectors. The model is not uploaded to
 GitHub Releases; by default the manifest points at pinned Hugging Face
 EmbeddingGemma files, and the Rust client downloads and verifies them during
-`init`, `update`, or `serve`. Pass `--model-url` only for an approved mirror.
+`init`, `update`, or an opted-in `serve --check-update` startup check. Pass
+`--model-url` only for an approved mirror.
 Corpus releases must come from `build-index`; DB-derived repack scripts are not
 a supported release path. A full current corpus should use the current 64 MB
 pack target, which is about a dozen pack assets rather than dozens of small
@@ -229,6 +231,31 @@ scripts/make-offline-bundle.sh ./release/ato-mcp-offline-bundle.tar.zst
 
 CI runs both the Rust binary checks and the Python maintainer test suite.
 Release binary assets are produced by `.github/workflows/release-binaries.yml`.
+
+## Corporate Windows Builds
+
+Windows release binaries built from this repo use the Windows system TLS stack
+(`native-tls`/SChannel), so HTTPS downloads trust corporate root CAs installed
+in the OS certificate store. The Windows release zip includes `onnxruntime.dll`
+next to `ato-mcp.exe`; the Windows build uses ORT dynamic loading to reduce the
+executable footprint and avoid requiring MSVC for local source builds.
+
+For local Windows source builds, put Microsoft's `onnxruntime.dll` next to the
+built `ato-mcp.exe`, or set `ORT_DYLIB_PATH` to the DLL path before running
+`ato-mcp`.
+
+If building from source behind a TLS-inspecting proxy, Cargo may fail revocation
+checks before it can fetch dependencies. Put this in `%USERPROFILE%\.cargo\config.toml`
+when your corporate proxy blocks CRL access:
+
+```toml
+[http]
+check-revoke = false
+```
+
+Aggressive endpoint protection can still block unsigned binaries based on local
+policy. Building from source produces local-prevalence bytes, but a durable
+fleet-wide fix for published Windows artifacts requires Authenticode signing.
 
 ## License
 

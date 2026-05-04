@@ -31,12 +31,21 @@ jobs:
             asset: ato-mcp-x86_64-pc-windows-msvc.zip
             binary: target/release/ato-mcp.exe
             archive: zip
+            ort_version: 1.24.4
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - name: Build
         run: cargo build --release --locked
+      - name: Download ONNX Runtime DLL
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = "${{ matrix.ort_version }}"
+          $url = "https://github.com/microsoft/onnxruntime/releases/download/v$version/onnxruntime-win-x64-$version.zip"
+          Invoke-WebRequest -Uri $url -OutFile onnxruntime.zip
+          Expand-Archive -Path onnxruntime.zip -DestinationPath onnxruntime
       - name: Package tar
         if: matrix.archive == 'tar'
         shell: bash
@@ -51,6 +60,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Path package
           Copy-Item "${{ matrix.binary }}" package/ato-mcp.exe
+          Copy-Item "onnxruntime/onnxruntime-win-x64-${{ matrix.ort_version }}/lib/onnxruntime.dll" package/onnxruntime.dll
           Copy-Item README.md package/
           Copy-Item LICENSE package/
           Compress-Archive -Path package/* -DestinationPath "${{ matrix.asset }}"

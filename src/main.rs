@@ -94,9 +94,12 @@ struct Cli {
 enum Command {
     /// Run the MCP stdio server.
     Serve {
-        /// Serve the installed corpus without checking for updates first.
+        /// Deprecated no-op: serve skips update checks by default.
         #[arg(long)]
         no_update: bool,
+        /// Check for corpus updates before starting the MCP stdio loop.
+        #[arg(long)]
+        check_update: bool,
     },
     /// First-run install of the corpus into the local data directory.
     Init {
@@ -233,11 +236,14 @@ enum DocumentFormat {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Serve { no_update } => {
-            if no_update || env_truthy("ATO_MCP_OFFLINE") {
-                ensure_installed_db()?;
-            } else {
+        Command::Serve {
+            no_update,
+            check_update,
+        } => {
+            if serve_should_check_update(no_update, check_update) {
                 update_before_serve()?;
+            } else {
+                ensure_installed_db()?;
             }
             serve()
         }
@@ -2930,7 +2936,7 @@ fn apply_update(manifest_url: &str) -> Result<UpdateStats> {
 }
 
 fn update_before_serve() -> Result<()> {
-    // [CC-02] serve updates first, but falls back to the installed DB if update fails.
+    // [CC-02] serve only checks for updates when explicitly opted in, and falls back to the installed DB if that update fails.
     let url = default_manifest_url();
     match apply_update(&url) {
         Ok(stats) => {
@@ -2965,6 +2971,12 @@ fn env_truthy(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn serve_should_check_update(no_update: bool, check_update: bool) -> bool {
+    !no_update
+        && !env_truthy("ATO_MCP_OFFLINE")
+        && (check_update || env_truthy("ATO_MCP_AUTO_UPDATE"))
+}
+
 fn ensure_installed_db() -> Result<()> {
     if db_path()?.exists() {
         Ok(())
@@ -2977,7 +2989,7 @@ fn ensure_installed_db() -> Result<()> {
 /// how to ingest, or whose `min_client_version` is newer than the
 /// currently-running binary.
 fn enforce_manifest_compatibility(manifest: &Manifest) -> Result<()> {
-    // [CC-03] init/update/serve share manifest compatibility gates through apply_update.
+    // [CC-03] init/update and opted-in serve startup checks share manifest compatibility gates through apply_update.
     let schema_version = manifest.schema_version;
     if schema_version < 0 {
         bail!("manifest schema_version is negative ({schema_version}); manifest is malformed");
@@ -5149,6 +5161,36 @@ mod tests {
             std::env::remove_var("ATO_MCP_DATA_DIR");
         }
         result
+    }
+
+    #[test]
+    fn serve_update_check_is_opt_in() {
+        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let offline_prev = std::env::var("ATO_MCP_OFFLINE").ok();
+        let auto_prev = std::env::var("ATO_MCP_AUTO_UPDATE").ok();
+        std::env::remove_var("ATO_MCP_OFFLINE");
+        std::env::remove_var("ATO_MCP_AUTO_UPDATE");
+
+        assert!(!serve_should_check_update(false, false));
+        assert!(serve_should_check_update(false, true));
+        assert!(!serve_should_check_update(true, true));
+
+        std::env::set_var("ATO_MCP_AUTO_UPDATE", "1");
+        assert!(serve_should_check_update(false, false));
+
+        std::env::set_var("ATO_MCP_OFFLINE", "1");
+        assert!(!serve_should_check_update(false, true));
+
+        if let Some(value) = offline_prev {
+            std::env::set_var("ATO_MCP_OFFLINE", value);
+        } else {
+            std::env::remove_var("ATO_MCP_OFFLINE");
+        }
+        if let Some(value) = auto_prev {
+            std::env::set_var("ATO_MCP_AUTO_UPDATE", value);
+        } else {
+            std::env::remove_var("ATO_MCP_AUTO_UPDATE");
+        }
     }
 
     #[test]

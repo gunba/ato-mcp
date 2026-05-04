@@ -81,6 +81,30 @@ def test_compose_title_from_leading_headings() -> None:
     assert "Background" not in (doc.title or "")
 
 
+def test_extract_unwraps_source_wrapped_inline_fragments() -> None:
+    html = """
+    <div id="LawContent">
+        <p class="text-left">S 355-210(1) amended by No 15 of 2017, s 3 and Sch 4 items 61
+            <span>-</span>
+            65, by omitting
+            <span>"</span>
+            <span>or an external Territory</span>
+            <span>"</span>
+            after
+            <span>"</span>
+            <span>within Australia</span>
+            <span>"</span>
+            from para (a) and (e)(i),</p>
+    </div>
+    """
+    doc = extract(html)
+    assert (
+        'S 355-210(1) amended by No 15 of 2017, s 3 and Sch 4 items 61-65, '
+        'by omitting "or an external Territory" after "within Australia" '
+        "from para (a) and (e)(i),"
+    ) in doc.markdown
+
+
 # ---------------------------------------------------------------------------
 # W2.2 — currency / supersession extraction
 

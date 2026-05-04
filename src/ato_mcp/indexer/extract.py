@@ -209,9 +209,48 @@ def _inject_anchor_suffixes(node: Node) -> None:
 
 _MD_COLLAPSE = re.compile(r"\n{3,}")
 _MD_TRAIL_WS = re.compile(r"[ \t]+\n")
+_MD_NUMERIC_RANGE = re.compile(r"(?<=\d)\s+-\s+(?=\d)")
+_MD_SPACED_QUOTE = re.compile(r'"\s+([^"\n]*?)\s+"')
+
+
+def _is_structural_markdown_line(line: str) -> bool:
+    stripped = line.lstrip()
+    return (
+        not stripped
+        or stripped.startswith(("#", ">", "|", "```", "---"))
+        or bool(re.match(r"([-*+]|\d+[.)])\s+", stripped))
+    )
+
+
+def _unwrap_prose_lines(md: str) -> str:
+    """Join source-wrapped inline fragments inside plain prose blocks.
+
+    ATO legislation pages sometimes split inline spans, quotes, and hyphenated
+    amendment ranges across physical HTML source lines. markdownify preserves
+    those newlines, which turns inline phrases into broken markdown. Keep
+    structural markdown blocks intact and unwrap only plain prose paragraphs.
+    """
+
+    # [IE-03] Plain prose blocks are unwrapped after markdownify so source line breaks inside inline spans/quotes don't shatter amendment notes.
+    blocks = re.split(r"(\n\s*\n)", md)
+    out: list[str] = []
+    for block in blocks:
+        if not block or block.isspace():
+            out.append(block)
+            continue
+        lines = block.splitlines()
+        if len(lines) <= 1 or any(_is_structural_markdown_line(line) for line in lines):
+            out.append(block)
+            continue
+        joined = " ".join(line.strip() for line in lines if line.strip())
+        joined = _MD_NUMERIC_RANGE.sub("-", joined)
+        joined = _MD_SPACED_QUOTE.sub(r'"\1"', joined)
+        out.append(joined)
+    return "".join(out)
 
 
 def _tidy_markdown(md: str) -> str:
+    md = _unwrap_prose_lines(md)
     md = _MD_TRAIL_WS.sub("\n", md)
     md = _MD_COLLAPSE.sub("\n\n", md)
     return md.strip() + "\n"
